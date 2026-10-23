@@ -1,0 +1,5 @@
+{
+  "OPENAI_API_KEY": "PASTE_API_KEY_HERE",
+  "OPENAI_BASE_URL": "https://token.sensenova.cn/v1",
+  "MODEL_NAME": "sensenova-6.8-flash-lite"
+}

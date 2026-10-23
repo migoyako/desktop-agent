@@ -1,0 +1,31 @@
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "current-agent/python-agent"
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "current-agent": {
+"baseUrl": "http://127.0.0.1:8765/v1",
+"api": "openai-completions",
+"auth": "api-key",
+"apiKey": "local-agent",
+        "timeoutSeconds": 120,
+        "models": [
+          {
+            "id": "python-agent",
+            "name": "Current Python Agent",
+            "reasoning": false,
+            "input": ["text"],
+            "contextWindow": 20000,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  }
+}

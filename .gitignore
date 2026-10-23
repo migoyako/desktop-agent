@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Local secrets
+config/keys.json
+
+# Local companion data
+data/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.idea/
+.vscode/
+
+# Reference projects
+/research/
+
+# Accidental shell artifacts
+/$null
+
+# Local backups
+backups/
