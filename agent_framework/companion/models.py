@@ -144,6 +144,8 @@ class ExperienceRecord:
     source_message_id: Optional[int]
     receipt_id: Optional[str]
     created_at: str
+    memory_id: str = ""
+    status: str = "active"
 
 
 @dataclass

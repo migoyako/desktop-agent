@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from ..models import AgentMode
@@ -89,8 +90,11 @@ class CompanionTkApp:
         self.mode = AgentMode.CHAT
         self.current_proposal = None
         self.jobs = queue.Queue()
+        self.persona_name = (
+            runtime.persona.name if getattr(runtime, "persona", None) else "数字分身"
+        )
         self.root = tk.Tk()
-        self.root.title("数字分身")
+        self.root.title(self.persona_name)
         self.root.geometry("500x760")
         self.root.minsize(430, 640)
         self.root.configure(bg=BG)
@@ -150,12 +154,13 @@ class CompanionTkApp:
         top.pack(fill="x", padx=18, pady=(14, 2))
         title = tk.Label(
             top,
-            text="数字分身  /  Companion",
+            text="{}  /  Companion".format(self.persona_name),
             bg=BG,
             fg=TEXT,
             font=("Microsoft YaHei UI", 12, "bold"),
         )
         title.pack(side="left")
+        self.title_label = title
         close = ttk.Button(top, text="关闭", command=self.root.destroy)
         close.pack(side="right")
         top.bind("<ButtonPress-1>", self.start_drag)
@@ -175,6 +180,7 @@ class CompanionTkApp:
         self.work_mode.pack(side="left")
         ttk.Button(mode_row, text="记忆", command=self.open_memory).pack(side="right")
         ttk.Button(mode_row, text="情绪", command=self.open_affect).pack(side="right", padx=6)
+        ttk.Button(mode_row, text="人设", command=self.open_persona).pack(side="right")
 
         workspace_row = tk.Frame(self.root, bg=BG)
         workspace_row.pack(fill="x", padx=18, pady=(4, 6))
@@ -442,10 +448,272 @@ class CompanionTkApp:
         state = self.runtime.affect_snapshot()
         self.avatar.set_state(mood=state["agent"]["mood_label"])
 
+    def refresh_persona(self):
+        self.persona_name = (
+            self.runtime.persona.name
+            if getattr(self.runtime, "persona", None)
+            else "数字分身"
+        )
+        self.root.title(self.persona_name)
+        self.title_label.config(
+            text="{}  /  Companion".format(self.persona_name)
+        )
+
+    def persona_summary(self, info):
+        source = info.get("source")
+        if not isinstance(source, dict):
+            source = {}
+        license_info = info.get("license")
+        if not isinstance(license_info, dict):
+            license_info = {}
+        lines = [
+            "名称：{}（v{}）".format(
+                info.get("name") or "数字分身",
+                info.get("version") or "-",
+            ),
+            "ID：{}".format(info.get("id") or "-"),
+            "稳定前缀哈希：{}".format(info.get("stable_hash") or "-"),
+            "世界书：{} 条 / {} 字符".format(
+                info.get("worldbook_entries", 0),
+                info.get("worldbook_chars", 0),
+            ),
+        ]
+        if not info.get("loaded"):
+            lines.append(
+                "人设包未加载：{}".format(
+                    info.get("error") or "目录不存在"
+                )
+            )
+        for label, key in (
+            ("作品", "work"),
+            ("权利方", "owner"),
+            ("版本", "release"),
+            ("设定截止", "canon_cutoff"),
+        ):
+            value = source.get(key)
+            if value:
+                lines.append("{}：{}".format(label, value))
+        for label, key in (
+            ("角色 IP", "character_ip"),
+            ("使用边界", "derivative_policy"),
+        ):
+            value = license_info.get(key)
+            if value:
+                lines.append("{}：{}".format(label, value))
+        files = info.get("files")
+        if isinstance(files, dict) and files:
+            lines.append(
+                "文件：{}".format(
+                    "、".join(
+                        "{} {:.1f} KB".format(name, size / 1024.0)
+                        for name, size in files.items()
+                    )
+                )
+            )
+            lines.append(
+                "总大小：{:.1f} KB".format(
+                    info.get("total_bytes", 0) / 1024.0
+                )
+            )
+        return "\n".join(lines)
+
+    def open_persona(self):
+        info = self.runtime.persona_info()
+        preferences = info.get("preferences")
+        if not isinstance(preferences, dict):
+            preferences = {}
+        window = tk.Toplevel(self.root)
+        window.title("人设与设定")
+        window.geometry("580x700")
+        window.configure(bg=BG)
+        tk.Label(
+            window,
+            text="人设包",
+            bg=BG,
+            fg=TEXT,
+            font=("Microsoft YaHei UI", 12, "bold"),
+        ).pack(anchor="w", padx=14, pady=(12, 6))
+        info_box = tk.Text(
+            window,
+            height=12,
+            bg=PANEL,
+            fg=TEXT,
+            wrap="word",
+            relief="flat",
+            padx=8,
+            pady=6,
+        )
+        info_box.insert("1.0", self.persona_summary(info))
+        info_box.configure(state="disabled")
+        info_box.pack(fill="x", padx=14)
+
+        tk.Label(
+            window,
+            text="称呼（留空表示恢复默认）",
+            bg=BG,
+            fg=MUTED,
+        ).pack(anchor="w", padx=14, pady=(8, 2))
+        address = tk.Entry(
+            window,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+        )
+        address.insert(0, str(preferences.get("address") or ""))
+        address.pack(fill="x", padx=14, ipady=4)
+
+        tk.Label(
+            window,
+            text="关系",
+            bg=BG,
+            fg=MUTED,
+        ).pack(anchor="w", padx=14, pady=(8, 2))
+        relationship = tk.Text(
+            window,
+            height=3,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            wrap="word",
+            relief="flat",
+            padx=6,
+            pady=4,
+        )
+        relationship.insert(
+            "1.0",
+            str(preferences.get("relationship") or ""),
+        )
+        relationship.pack(fill="x", padx=14)
+
+        tk.Label(
+            window,
+            text="边界与雷点",
+            bg=BG,
+            fg=MUTED,
+        ).pack(anchor="w", padx=14, pady=(8, 2))
+        boundaries = tk.Text(
+            window,
+            height=3,
+            bg=PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            wrap="word",
+            relief="flat",
+            padx=6,
+            pady=4,
+        )
+        boundaries.insert(
+            "1.0",
+            str(preferences.get("boundaries") or ""),
+        )
+        boundaries.pack(fill="x", padx=14)
+
+        tk.Label(
+            window,
+            text="这些设定以受保护人设记忆保存，优先于角色默认；"
+            "留空表示清除，且不能覆盖安全规则。",
+            bg=BG,
+            fg=MUTED,
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", padx=14, pady=(6, 2))
+        status = tk.Label(window, text="", bg=BG, fg=MUTED, wraplength=520)
+        status.pack(anchor="w", padx=14)
+
+        def save():
+            try:
+                self.runtime.set_persona_preference(
+                    "address",
+                    address.get(),
+                )
+                self.runtime.set_persona_preference(
+                    "relationship",
+                    relationship.get("1.0", "end-1c"),
+                )
+                self.runtime.set_persona_preference(
+                    "boundaries",
+                    boundaries.get("1.0", "end-1c"),
+                )
+            except ValueError as error:
+                messagebox.showwarning("人设设定", str(error), parent=window)
+                return
+            self.refresh_persona()
+            status.config(text="已保存。空白的设定项已清除。")
+
+        def import_pack():
+            path = filedialog.askdirectory(
+                title="选择人设包目录",
+                parent=window,
+            )
+            if not path:
+                return
+            try:
+                preview = self.runtime.preview_persona_import(path)
+            except Exception as error:
+                messagebox.showwarning(
+                    "导入人设包",
+                    str(error),
+                    parent=window,
+                )
+                return
+            detail = self.persona_summary(preview)
+            warnings = preview.get("warnings") or []
+            if warnings:
+                detail += "\n\n" + "\n".join(str(item) for item in warnings)
+            overwrite = bool(preview.get("target_exists"))
+            question = detail + (
+                "\n\n同 ID 人设包已存在。覆盖后会用新文件替换当前版本，"
+                "已有用户记忆不受影响。继续吗？"
+                if overwrite
+                else "\n\n只复制人设文本文件，确定导入吗？"
+            )
+            if not messagebox.askyesno(
+                "导入人设包",
+                question,
+                parent=window,
+            ):
+                return
+            try:
+                imported = self.runtime.import_persona(
+                    path,
+                    overwrite=overwrite,
+                )
+            except Exception as error:
+                messagebox.showwarning(
+                    "导入人设包",
+                    str(error),
+                    parent=window,
+                )
+                return
+            self.refresh_persona()
+            status.config(
+                text="已导入并切换到“{}”。当前哈希：{}".format(
+                    imported.get("name"),
+                    str(imported.get("stable_hash") or "")[:12],
+                )
+            )
+            info_box.configure(state="normal")
+            info_box.delete("1.0", "end")
+            info_box.insert("1.0", self.persona_summary(imported))
+            info_box.configure(state="disabled")
+
+        actions = tk.Frame(window, bg=BG)
+        actions.pack(fill="x", padx=14, pady=10)
+        ttk.Button(actions, text="保存设定", command=save).pack(side="left")
+        ttk.Button(
+            actions,
+            text="导入人设包…",
+            command=import_pack,
+        ).pack(side="left", padx=6)
+        ttk.Button(actions, text="关闭", command=window.destroy).pack(
+            side="right"
+        )
+
     def open_memory(self):
         window = tk.Toplevel(self.root)
         window.title("记忆与共同经历")
-        window.geometry("760x560")
+        window.geometry("820x700")
         window.configure(bg=BG)
         tk.Label(
             window,
@@ -456,39 +724,150 @@ class CompanionTkApp:
         ).pack(anchor="w", padx=14, pady=(12, 6))
         table = ttk.Treeview(
             window,
-            columns=("id", "kind", "content", "status"),
+            columns=("id", "kind", "content", "status", "protected"),
             show="headings",
-            height=12,
+            height=9,
         )
         for column, label, width in [
             ("id", "ID", 120),
-            ("kind", "类型", 110),
-            ("content", "内容", 360),
-            ("status", "状态", 90),
+            ("kind", "类型", 100),
+            ("content", "内容", 330),
+            ("status", "状态", 80),
+            ("protected", "保护", 50),
         ]:
             table.heading(column, text=label)
             table.column(column, width=width, stretch=column == "content")
         table.pack(fill="both", expand=True, padx=14)
-        memories = self.runtime.memories()
-        for memory in memories:
-            table.insert(
-                "",
-                "end",
-                iid=memory.memory_id,
-                values=(
-                    memory.memory_id,
-                    memory.kind,
-                    memory.content,
-                    memory.status,
-                ),
-            )
 
-        def selected():
+        detail = tk.Text(
+            window,
+            height=10,
+            bg=PANEL,
+            fg=TEXT,
+            wrap="word",
+            relief="flat",
+            padx=8,
+            pady=6,
+        )
+        detail.pack(fill="both", expand=False, padx=14, pady=(8, 4))
+
+        def selected(show_message=True):
             values = table.selection()
             if not values:
-                messagebox.showinfo("记忆", "请先选择一条记忆。")
+                if show_message:
+                    messagebox.showinfo("记忆", "请先选择一条记忆。")
                 return None
             return values[0]
+
+        def show_details(event=None):
+            memory_id = selected(show_message=False)
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            if not memory_id:
+                detail.insert("end", "选择一条记忆查看来源、候选与召回记录。")
+                detail.configure(state="disabled")
+                return
+            try:
+                details = self.runtime.memory_details(memory_id)
+            except ValueError as error:
+                detail.insert("end", str(error))
+                detail.configure(state="disabled")
+                return
+            memory = details["memory"]
+            lines = [
+                memory.content,
+                "ID：{}  类型：{}  状态：{}  保护：{}".format(
+                    memory.memory_id,
+                    memory.kind,
+                    memory.status,
+                    "是" if memory.protected else "否",
+                ),
+                "规范键：{}  证据：{} 条  重要度：{:.2f}".format(
+                    memory.canonical_key or "-",
+                    memory.evidence_count,
+                    memory.importance,
+                ),
+            ]
+            if details["evidence"]:
+                lines.append("\n来源证据：")
+                for item in details["evidence"]:
+                    lines.append(
+                        "- 消息 #{}（{}）原文：{}".format(
+                            item["message_id"],
+                            item["source_role"],
+                            item.get("message_content", ""),
+                        )
+                    )
+            if details["candidates"]:
+                lines.append("\n候选记录：")
+                for item in details["candidates"]:
+                    lines.append(
+                        "- {} 评分 {:.2f}：{}".format(
+                            item["status"],
+                            item["score"],
+                            item["reason"],
+                        )
+                    )
+            if details["recalls"]:
+                lines.append("\n最近召回：")
+                for item in details["recalls"]:
+                    score = item.get("score")
+                    lines.append(
+                        "- {} 来源 {} 评分 {}".format(
+                            item["created_at"],
+                            item.get("source") or "-",
+                            "{:.3f}".format(score)
+                            if score is not None
+                            else "-",
+                        )
+                    )
+            if details["derived"]:
+                lines.append(
+                    "\n派生记忆：{}".format("、".join(details["derived"]))
+                )
+            detail.insert("end", "\n".join(lines))
+            detail.configure(state="disabled")
+
+        experiences = tk.Text(
+            window,
+            height=5,
+            bg=PANEL,
+            fg=TEXT,
+            wrap="word",
+            relief="flat",
+            padx=8,
+            pady=6,
+        )
+        experiences.pack(fill="x", padx=14, pady=(4, 8))
+
+        def render():
+            table.delete(*table.get_children())
+            for memory in self.runtime.memories():
+                table.insert(
+                    "",
+                    "end",
+                    iid=memory.memory_id,
+                    values=(
+                        memory.memory_id,
+                        memory.kind,
+                        memory.content,
+                        memory.status,
+                        "是" if memory.protected else "",
+                    ),
+                )
+            experiences.configure(state="normal")
+            experiences.delete("1.0", "end")
+            rows = self.runtime.experiences()
+            experiences.insert(
+                "end",
+                "\n\n".join(
+                    "{}：{}".format(item.title, item.summary)
+                    for item in rows
+                )
+                or "还没有共同经历记录。",
+            )
+            experiences.configure(state="disabled")
+            show_details()
 
         def correct():
             memory_id = selected()
@@ -503,63 +882,112 @@ class CompanionTkApp:
             )
             if replacement and replacement.strip():
                 self.runtime.correct_memory(memory_id, replacement.strip())
-                table.item(
-                    memory_id,
-                    values=(
-                        memory_id,
-                        table.item(memory_id, "values")[1],
-                        replacement.strip(),
-                        "confirmed",
-                    ),
-                )
+                render()
 
         def forget():
             memory_id = selected()
             if not memory_id:
                 return
-            if messagebox.askyesno("忘记记忆", "确认忘记选中的记忆？", parent=window):
+            if messagebox.askyesno(
+                "忘记记忆",
+                "确认忘记选中的记忆？",
+                parent=window,
+            ):
                 self.runtime.forget_memory(memory_id)
-                table.item(
-                    memory_id,
-                    values=(
-                        memory_id,
-                        table.item(memory_id, "values")[1],
-                        table.item(memory_id, "values")[2],
-                        "forgotten",
-                    ),
-                )
+                render()
+
+        def toggle_protected():
+            memory_id = selected()
+            if not memory_id:
+                return
+            details = self.runtime.memory_details(memory_id)
+            self.runtime.set_memory_protected(
+                memory_id,
+                not details["memory"].protected,
+            )
+            render()
+
+        def add_persona():
+            content = simpledialog.askstring(
+                "新增人设",
+                "希望长期保留、不会被自动淘汰的人设：",
+                parent=window,
+            )
+            if content and content.strip():
+                self.runtime.remember_persona(content.strip())
+                render()
+
+        def import_chat():
+            path = filedialog.askopenfilename(
+                parent=window,
+                title="导入旧聊天",
+                filetypes=[
+                    ("聊天记录", "*.json *.jsonl *.ndjson"),
+                    ("所有文件", "*.*"),
+                ],
+            )
+            if not path:
+                return
+            try:
+                estimate = self.runtime.estimate_chat_import(path)
+            except Exception as error:
+                messagebox.showwarning("导入旧聊天", str(error), parent=window)
+                return
+            detail_text = (
+                "文件：{}\n消息：{} 条（其中用户 {} 条）\n"
+                "会话：{} 个\n预计生成记忆：{} 条\n"
+                "预计耗时：约 {:.1f} 秒\n已导入进度：{}/{}"
+            ).format(
+                Path(path).name,
+                estimate["messages"],
+                estimate["user_messages"],
+                estimate["conversations"],
+                estimate["estimated_memories"],
+                estimate["estimated_seconds"],
+                estimate["resume_from"],
+                estimate["messages"],
+            )
+            if not messagebox.askyesno(
+                "导入成本预估",
+                detail_text + "\n\n确定继续吗？",
+                parent=window,
+            ):
+                return
+            try:
+                result = self.runtime.import_chat(path)
+            except Exception as error:
+                messagebox.showwarning("导入旧聊天", str(error), parent=window)
+                return
+            messagebox.showinfo(
+                "导入旧聊天",
+                "状态：{}\n导入消息：{} 条\n新记忆：{} 条\n"
+                "跳过重复：{} 条".format(
+                    result["status"],
+                    result["imported_messages"],
+                    result["imported_memories"],
+                    result["skipped_duplicates"],
+                ),
+                parent=window,
+            )
+            render()
 
         row = tk.Frame(window, bg=BG)
         row.pack(fill="x", padx=14, pady=8)
         ttk.Button(row, text="纠正选中记忆", command=correct).pack(side="left")
-        ttk.Button(row, text="忘记选中记忆", command=forget).pack(side="left", padx=6)
-        tk.Label(
-            window,
-            text="共同经历",
-            bg=BG,
-            fg=TEXT,
-            font=("Microsoft YaHei UI", 10, "bold"),
-        ).pack(anchor="w", padx=14)
-        experiences = tk.Text(
-            window,
-            height=7,
-            bg=PANEL,
-            fg=TEXT,
-            wrap="word",
-            relief="flat",
-            padx=8,
-            pady=6,
+        ttk.Button(row, text="忘记选中记忆", command=forget).pack(
+            side="left",
+            padx=6,
         )
-        experiences.pack(fill="x", padx=14, pady=(4, 12))
-        rows = self.runtime.experiences()
-        experiences.insert(
-            "end",
-            "\n\n".join(
-                "{}：{}".format(item.title, item.summary) for item in rows
-            )
-            or "还没有共同经历记录。",
+        ttk.Button(row, text="切换受保护", command=toggle_protected).pack(
+            side="left"
         )
-        experiences.configure(state="disabled")
+        ttk.Button(row, text="新增人设", command=add_persona).pack(
+            side="left",
+            padx=6,
+        )
+        ttk.Button(row, text="导入旧聊天", command=import_chat).pack(side="left")
+        table.bind("<<TreeviewSelect>>", show_details)
+        render()
 
     def open_affect(self):
         window = tk.Toplevel(self.root)

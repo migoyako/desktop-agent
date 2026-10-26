@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS workspace_grants (
 """
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 MEMORY_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
@@ -244,6 +244,51 @@ CREATE TABLE IF NOT EXISTS memory_tombstones (
 
 CREATE INDEX IF NOT EXISTS idx_memory_tombstones_session
     ON memory_tombstones(session_id, canonical_key);
+"""
+
+MEMORY_GRAPH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS memory_relations (
+    relation_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    parent_memory_id TEXT NOT NULL,
+    child_memory_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(parent_memory_id) REFERENCES memories(memory_id),
+    FOREIGN KEY(child_memory_id) REFERENCES memories(memory_id),
+    UNIQUE(parent_memory_id, child_memory_id, relation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_relations_parent
+    ON memory_relations(session_id, parent_memory_id);
+
+CREATE INDEX IF NOT EXISTS idx_memory_relations_child
+    ON memory_relations(session_id, child_memory_id);
+"""
+
+IMPORT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS import_jobs (
+    job_id TEXT PRIMARY KEY,
+    source_fingerprint TEXT NOT NULL UNIQUE,
+    source_name TEXT NOT NULL,
+    target_session_id TEXT NOT NULL,
+    cursor INTEGER NOT NULL DEFAULT 0,
+    total_units INTEGER NOT NULL DEFAULT 0,
+    imported_messages INTEGER NOT NULL DEFAULT 0,
+    imported_memories INTEGER NOT NULL DEFAULT 0,
+    skipped_duplicates INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS import_messages (
+    message_hash TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    imported_message_id INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -335,6 +380,30 @@ def _migrate_v2(connection):
     _reindex_memory_fts(connection)
 
 
+def _migrate_v3(connection):
+    """派生关系、经历状态与旧聊天导入账本。"""
+    connection.executescript(MEMORY_GRAPH_SCHEMA)
+    connection.executescript(IMPORT_SCHEMA)
+    _add_column_if_missing(
+        connection,
+        "experiences",
+        "memory_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column_if_missing(
+        connection,
+        "experiences",
+        "status",
+        "TEXT NOT NULL DEFAULT 'active'",
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_experiences_memory
+            ON experiences(session_id, memory_id)
+        """
+    )
+
+
 def _reindex_memory_fts(connection):
     """从 memories 全量重建 memory_fts 索引（幂等）。"""
     connection.execute("DELETE FROM memory_fts")
@@ -379,6 +448,9 @@ class CompanionStore:
                 if version < 2:
                     _migrate_v2(connection)
                     version = 2
+                if version < 3:
+                    _migrate_v3(connection)
+                    version = 3
             connection.execute(
                 "PRAGMA user_version = {}".format(int(version))
             )
@@ -830,10 +902,21 @@ class CompanionStore:
         evidence: Optional[Dict] = None,
         candidate_score: Optional[float] = None,
         candidate_reason: str = "",
+        protected: bool = False,
+        derived_from: Optional[Iterable[str]] = None,
+        relation: str = "derived",
     ) -> str:
         now = utc_now()
         memory_id = new_id("mem")
+        derived_from = list(derived_from or [])
         with self._connection() as connection:
+            for parent_id in derived_from:
+                parent = connection.execute(
+                    "SELECT status FROM memories WHERE memory_id = ?",
+                    (parent_id,),
+                ).fetchone()
+                if parent is not None and parent["status"] == "forgotten":
+                    raise ValueError("来源事实已遗忘，不能创建派生记忆。")
             validated = self._validate_evidence(connection, evidence)
             quote, quote_start = validated if validated else ("", 0)
             connection.execute(
@@ -842,8 +925,8 @@ class CompanionStore:
                     memory_id, session_id, kind, content, source_message_id,
                     confidence, importance, activation, status, created_at,
                     updated_at, canonical_key, evidence_count, first_seen_at,
-                    last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_seen_at, protected
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     memory_id,
@@ -861,8 +944,28 @@ class CompanionStore:
                     1 if quote else 0,
                     now,
                     now,
+                    1 if protected else 0,
                 ),
             )
+            for parent_id in derived_from:
+                if not parent_id or parent_id == memory_id:
+                    continue
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO memory_relations(
+                        relation_id, session_id, parent_memory_id,
+                        child_memory_id, relation, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_id("rel"),
+                        session_id,
+                        parent_id,
+                        memory_id,
+                        relation,
+                        now,
+                    ),
+                )
             if quote:
                 self._insert_evidence(
                     connection,
@@ -1189,6 +1292,14 @@ class CompanionStore:
             ).fetchone()
         return row["role"] if row else None
 
+    def get_message(self, message_id: int) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def find_memory_by_key(
         self,
         session_id: str,
@@ -1303,15 +1414,17 @@ class CompanionStore:
                 now,
             )
 
-    def archive_memory(self, memory_id: str, reason: str):
+    def archive_memory(self, memory_id: str, reason: str) -> bool:
         now = utc_now()
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT session_id FROM memories WHERE memory_id = ?",
+                "SELECT session_id, protected FROM memories WHERE memory_id = ?",
                 (memory_id,),
             ).fetchone()
             if row is None:
-                return
+                return False
+            if row["protected"]:
+                return False
             connection.execute(
                 "UPDATE memories SET status = 'archived', updated_at = ? WHERE memory_id = ?",
                 (now, memory_id),
@@ -1333,6 +1446,40 @@ class CompanionStore:
                 {"reason": reason},
                 now,
             )
+        return True
+
+    def set_memory_protected(self, memory_id: str, protected: bool = True):
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT session_id FROM memories WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                "UPDATE memories SET protected = ?, updated_at = ? WHERE memory_id = ?",
+                (1 if protected else 0, utc_now(), memory_id),
+            )
+            self._insert_memory_event(
+                connection,
+                memory_id,
+                row["session_id"],
+                "protected" if protected else "unprotected",
+                {},
+            )
+        return True
+
+    def list_child_memories(self, memory_id: str) -> List[MemoryRecord]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.* FROM memory_relations r
+                JOIN memories m ON m.memory_id = r.child_memory_id
+                WHERE r.parent_memory_id = ?
+                """,
+                (memory_id,),
+            ).fetchall()
+        return [self._memory_from_row(row) for row in rows]
 
     def add_memory_candidate(
         self,
@@ -1459,10 +1606,25 @@ class CompanionStore:
         session_id: str,
         statuses: Optional[Iterable[str]] = None,
         limit: int = 50,
+        memory_id: Optional[str] = None,
     ):
         statuses = list(statuses or [])
         with self._connection() as connection:
-            if statuses:
+            if memory_id:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM memory_candidates
+                    WHERE session_id = ? AND memory_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (
+                        session_id,
+                        memory_id,
+                        max(1, min(int(limit), 500)),
+                    ),
+                ).fetchall()
+            elif statuses:
                 placeholders = ",".join("?" for _ in statuses)
                 rows = connection.execute(
                     """
@@ -1527,6 +1689,32 @@ class CompanionStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_recall_logs_for_memory(
+        self,
+        session_id: str,
+        memory_id: str,
+        limit: int = 10,
+    ):
+        matched = []
+        for row in self.list_recall_logs(session_id, limit=500):
+            try:
+                fact_ids = json.loads(row["fact_ids"] or "[]")
+            except ValueError:
+                continue
+            if memory_id not in fact_ids:
+                continue
+            scores = []
+            try:
+                scores = json.loads(row["scores"] or "[]")
+            except ValueError:
+                pass
+            index = fact_ids.index(memory_id)
+            row["score"] = scores[index] if index < len(scores) else None
+            matched.append(row)
+            if len(matched) >= max(1, min(int(limit), 100)):
+                break
+        return matched
+
     def add_experience(
         self,
         session_id: str,
@@ -1534,6 +1722,7 @@ class CompanionStore:
         summary: str,
         source_message_id: Optional[int],
         receipt_id: Optional[str],
+        memory_id: str = "",
     ) -> str:
         from .models import new_id
 
@@ -1543,8 +1732,9 @@ class CompanionStore:
                 """
                 INSERT INTO experiences(
                     experience_id, session_id, title, summary,
-                    source_message_id, receipt_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    source_message_id, receipt_id, created_at,
+                    memory_id, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
                 """,
                 (
                     experience_id,
@@ -1554,6 +1744,7 @@ class CompanionStore:
                     source_message_id,
                     receipt_id,
                     utc_now(),
+                    memory_id,
                 ),
             )
         return experience_id
@@ -1563,7 +1754,7 @@ class CompanionStore:
             rows = connection.execute(
                 """
                 SELECT * FROM experiences
-                WHERE session_id = ?
+                WHERE session_id = ? AND status != 'forgotten'
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
@@ -1578,9 +1769,127 @@ class CompanionStore:
                 source_message_id=row["source_message_id"],
                 receipt_id=row["receipt_id"],
                 created_at=row["created_at"],
+                memory_id=(
+                    row["memory_id"] if "memory_id" in set(row.keys()) else ""
+                ),
+                status=row["status"] if "status" in set(row.keys()) else "active",
             )
             for row in rows
         ]
+
+    def forget_experience_by_memory(self, memory_id: str, session_id: str):
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE experiences SET status = 'forgotten'
+                WHERE session_id = ? AND memory_id = ?
+                """,
+                (session_id, memory_id),
+            )
+
+    def get_import_job(self, fingerprint: str) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM import_jobs WHERE source_fingerprint = ?",
+                (fingerprint,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_import_job_by_id(self, job_id: str) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM import_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_import_job(
+        self,
+        fingerprint: str,
+        source_name: str,
+        target_session_id: str,
+        total_units: int,
+    ) -> str:
+        job_id = new_id("job")
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO import_jobs(
+                    job_id, source_fingerprint, source_name,
+                    target_session_id, cursor, total_units,
+                    imported_messages, imported_memories,
+                    skipped_duplicates, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 0, ?, 0, 0, 0, 'running', ?, ?)
+                """,
+                (
+                    job_id,
+                    fingerprint,
+                    source_name,
+                    target_session_id,
+                    max(0, int(total_units)),
+                    now,
+                    now,
+                ),
+            )
+        return job_id
+
+    def update_import_job(
+        self,
+        job_id: str,
+        cursor: int,
+        imported_messages: int,
+        imported_memories: int,
+        skipped_duplicates: int,
+        status: str,
+    ):
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE import_jobs SET
+                    cursor = ?,
+                    imported_messages = ?,
+                    imported_memories = ?,
+                    skipped_duplicates = ?,
+                    status = ?,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    max(0, int(cursor)),
+                    max(0, int(imported_messages)),
+                    max(0, int(imported_memories)),
+                    max(0, int(skipped_duplicates)),
+                    status,
+                    utc_now(),
+                    job_id,
+                ),
+            )
+
+    def import_message_seen(self, message_hash: str) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM import_messages WHERE message_hash = ?",
+                (message_hash,),
+            ).fetchone()
+        return row is not None
+
+    def record_import_message(
+        self,
+        message_hash: str,
+        job_id: str,
+        message_id: int,
+        role: str,
+    ):
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO import_messages(
+                    message_hash, job_id, imported_message_id, role, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (message_hash, job_id, int(message_id), role, utc_now()),
+            )
 
     def set_affect(
         self,

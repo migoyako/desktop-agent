@@ -1,6 +1,7 @@
 """Qt desktop smoke tests, skipped when PySide6 is unavailable."""
 
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -33,6 +34,10 @@ class StubSearch:
                 snippet="A short search summary.",
             )
         ]
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BUNDLED_PERSONA = REPO_ROOT / "data" / "personas" / "remielle"
 
 
 class CompanionQtEndToEndTest(unittest.TestCase):
@@ -129,6 +134,9 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
             return
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
+        persona_target = root / "personas" / "remielle"
+        persona_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(BUNDLED_PERSONA, persona_target)
         runtime = CompanionRuntime(
             CompanionStore(root / "db.sqlite"),
             OfflineLLMClient(),
@@ -136,6 +144,8 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
             root,
             offline=True,
         )
+        self.runtime = runtime
+        self.store = runtime.store
         self.app = QApplication.instance() or QApplication([])
         self.window = CompanionWindow(runtime)
 
@@ -155,8 +165,10 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
 
         if attribute == "memory_dialog":
             self.window.open_memory()
-        else:
+        elif attribute == "affect_dialog":
             self.window.open_affect()
+        else:
+            self.window.open_persona()
         dialog = getattr(self.window, attribute)
         self.app.processEvents()
 
@@ -187,10 +199,69 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
             self.skipTest("PySide6 unavailable")
         self.assert_dialog_closes_independently("affect_dialog")
 
+    def test_persona_dialog_closes_without_closing_main_window(self):
+        if CompanionWindow is None:
+            self.skipTest("PySide6 unavailable")
+        self.assert_dialog_closes_independently("persona_dialog")
+
+    def test_persona_dialog_saves_address_and_updates_prompt(self):
+        if CompanionWindow is None:
+            self.skipTest("PySide6 unavailable")
+        self.window.open_persona()
+        dialog = self.window.persona_dialog
+        self.app.processEvents()
+
+        info = dialog.info.toPlainText()
+        self.assertIn("蕾米埃尔·丹", info)
+        self.assertIn("世界书", info)
+
+        dialog.address.setText("搭档")
+        dialog.save()
+        self.app.processEvents()
+
+        self.assertEqual(
+            self.runtime.persona_preferences()["address"],
+            "搭档",
+        )
+        prompt = self.runtime._system_prompt("你好", AgentMode.CHAT)
+        self.assertIn("称呼：搭档", prompt)
+        self.assertEqual(dialog.address.text(), "搭档")
+
     def test_memory_dialog_closes_without_closing_main_window(self):
         if CompanionWindow is None:
             self.skipTest("PySide6 unavailable")
         self.assert_dialog_closes_independently("memory_dialog")
+
+    def test_memory_dialog_shows_evidence_and_protected_state(self):
+        if CompanionWindow is None:
+            self.skipTest("PySide6 unavailable")
+        text = "请记住我喜欢咖啡。"
+        message_id = self.store.add_message(
+            "main",
+            "user",
+            text,
+            AgentMode.CHAT,
+        )
+        self.runtime.memory.observe_user_message("main", message_id, text)
+        self.runtime.memory.recall("main", "咖啡")
+
+        self.window.open_memory()
+        dialog = self.window.memory_dialog
+        self.app.processEvents()
+
+        self.assertEqual(dialog.table.rowCount(), 1)
+        self.assertEqual(dialog.table.item(0, 4).text(), "")
+        dialog.table.selectRow(0)
+        self.app.processEvents()
+        detail = dialog.detail.toPlainText()
+        self.assertIn("来源证据", detail)
+        self.assertIn(text, detail)
+        self.assertIn("最近召回", detail)
+
+        memory_id = dialog.table.item(0, 0).text()
+        self.runtime.set_memory_protected(memory_id, True)
+        dialog.refresh()
+        self.assertEqual(dialog.table.item(0, 4).text(), "是")
 
 
 if __name__ == "__main__":

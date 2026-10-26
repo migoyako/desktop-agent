@@ -35,8 +35,39 @@ IDENTITY_PATTERNS = (
     ),
 )
 EXPLICIT = re.compile(r"(?:请)?记住[：:，,\s]*(.+)")
+ROLEPLAY = re.compile(
+    r"(?:角色扮演|语c|语C|皮上|皮下|ooc|OOC|"
+    r"开始(?:角色)?扮演|结束(?:角色)?扮演|不演了|出戏|"
+    r"设定(?:我|你|是)[：:]?|我来扮演|你扮演|扮演(?:我|你|一个|一下)|"
+    r"角色卡|人设卡|剧本杀|跑团|"
+    r"假如(?:我|你)是|如果(?:我|你)是)"
+)
+ROLEPLAY_QUOTE = re.compile(r"[“”「」『』]")
+ROLEPLAY_FIRST_PERSON = re.compile(
+    r"(?:我|本人).{0,12}(?:叫|名字|喜欢|不喜欢|生日|职业|工作|住在|来自|今年)"
+)
 CONFIRM_SCORE = 0.70
 CANDIDATE_SCORE = 0.45
+PERSONA_SETTING_KEYS = {
+    "address": "persona:setting:address",
+    "relationship": "persona:setting:relationship",
+    "boundaries": "persona:setting:boundaries",
+}
+PERSONA_SETTING_LABELS = {
+    "address": "称呼",
+    "relationship": "关系",
+    "boundaries": "边界与雷点",
+}
+
+
+def is_roleplay_text(text: str) -> bool:
+    text = text or ""
+    if ROLEPLAY.search(text):
+        return True
+    return bool(
+        ROLEPLAY_QUOTE.search(text)
+        and ROLEPLAY_FIRST_PERSON.search(text)
+    )
 
 
 def tokenize(text: str) -> List[str]:
@@ -211,6 +242,16 @@ class MemoryService:
                     )
                 continue
             if existing is not None:
+                if existing.protected:
+                    self.store.add_memory_candidate(
+                        session_id=session_id,
+                        memory_id=existing.memory_id,
+                        canonical_key=item["canonical_key"],
+                        content=item["content"],
+                        score=item["score"],
+                        reason=item["reason"] + "；受保护人设，不自动取代",
+                    )
+                    continue
                 if item["score"] >= CONFIRM_SCORE:
                     self.store.archive_memory(
                         existing.memory_id,
@@ -243,6 +284,8 @@ class MemoryService:
         return created
 
     def _extract(self, text: str):
+        if is_roleplay_text(text):
+            return []
         items = []
         for match in PREFERENCE.finditer(text):
             content = _clean(match.group(1))
@@ -449,40 +492,224 @@ class MemoryService:
             raise ValueError("找不到这条记忆。")
         epoch = int(datetime.now(timezone.utc).timestamp() * 1000)
         through_seq = self.store.max_message_id(memory.session_id)
-        self.store.update_memory(memory_id, status="forgotten")
-        self.store.add_memory_event(
-            memory_id,
-            memory.session_id,
-            "forgotten",
-            {"epoch": epoch},
-        )
+        queue = [(memory, None)]
+        seen = set()
+        while queue:
+            current, parent_id = queue.pop(0)
+            if current.memory_id in seen:
+                continue
+            seen.add(current.memory_id)
+            self.store.update_memory(current.memory_id, status="forgotten")
+            self.store.add_memory_event(
+                current.memory_id,
+                current.session_id,
+                "forgotten" if parent_id is None else "forgotten_derived",
+                (
+                    {"epoch": epoch}
+                    if parent_id is None
+                    else {"epoch": epoch, "parent_memory_id": parent_id}
+                ),
+            )
+            self.store.forget_experience_by_memory(
+                current.memory_id,
+                current.session_id,
+            )
+            self.store.add_memory_tombstone(
+                current.session_id,
+                current.canonical_key,
+                _content_hash(current.content),
+                epoch,
+                through_seq,
+            )
+            for child in self.store.list_child_memories(current.memory_id):
+                queue.append((child, current.memory_id))
+
         if memory.canonical_key:
             for other in self.store.list_memories(
                 memory.session_id,
                 limit=500,
             ):
                 if (
-                    other.memory_id != memory_id
-                    and other.canonical_key == memory.canonical_key
-                    and other.status in ("candidate", "confirmed")
+                    other.memory_id in seen
+                    or other.canonical_key != memory.canonical_key
+                    or other.status not in ("candidate", "confirmed")
                 ):
-                    self.store.update_memory(
-                        other.memory_id,
-                        status="forgotten",
-                    )
-                    self.store.add_memory_event(
-                        other.memory_id,
-                        other.session_id,
-                        "forgotten_cascade",
-                        {"source_memory_id": memory_id},
-                    )
-        self.store.add_memory_tombstone(
-            memory.session_id,
-            memory.canonical_key,
-            _content_hash(memory.content),
-            epoch,
-            through_seq,
+                    continue
+                self.store.update_memory(
+                    other.memory_id,
+                    status="forgotten",
+                )
+                self.store.forget_experience_by_memory(
+                    other.memory_id,
+                    other.session_id,
+                )
+                self.store.add_memory_event(
+                    other.memory_id,
+                    other.session_id,
+                    "forgotten_cascade",
+                    {"source_memory_id": memory_id},
+                )
+                self.store.add_memory_tombstone(
+                    other.session_id,
+                    other.canonical_key,
+                    _content_hash(other.content),
+                    epoch,
+                    through_seq,
+                )
+
+    def set_protected(self, memory_id: str, protected: bool = True):
+        if self.store.get_memory(memory_id) is None:
+            raise ValueError("找不到这条记忆。")
+        self.store.set_memory_protected(memory_id, protected)
+
+    def remember_persona(
+        self,
+        session_id: str,
+        content: str,
+        message_id=None,
+        quote=None,
+        key=None,
+    ):
+        content = _clean(content)
+        if not content:
+            raise ValueError("人设内容不能为空。")
+        canonical_key = key or ("persona:" + _normalize(content))
+        statuses = ["candidate", "confirmed", "archived"]
+        if key:
+            statuses.append("forgotten")
+        existing = self.store.find_memory_by_key(
+            session_id,
+            canonical_key,
+            statuses=statuses,
         )
+        if existing is not None:
+            self.store.update_memory(
+                existing.memory_id,
+                content=content,
+                status="confirmed",
+            )
+            self.store.set_memory_protected(existing.memory_id, True)
+            return existing.memory_id
+        evidence = None
+        if message_id is not None and quote:
+            evidence = {"message_id": message_id, "quote": quote}
+        return self.store.add_memory(
+            session_id=session_id,
+            kind="persona",
+            content=content,
+            source_message_id=message_id,
+            confidence=1.0,
+            importance=1.0,
+            status="confirmed",
+            canonical_key=canonical_key,
+            evidence=evidence,
+            protected=True,
+            candidate_reason="用户设定的人设事实",
+        )
+
+    def persona_setting(self, session_id: str, field: str) -> str:
+        key = PERSONA_SETTING_KEYS.get(field)
+        if key is None:
+            raise ValueError("未知的人设设定项。")
+        memory = self.store.find_memory_by_key(
+            session_id,
+            key,
+            statuses=["confirmed"],
+        )
+        return memory.content if memory is not None else ""
+
+    def persona_lines(self, session_id: str) -> List[str]:
+        lines = []
+        seen = set()
+        for field, key in PERSONA_SETTING_KEYS.items():
+            memory = self.store.find_memory_by_key(
+                session_id,
+                key,
+                statuses=["confirmed"],
+            )
+            if memory is not None:
+                lines.append(
+                    "- {}：{}".format(
+                        PERSONA_SETTING_LABELS[field],
+                        memory.content,
+                    )
+                )
+                seen.add(memory.memory_id)
+        for memory in self.store.list_memories(
+            session_id,
+            statuses=["confirmed"],
+            limit=200,
+        ):
+            if (
+                memory.memory_id in seen
+                or memory.kind != "persona"
+                or not memory.protected
+                or memory.canonical_key in PERSONA_SETTING_KEYS.values()
+            ):
+                continue
+            lines.append("- {}".format(memory.content))
+        return lines
+
+    def clear_persona_setting(self, session_id: str, field: str) -> bool:
+        key = PERSONA_SETTING_KEYS.get(field)
+        if key is None:
+            raise ValueError("未知的人设设定项。")
+        memory = self.store.find_memory_by_key(
+            session_id,
+            key,
+            statuses=["confirmed", "archived"],
+        )
+        if memory is None:
+            return False
+        self.store.update_memory(memory.memory_id, status="archived")
+        self.store.add_memory_event(
+            memory.memory_id,
+            session_id,
+            "persona_setting_cleared",
+            {"field": field},
+        )
+        return True
+
+    def details(self, session_id: str, memory_id: str):
+        memory = self.store.get_memory(memory_id)
+        if memory is None or memory.session_id != session_id:
+            raise ValueError("找不到这条记忆。")
+        evidence = []
+        for item in self.store.list_memory_evidence(memory_id):
+            message = self.store.get_message(item["message_id"])
+            evidence.append(
+                {
+                    **item,
+                    "message_content": (
+                        message["content"] if message else ""
+                    ),
+                    "message_created_at": (
+                        message["created_at"] if message else ""
+                    ),
+                    "message_session_id": (
+                        message["session_id"] if message else ""
+                    ),
+                }
+            )
+        return {
+            "memory": memory,
+            "evidence": evidence,
+            "candidates": self.store.list_memory_candidates(
+                session_id,
+                memory_id=memory_id,
+                limit=20,
+            ),
+            "events": self.store.list_memory_events(memory_id),
+            "recalls": self.store.list_recall_logs_for_memory(
+                session_id,
+                memory_id,
+                limit=10,
+            ),
+            "derived": [
+                child.memory_id
+                for child in self.store.list_child_memories(memory_id)
+            ],
+        }
 
     def remember_experience(
         self,
@@ -491,15 +718,14 @@ class MemoryService:
         summary: str,
         source_message_id,
         receipt_id,
+        derived_from=None,
     ):
-        self.store.add_experience(
-            session_id=session_id,
-            title=title,
-            summary=summary,
-            source_message_id=source_message_id,
-            receipt_id=receipt_id,
-        )
-        return self.store.add_memory(
+        if self.store.content_tombstoned(
+            session_id,
+            _content_hash(summary),
+        ):
+            return ""
+        memory_id = self.store.add_memory(
             session_id=session_id,
             kind="shared_experience",
             content=summary,
@@ -507,7 +733,18 @@ class MemoryService:
             confidence=1.0,
             importance=0.8,
             status="confirmed",
+            derived_from=derived_from,
+            relation="experience",
         )
+        self.store.add_experience(
+            session_id=session_id,
+            title=title,
+            summary=summary,
+            source_message_id=source_message_id,
+            receipt_id=receipt_id,
+            memory_id=memory_id,
+        )
+        return memory_id
 
 
 def relevance_tokens(text: str) -> Iterable[str]:

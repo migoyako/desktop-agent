@@ -8,8 +8,10 @@ venv/
 # Local secrets
 config/keys.json
 
-# Local companion data
-data/
+# Local companion data (persona packs are project assets and stay tracked)
+data/*
+!data/personas/
+!data/personas/**
 
 # Tooling
 .pytest_cache/

@@ -169,6 +169,22 @@ class MemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(created, [])
         self.assertEqual(self.store.list_memories("main"), [])
 
+    def test_roleplay_marker_blocks_user_fact_extraction(self):
+        self.observe("我们来角色扮演吧。请记住我喜欢咖啡。")
+
+        self.assertEqual(self.store.list_memories("main"), [])
+
+    def test_quoted_roleplay_dialogue_is_not_saved_as_user_fact(self):
+        self.observe("（她笑了笑）“我叫林夜，我最喜欢咖啡。”")
+
+        self.assertEqual(self.store.list_memories("main"), [])
+
+    def test_roleplay_guard_does_not_block_normal_sentences(self):
+        self.observe("你演示一下这个流程。请记住我喜欢简洁回答。")
+
+        contents = [item.content for item in self.confirmed()]
+        self.assertTrue(any("简洁回答" in content for content in contents))
+
     def test_explicit_fact_is_confirmed_and_identity_stays_candidate(self):
         self.observe("请记住我不吃香菜。")
         self.observe("我的生日是5月1日。")

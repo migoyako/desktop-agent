@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 from agent_framework.companion.models import AgentMode
+from agent_framework.companion.persona import DEFAULT_PERSONA_ID
 from agent_framework.companion.runtime import CompanionRuntime
 
 
@@ -23,6 +24,13 @@ def parse_args(argv=None):
     parser.add_argument("--session-id", default="main")
     parser.add_argument("--workspace", help="预先授权的工作目录")
     parser.add_argument("--offline", action="store_true", help="强制使用离线模型")
+    parser.add_argument(
+        "--persona",
+        default=DEFAULT_PERSONA_ID,
+        help="人设包 ID，默认 {}（data/personas/<id>）".format(
+            DEFAULT_PERSONA_ID
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -50,7 +58,18 @@ def print_affect(runtime):
 
 def run_cli(runtime):
     mode = runtime.current_mode()
-    print("数字分身已启动。")
+    persona = runtime.persona_info()
+    if persona["loaded"]:
+        print("{} 已启动。".format(persona["name"]))
+        print("人设包：{} v{} / {}".format(
+            persona["id"],
+            persona["version"],
+            persona["stable_hash"][:12],
+        ))
+    else:
+        print("数字分身已启动。")
+        if persona.get("error"):
+            print("人设包加载失败：{}".format(persona["error"]))
     print("命令：/mode chat|work、/workspace 路径、/memory、/affect、/undo、/quit")
     while True:
         try:
@@ -123,6 +142,7 @@ def main(argv=None):
         data_dir=args.data_dir,
         offline=args.offline,
         session_id=args.session_id,
+        persona_id=args.persona,
     )
     if args.workspace:
         try:

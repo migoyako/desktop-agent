@@ -13,7 +13,14 @@
 - 覆盖前创建备份，并支持撤销最近一次写入。
 - SQLite 保存对话、动作提案、执行回执、记忆、共同经历和情绪快照，并按 `user_version` 自动迁移。
 - 记忆以用户消息原文为证据，支持规范键、候选评分、纠正取代、查看和忘记。
-- 遗忘会写入墓碑，阻止相同内容被重新召回或导入。
+- 遗忘会写入墓碑，阻止相同内容被重新召回或导入；由该事实派生的经历、反思和摘要同步失效。
+- 记忆窗口展示来源原文、候选评分、生命周期事件与最近召回；人设事实可设为受保护，不会被自动取代。
+- 旧聊天支持 JSON/JSONL 导入，导入前展示消息数、预计记忆数与耗时，支持暂停续跑和跨副本去重。
+- 导入时，角色扮演会话（标题或开始/结束标记）只导入消息，不抽取用户事实；引用台词与假设句也不会被当作用户自述。
+- 默认人设为《绝区零》蕾米埃尔·丹的本地 persona pack：稳定人格/背景走系统前缀，不写入用户记忆；角色事实不会被说成用户经历。
+- 人设包可用 `--persona <id>` 切换；缺失或损坏时回退为朴素助手人格。
+- “人设”面板可查看来源、许可、版本、大小与世界书条目，编辑称呼/关系/边界，或从本地目录导入人设包。
+- 可选世界书按当前话题触发，只注入相关条目，不进入稳定前缀，也不写入用户记忆。
 - 情绪状态分为用户估计和角色状态，并允许用户纠正。
 - 关闭再打开后可以恢复历史会话和待确认动作。
 
@@ -45,6 +52,12 @@ python companion.py --ui tk
 
 ```powershell
 python companion.py --offline
+```
+
+切换本地人设包（默认 `remielle`）：
+
+```powershell
+python companion.py --persona remielle
 ```
 
 命令行模式：
@@ -108,16 +121,24 @@ python companion.py --ui cli --offline
 ```text
 data/
 ├── companion.db
-└── backups/
+├── backups/
+└── personas/
+    └── remielle/
+        ├── persona.md
+        ├── facts.md
+        ├── worldbook.md
+        └── persona.json
 ```
 
-SQLite 使用 WAL 模式。备份只保存被覆盖文件的写入前内容，撤销时会再次校验哈希。
+SQLite 使用 WAL 模式。备份只保存被覆盖文件的写入前内容，撤销时会再次校验哈希。人设包是稳定资料，不写入 `memories`；角色资料与用户事实分开保存。
 
 可以通过参数指定独立数据目录：
 
 ```powershell
 python companion.py --data-dir C:\path\to\companion-data
 ```
+
+使用独立数据目录时，人设包也放在该目录的 `personas/<id>/` 下；找不到时回退为朴素助手人格。也可以复制 `data/personas/remielle/` 过去。
 
 ## 安全边界
 
@@ -135,8 +156,8 @@ python companion.py --data-dir C:\path\to\companion-data
 - 任意 Shell 命令执行。
 - 鼠标和键盘自动控制。
 - Playwright 浏览器交互。
-- FTS5/BM25 中文召回、旧聊天导入与跨类型遗忘传播。
 - 向量召回与多模态记忆。
+- 旧聊天导出格式的自动识别（当前支持消息数组、含 `messages` 的会话对象和 JSONL）。
 - 主动发言调度。
 - Live2D、语音输入和语音合成。
 - 操作系统钥匙串迁移。
@@ -164,4 +185,6 @@ python -m compileall -q agent_framework companion.py tests
 - 共同经历和回执持久化。
 - 记忆纠正与忘记。
 - 情绪纠正。
+- persona pack 稳定哈希、路径校验、提示分层、角色/用户事实隔离、删除人设不影响记忆。
+- persona 导入预览/覆盖/超限拒绝、世界书按需检索、称呼/关系/边界 protected 设定与人设面板。
 - Tkinter 界面创建冒烟测试。
