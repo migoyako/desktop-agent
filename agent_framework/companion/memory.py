@@ -162,6 +162,7 @@ def _canonical_key(kind: str, content: str) -> str:
 class MemoryService:
     def __init__(self, store):
         self.store = store
+        self.last_recall_source = "keyword"
 
     def observe_user_message(
         self,
@@ -306,15 +307,77 @@ class MemoryService:
             "reason": _memory_reason(kind, explicit),
         }
 
+    FTS_CANDIDATE_LIMIT = 30
+
     def recall(self, session_id: str, query: str, limit: int = 5):
         started = time.perf_counter()
+        tombstones = self.store.list_memory_tombstones(session_id)
+        ranked = self._recall_via_fts(session_id, query, limit, tombstones)
+        source = "fts"
+        if ranked is None:
+            ranked = self._recall_via_keywords(
+                session_id,
+                query,
+                limit,
+                tombstones,
+            )
+            source = "keyword"
+        self.last_recall_source = source
+        self.store.log_recall(
+            session_id,
+            _query_hash(query),
+            [memory.memory_id for _, memory, _ in ranked],
+            [round(score, 6) for score, _, _ in ranked],
+            (time.perf_counter() - started) * 1000.0,
+            source=source,
+        )
+        return ranked
+
+    def _recall_via_fts(self, session_id, query, limit, tombstones):
+        """FTS5/BM25 检索候选，再用单一衰减公式重排。
+
+        返回 ``None`` 表示 FTS 不可用、查询失败或没有候选，
+        调用方降级为关键词召回；聊天主流程永不因索引异常阻塞。
+        """
+        try:
+            hits = self.store.search_memories_fts(
+                session_id,
+                query,
+                limit=self.FTS_CANDIDATE_LIMIT,
+            )
+        except Exception:
+            return None
+        if not hits:
+            return None
+        records = self.store.get_memories_by_ids(
+            [hit["memory_id"] for hit in hits]
+        )
+        ranked = []
+        for hit in hits:
+            memory = records.get(hit["memory_id"])
+            if memory is None or memory.status != "confirmed":
+                continue
+            if _tombstone_blocks(memory, tombstones):
+                continue
+            activation = effective_activation(
+                memory.activation,
+                memory.importance,
+                memory.created_at,
+            )
+            score = recall_score(query, memory.content, activation)
+            if score > 0:
+                ranked.append((score, memory, activation))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return ranked[: max(1, min(limit, 20))]
+
+    def _recall_via_keywords(self, session_id, query, limit, tombstones):
+        """原关键词重叠召回，作为 FTS 不可用时的降级路径。"""
         memories = self.store.list_memories(
             session_id,
             statuses=["confirmed"],
             limit=200,
         )
         ranked = []
-        tombstones = self.store.list_memory_tombstones(session_id)
         for memory in memories:
             if _tombstone_blocks(memory, tombstones):
                 continue
@@ -327,15 +390,7 @@ class MemoryService:
             if score > 0:
                 ranked.append((score, memory, activation))
         ranked.sort(key=lambda item: item[0], reverse=True)
-        selected = ranked[: max(1, min(limit, 20))]
-        self.store.log_recall(
-            session_id,
-            _query_hash(query),
-            [memory.memory_id for _, memory, _ in selected],
-            [round(score, 6) for score, _, _ in selected],
-            (time.perf_counter() - started) * 1000.0,
-        )
-        return selected
+        return ranked[: max(1, min(limit, 20))]
 
     def context_lines(self, session_id: str, query: str, limit: int = 5):
         lines = []
@@ -345,11 +400,18 @@ class MemoryService:
                 if memory.source_message_id is not None
                 else "-"
             )
-            reason = (
-                "结构化记忆+关键词"
-                if memory.canonical_key
-                else "关键词匹配"
-            )
+            if self.last_recall_source == "fts":
+                reason = (
+                    "结构化记忆+BM25召回"
+                    if memory.canonical_key
+                    else "BM25召回"
+                )
+            else:
+                reason = (
+                    "结构化记忆+关键词"
+                    if memory.canonical_key
+                    else "关键词匹配"
+                )
             lines.append(
                 "[记忆 {} | {} | 来源消息 {} | 证据 {} 条 | 原因 {}] {}".format(
                     memory.memory_id,

@@ -88,6 +88,49 @@ def main():
         checks.append(check("Write access", False, str(error)))
 
     try:
+        import sqlite3
+
+        db_path = ROOT / "data" / "companion.db"
+        if db_path.exists():
+            connection = sqlite3.connect(
+                "file:{}?mode=ro".format(db_path.as_posix()),
+                uri=True,
+            )
+            try:
+                integrity = connection.execute(
+                    "PRAGMA integrity_check"
+                ).fetchone()[0]
+                db_version = connection.execute(
+                    "PRAGMA user_version"
+                ).fetchone()[0]
+                names = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master"
+                    ).fetchall()
+                }
+            finally:
+                connection.close()
+            fts_state = (
+                "ready" if "memory_fts" in names else "missing(启动时自愈)"
+            )
+            checks.append(
+                check(
+                    "Database",
+                    integrity == "ok",
+                    "{} user_version={} fts={}".format(
+                        integrity,
+                        db_version,
+                        fts_state,
+                    ),
+                )
+            )
+        else:
+            checks.append(check("Database", True, "尚未创建"))
+    except Exception as error:
+        checks.append(check("Database", False, str(error)))
+
+    try:
         if tk is None:
             raise RuntimeError("tkinter is not installed")
         root = tk.Tk()

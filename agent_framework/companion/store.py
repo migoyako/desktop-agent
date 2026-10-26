@@ -21,6 +21,7 @@ from .models import (
     new_id,
     utc_now,
 )
+from .textseg import fts_match_query, fts_segment
 
 
 SCHEMA = """
@@ -159,7 +160,14 @@ CREATE TABLE IF NOT EXISTS workspace_grants (
 """
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+MEMORY_FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+    memory_id UNINDEXED,
+    seg
+);
+"""
 
 MEMORY_LIFECYCLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory_evidence (
@@ -308,6 +316,37 @@ def _migrate_v1(connection):
     )
 
 
+def _migrate_v2(connection):
+    """召回索引：recall_log.source 列 + FTS5 虚表与全量回填。
+
+    FTS5 不可用（编译选项缺失）时不抛错：只跳过虚表，
+    召回自动降级为关键词路径，聊天主流程不受影响。
+    """
+    _add_column_if_missing(
+        connection,
+        "recall_log",
+        "source",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    try:
+        connection.executescript(MEMORY_FTS_SCHEMA)
+    except sqlite3.Error:
+        return
+    _reindex_memory_fts(connection)
+
+
+def _reindex_memory_fts(connection):
+    """从 memories 全量重建 memory_fts 索引（幂等）。"""
+    connection.execute("DELETE FROM memory_fts")
+    rows = connection.execute(
+        "SELECT memory_id, content FROM memories"
+    ).fetchall()
+    connection.executemany(
+        "INSERT INTO memory_fts(memory_id, seg) VALUES (?, ?)",
+        [(row["memory_id"], fts_segment(row["content"])) for row in rows],
+    )
+
+
 class CompanionStore:
     def __init__(self, database_path):
         self.database_path = Path(database_path)
@@ -326,6 +365,7 @@ class CompanionStore:
             connection.close()
 
     def _initialize(self):
+        self.fts_enabled = False
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
@@ -336,9 +376,34 @@ class CompanionStore:
                 if version < 1:
                     _migrate_v1(connection)
                     version = 1
+                if version < 2:
+                    _migrate_v2(connection)
+                    version = 2
             connection.execute(
                 "PRAGMA user_version = {}".format(int(version))
             )
+            self.fts_enabled = self._ensure_memory_fts(connection)
+
+    @staticmethod
+    def _ensure_memory_fts(connection) -> bool:
+        """启动时自愈 FTS 索引：缺表建表、行数不符则重建。
+
+        任何异常都只关闭 FTS 召回（降级关键词），不阻塞启动。
+        """
+        try:
+            connection.executescript(MEMORY_FTS_SCHEMA)
+            indexed = connection.execute(
+                "SELECT COUNT(*) AS value FROM memory_fts"
+            ).fetchone()["value"]
+            total = connection.execute(
+                "SELECT COUNT(*) AS value FROM memories"
+            ).fetchone()["value"]
+            if int(indexed) != int(total):
+                _reindex_memory_fts(connection)
+            connection.execute("SELECT COUNT(*) FROM memory_fts").fetchone()
+            return True
+        except sqlite3.Error:
+            return False
 
     def ensure_session(self, session_id: str, mode: AgentMode):
         now = utc_now()
@@ -808,6 +873,7 @@ class CompanionStore:
                     quote_start,
                     now,
                 )
+            self._index_memory_fts(connection, memory_id, content)
             self._insert_memory_event(
                 connection,
                 memory_id,
@@ -1002,6 +1068,110 @@ class CompanionStore:
                 ),
                 tuple(values),
             )
+            if content is not None:
+                self._reindex_memory_fts_row(
+                    connection,
+                    memory_id,
+                    content,
+                )
+
+    def _index_memory_fts(self, connection, memory_id, content):
+        """向 FTS 索引追加一行；索引异常时自动降级，不阻塞记忆写入。"""
+        if not self.fts_enabled:
+            return
+        try:
+            connection.execute(
+                "INSERT INTO memory_fts(memory_id, seg) VALUES (?, ?)",
+                (memory_id, fts_segment(content)),
+            )
+        except sqlite3.Error:
+            self.fts_enabled = False
+
+    def _reindex_memory_fts_row(self, connection, memory_id, content):
+        """内容变更（如用户纠正）后替换该记忆的索引行。"""
+        if not self.fts_enabled:
+            return
+        try:
+            connection.execute(
+                "DELETE FROM memory_fts WHERE memory_id = ?",
+                (memory_id,),
+            )
+            connection.execute(
+                "INSERT INTO memory_fts(memory_id, seg) VALUES (?, ?)",
+                (memory_id, fts_segment(content)),
+            )
+        except sqlite3.Error:
+            self.fts_enabled = False
+
+    def search_memories_fts(
+        self,
+        session_id: str,
+        query: str,
+        limit: int = 30,
+    ) -> Optional[List[Dict]]:
+        """FTS5/BM25 候选检索，仅返回 confirmed 记忆。
+
+        返回值：``None`` 表示 FTS 不可用或查询异常（调用方应降级为
+        关键词召回）；``[]`` 表示索引可用但没有候选。BM25 分数只用于
+        候选排序，最终排序仍由记忆服务的单一衰减公式完成。
+        """
+        if not self.fts_enabled:
+            return None
+        match = fts_match_query(query)
+        if not match:
+            return []
+        with self._connection() as connection:
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT memory_fts.memory_id AS memory_id,
+                        bm25(memory_fts) AS score
+                    FROM memory_fts
+                    JOIN memories m
+                        ON m.memory_id = memory_fts.memory_id
+                    WHERE memory_fts MATCH ?
+                        AND m.session_id = ?
+                        AND m.status = 'confirmed'
+                    ORDER BY score
+                    LIMIT ?
+                    """,
+                    (match, session_id, max(1, min(int(limit), 100))),
+                ).fetchall()
+            except sqlite3.Error:
+                self.fts_enabled = False
+                return None
+        return [
+            {"memory_id": row["memory_id"], "bm25": float(row["score"])}
+            for row in rows
+        ]
+
+    def get_memories_by_ids(self, memory_ids) -> Dict[str, MemoryRecord]:
+        ids = [str(item) for item in memory_ids if item]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM memories WHERE memory_id IN ({})".format(
+                    placeholders
+                ),
+                tuple(ids),
+            ).fetchall()
+        return {
+            row["memory_id"]: self._memory_from_row(row) for row in rows
+        }
+
+    def rebuild_memory_fts(self) -> bool:
+        """全量重建 FTS 索引（管理台/doctor 自愈入口）。"""
+        with self._connection() as connection:
+            try:
+                connection.executescript(MEMORY_FTS_SCHEMA)
+                _reindex_memory_fts(connection)
+                self.fts_enabled = True
+                return True
+            except sqlite3.Error:
+                self.fts_enabled = False
+                return False
 
     def get_memory(self, memory_id: str) -> Optional[MemoryRecord]:
         with self._connection() as connection:
@@ -1322,14 +1492,15 @@ class CompanionStore:
         fact_ids: List[str],
         scores: List[float],
         latency_ms: float,
+        source: str = "",
     ):
         with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO recall_log(
                     recall_id, session_id, query_hash, fact_ids, scores,
-                    used_in_reply, latency_ms, created_at
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                    used_in_reply, latency_ms, source, created_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
                 """,
                 (
                     new_id("rcl"),
@@ -1338,6 +1509,7 @@ class CompanionStore:
                     json.dumps(fact_ids, ensure_ascii=False),
                     json.dumps(scores),
                     float(latency_ms),
+                    source,
                     utc_now(),
                 ),
             )
