@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+import hashlib
 import json
 import sqlite3
 from typing import Dict, Iterable, List, Optional
@@ -17,6 +18,7 @@ from .models import (
     MemoryRecord,
     ProposalStatus,
     RiskLevel,
+    new_id,
     utc_now,
 )
 
@@ -82,6 +84,25 @@ CREATE TABLE IF NOT EXISTS action_receipts (
     FOREIGN KEY(action_id) REFERENCES action_proposals(action_id)
 );
 
+CREATE TABLE IF NOT EXISTS execution_ledger (
+    action_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    receipt_id TEXT,
+    workspace_json TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    before_json TEXT NOT NULL,
+    after_json TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(action_id) REFERENCES action_proposals(action_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_ledger_status
+    ON execution_ledger(status);
+
 CREATE TABLE IF NOT EXISTS memories (
     memory_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -138,6 +159,155 @@ CREATE TABLE IF NOT EXISTS workspace_grants (
 """
 
 
+SCHEMA_VERSION = 1
+
+MEMORY_LIFECYCLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS memory_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    source_role TEXT NOT NULL,
+    quote TEXT NOT NULL,
+    quote_start INTEGER NOT NULL,
+    quote_end INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(memory_id) REFERENCES memories(memory_id),
+    FOREIGN KEY(message_id) REFERENCES messages(id),
+    UNIQUE(memory_id, message_id, quote)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_evidence_memory
+    ON memory_evidence(memory_id, created_at);
+
+CREATE TABLE IF NOT EXISTS memory_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    canonical_key TEXT NOT NULL,
+    content TEXT NOT NULL,
+    score REAL NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(memory_id) REFERENCES memories(memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_candidates_session
+    ON memory_candidates(session_id, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS memory_events (
+    event_id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(memory_id) REFERENCES memories(memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_events_memory
+    ON memory_events(memory_id, created_at);
+
+CREATE TABLE IF NOT EXISTS recall_log (
+    recall_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    query_hash TEXT NOT NULL,
+    fact_ids TEXT NOT NULL,
+    scores TEXT NOT NULL,
+    used_in_reply INTEGER NOT NULL DEFAULT 0,
+    latency_ms REAL NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recall_log_session
+    ON recall_log(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS memory_tombstones (
+    tombstone_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    canonical_key TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    forget_epoch INTEGER NOT NULL,
+    through_seq INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_tombstones_session
+    ON memory_tombstones(session_id, canonical_key);
+"""
+
+
+def _add_column_if_missing(connection, table, column, definition):
+    existing = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info({})".format(table)
+        ).fetchall()
+    }
+    if column not in existing:
+        connection.execute(
+            "ALTER TABLE {} ADD COLUMN {} {}".format(
+                table,
+                column,
+                definition,
+            )
+        )
+
+
+def _migrate_v1(connection):
+    _add_column_if_missing(
+        connection,
+        "memories",
+        "canonical_key",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column_if_missing(
+        connection,
+        "memories",
+        "evidence_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        connection,
+        "memories",
+        "protected",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        connection,
+        "memories",
+        "merged_from_ids",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    _add_column_if_missing(
+        connection,
+        "memories",
+        "forget_epoch",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        connection,
+        "memories",
+        "first_seen_at",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column_if_missing(
+        connection,
+        "memories",
+        "last_seen_at",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    connection.executescript(MEMORY_LIFECYCLE_SCHEMA)
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_memories_key
+            ON memories(session_id, canonical_key, status)
+        """
+    )
+
+
 class CompanionStore:
     def __init__(self, database_path):
         self.database_path = Path(database_path)
@@ -159,6 +329,16 @@ class CompanionStore:
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
+            version = int(
+                connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if version < SCHEMA_VERSION:
+                if version < 1:
+                    _migrate_v1(connection)
+                    version = 1
+            connection.execute(
+                "PRAGMA user_version = {}".format(int(version))
+            )
 
     def ensure_session(self, session_id: str, mode: AgentMode):
         now = utc_now()
@@ -173,6 +353,17 @@ class CompanionStore:
                 """,
                 (session_id, AgentMode(mode).value, now, now),
             )
+
+    def set_session_mode(self, session_id: str, mode: AgentMode):
+        self.ensure_session(session_id, mode)
+
+    def get_session_mode(self, session_id: str) -> Optional[AgentMode]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT mode FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        return AgentMode(row["mode"]) if row else None
 
     def add_message(
         self,
@@ -379,6 +570,188 @@ class CompanionStore:
                 (status, receipt_id),
             )
 
+    def save_receipt_once(self, receipt: ActionResult) -> ActionResult:
+        try:
+            self.save_receipt(receipt)
+            return receipt
+        except sqlite3.IntegrityError:
+            existing = self.get_receipt_for_action(receipt.action_id)
+            if existing is None:
+                raise
+            return existing
+
+    def claim_execution(self, proposal: ActionProposal):
+        workspace = proposal.expected_state.get("workspace") or {}
+        target = proposal.expected_state.get("target")
+        content = proposal.normalized_arguments.get("content", "")
+        content_sha256 = hashlib.sha256(
+            str(content).encode("utf-8")
+        ).hexdigest()
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO execution_ledger(
+                    action_id, idempotency_key, session_id, status, receipt_id,
+                    workspace_json, target_path, content_sha256, before_json,
+                    after_json, started_at, updated_at
+                ) VALUES (?, ?, ?, 'running', NULL, ?, ?, ?, ?, '{}', ?, ?)
+                """,
+                (
+                    proposal.action_id,
+                    proposal.idempotency_key,
+                    proposal.session_id,
+                    json.dumps(workspace, ensure_ascii=False),
+                    proposal.target_summary,
+                    content_sha256,
+                    json.dumps(target, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM execution_ledger WHERE action_id = ?",
+                (proposal.action_id,),
+            ).fetchone()
+            if row is None:
+                conflict = connection.execute(
+                    "SELECT action_id FROM execution_ledger WHERE idempotency_key = ?",
+                    (proposal.idempotency_key,),
+                ).fetchone()
+                if conflict is not None:
+                    raise ValueError("执行幂等键已被其他动作使用。")
+        if row is None:
+            raise ValueError("执行账本写入失败。")
+        return cursor.rowcount == 1, dict(row)
+
+    def mark_execution_state(self, action_id: str, status: str):
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE execution_ledger
+                SET status = ?, updated_at = ?
+                WHERE action_id = ?
+                  AND status IN ('running', 'dispatching', 'replaced')
+                """,
+                (status, utc_now(), action_id),
+            )
+
+    def finish_execution(
+        self,
+        action_id: str,
+        status: str,
+        receipt_id: str,
+        after=None,
+    ):
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE execution_ledger
+                SET status = ?, receipt_id = ?, after_json = ?, updated_at = ?
+                WHERE action_id = ?
+                  AND status IN ('running', 'dispatching', 'replaced')
+                """,
+                (
+                    status,
+                    receipt_id,
+                    json.dumps(after, ensure_ascii=False),
+                    utc_now(),
+                    action_id,
+                ),
+            )
+
+    def get_execution(self, action_id: str) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM execution_ledger WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def recover_incomplete_executions(self):
+        recovered = []
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM execution_ledger
+                WHERE status IN ('running', 'dispatching', 'replaced')
+                """
+            ).fetchall()
+        for row in rows:
+            action_id = row["action_id"]
+            receipt = self.get_receipt_for_action(action_id)
+            if receipt is None:
+                receipt = self.save_receipt_once(
+                    ActionResult(
+                        receipt_id=new_id("rcp"),
+                        action_id=action_id,
+                        session_id=row["session_id"],
+                        status="unknown",
+                        summary="上次执行未完成，结果不确定。",
+                        result={
+                            "recovered": True,
+                            "target_path": row["target_path"],
+                            "workspace": json.loads(row["workspace_json"]),
+                            "before": json.loads(row["before_json"]),
+                        },
+                        started_at=row["started_at"],
+                        finished_at=utc_now(),
+                        error="process interrupted before a receipt was recorded",
+                        undoable=False,
+                    )
+                )
+            status = receipt.status
+            proposal_status = {
+                "completed": ProposalStatus.COMPLETED,
+                "failed": ProposalStatus.FAILED,
+                "not_executed": ProposalStatus.NOT_EXECUTED,
+            }.get(status, ProposalStatus.UNKNOWN)
+            ledger_status = (
+                status
+                if status in ("completed", "failed", "not_executed")
+                else "unknown"
+            )
+            self.update_proposal_status(action_id, proposal_status)
+            self.finish_execution(
+                action_id,
+                ledger_status,
+                receipt.receipt_id,
+                after=receipt.result.get("after"),
+            )
+            recovered.append(receipt)
+
+        with self._connection() as connection:
+            legacy = connection.execute(
+                """
+                SELECT action_id, session_id, updated_at
+                FROM action_proposals
+                WHERE status = ?
+                """,
+                (ProposalStatus.RUNNING.value,),
+            ).fetchall()
+        for row in legacy:
+            if self.get_execution(row["action_id"]) is not None:
+                continue
+            receipt = self.get_receipt_for_action(row["action_id"])
+            if receipt is None:
+                receipt = self.save_receipt_once(
+                    ActionResult(
+                        receipt_id=new_id("rcp"),
+                        action_id=row["action_id"],
+                        session_id=row["session_id"],
+                        status="unknown",
+                        summary="上次执行未完成，结果不确定。",
+                        result={"recovered": True},
+                        started_at=row["updated_at"],
+                        finished_at=utc_now(),
+                        error="process interrupted before a receipt was recorded",
+                        undoable=False,
+                    )
+                )
+            self.update_proposal_status(row["action_id"], ProposalStatus.UNKNOWN)
+            recovered.append(receipt)
+        return recovered
+
     def add_memory(
         self,
         session_id: str,
@@ -388,18 +761,24 @@ class CompanionStore:
         confidence: float,
         importance: float,
         status: str = "candidate",
+        canonical_key: str = "",
+        evidence: Optional[Dict] = None,
+        candidate_score: Optional[float] = None,
+        candidate_reason: str = "",
     ) -> str:
-        from .models import new_id
-
         now = utc_now()
         memory_id = new_id("mem")
         with self._connection() as connection:
+            validated = self._validate_evidence(connection, evidence)
+            quote, quote_start = validated if validated else ("", 0)
             connection.execute(
                 """
                 INSERT INTO memories(
                     memory_id, session_id, kind, content, source_message_id,
-                    confidence, importance, activation, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    confidence, importance, activation, status, created_at,
+                    updated_at, canonical_key, evidence_count, first_seen_at,
+                    last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     memory_id,
@@ -413,9 +792,158 @@ class CompanionStore:
                     status,
                     now,
                     now,
+                    canonical_key,
+                    1 if quote else 0,
+                    now,
+                    now,
                 ),
             )
+            if quote:
+                self._insert_evidence(
+                    connection,
+                    memory_id,
+                    session_id,
+                    evidence,
+                    quote,
+                    quote_start,
+                    now,
+                )
+            self._insert_memory_event(
+                connection,
+                memory_id,
+                session_id,
+                "created",
+                {
+                    "kind": kind,
+                    "status": status,
+                    "canonical_key": canonical_key,
+                    "has_evidence": bool(quote),
+                },
+                now,
+            )
+            if status == "candidate":
+                self._insert_memory_candidate(
+                    connection,
+                    session_id,
+                    memory_id,
+                    canonical_key,
+                    content,
+                    candidate_score if candidate_score is not None else confidence,
+                    candidate_reason or "自动抽取",
+                    now,
+                )
         return memory_id
+
+    @staticmethod
+    def _validate_evidence(connection, evidence):
+        if not evidence:
+            return None
+        message_id = evidence.get("message_id")
+        quote = str(evidence.get("quote") or "").strip()
+        if message_id is None or not quote:
+            raise ValueError("记忆证据必须包含消息 ID 和原文片段。")
+        row = connection.execute(
+            "SELECT role, content FROM messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("记忆证据指向的消息不存在。")
+        if row["role"] != "user":
+            raise ValueError("记忆证据必须来自用户消息。")
+        content = row["content"] or ""
+        start = content.find(quote)
+        if start < 0:
+            raise ValueError("记忆证据必须是用户消息原文的子串。")
+        return quote, start
+
+    @staticmethod
+    def _insert_evidence(
+        connection,
+        memory_id,
+        session_id,
+        evidence,
+        quote,
+        quote_start,
+        now,
+    ):
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO memory_evidence(
+                evidence_id, memory_id, session_id, message_id,
+                source_role, quote, quote_start, quote_end, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id("evd"),
+                memory_id,
+                session_id,
+                evidence["message_id"],
+                "user",
+                quote,
+                quote_start,
+                quote_start + len(quote),
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _insert_memory_event(
+        connection,
+        memory_id,
+        session_id,
+        event_type,
+        detail,
+        now=None,
+    ):
+        connection.execute(
+            """
+            INSERT INTO memory_events(
+                event_id, memory_id, session_id, event_type,
+                detail, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id("evt"),
+                memory_id,
+                session_id,
+                event_type,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                now or utc_now(),
+            ),
+        )
+
+    @staticmethod
+    def _insert_memory_candidate(
+        connection,
+        session_id,
+        memory_id,
+        canonical_key,
+        content,
+        score,
+        reason,
+        now,
+        status="pending",
+    ):
+        connection.execute(
+            """
+            INSERT INTO memory_candidates(
+                candidate_id, session_id, memory_id, canonical_key,
+                content, score, status, reason, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id("cand"),
+                session_id,
+                memory_id,
+                canonical_key,
+                content,
+                max(0.0, min(float(score), 1.0)),
+                status,
+                reason,
+                now,
+                now,
+            ),
+        )
 
     def list_memories(
         self,
@@ -474,6 +1002,358 @@ class CompanionStore:
                 ),
                 tuple(values),
             )
+
+    def get_memory(self, memory_id: str) -> Optional[MemoryRecord]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM memories WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+        return self._memory_from_row(row) if row else None
+
+    def get_message_role(self, message_id: int) -> Optional[str]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT role FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+        return row["role"] if row else None
+
+    def find_memory_by_key(
+        self,
+        session_id: str,
+        canonical_key: str,
+        statuses: Optional[Iterable[str]] = None,
+    ) -> Optional[MemoryRecord]:
+        if not canonical_key:
+            return None
+        statuses = list(statuses or ["candidate", "confirmed"])
+        placeholders = ",".join("?" for _ in statuses)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM memories
+                WHERE session_id = ? AND canonical_key = ?
+                    AND status IN ({})
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """.format(placeholders),
+                (session_id, canonical_key, *statuses),
+            ).fetchone()
+        return self._memory_from_row(row) if row else None
+
+    def reinforce_memory(self, memory_id: str, evidence: Dict) -> bool:
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT session_id FROM memories WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            validated = self._validate_evidence(connection, evidence)
+            if not validated:
+                return False
+            quote, quote_start = validated
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO memory_evidence(
+                    evidence_id, memory_id, session_id, message_id,
+                    source_role, quote, quote_start, quote_end, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id("evd"),
+                    memory_id,
+                    row["session_id"],
+                    evidence["message_id"],
+                    "user",
+                    quote,
+                    quote_start,
+                    quote_start + len(quote),
+                    now,
+                ),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    """
+                    UPDATE memories SET
+                        evidence_count = evidence_count + 1,
+                        last_seen_at = ?,
+                        updated_at = ?
+                    WHERE memory_id = ?
+                    """,
+                    (now, now, memory_id),
+                )
+                self._insert_memory_event(
+                    connection,
+                    memory_id,
+                    row["session_id"],
+                    "reinforced",
+                    {"message_id": evidence["message_id"]},
+                    now,
+                )
+                return True
+        return False
+
+    def promote_memory(self, memory_id: str, score: float, reason: str):
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT session_id FROM memories WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return
+            connection.execute(
+                """
+                UPDATE memories SET
+                    status = 'confirmed',
+                    confidence = ?,
+                    updated_at = ?
+                WHERE memory_id = ?
+                """,
+                (max(0.0, min(float(score), 1.0)), now, memory_id),
+            )
+            connection.execute(
+                """
+                UPDATE memory_candidates SET
+                    status = 'accepted',
+                    updated_at = ?
+                WHERE memory_id = ? AND status = 'pending'
+                """,
+                (now, memory_id),
+            )
+            self._insert_memory_event(
+                connection,
+                memory_id,
+                row["session_id"],
+                "promoted",
+                {"score": score, "reason": reason},
+                now,
+            )
+
+    def archive_memory(self, memory_id: str, reason: str):
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT session_id FROM memories WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return
+            connection.execute(
+                "UPDATE memories SET status = 'archived', updated_at = ? WHERE memory_id = ?",
+                (now, memory_id),
+            )
+            connection.execute(
+                """
+                UPDATE memory_candidates SET
+                    status = 'superseded',
+                    updated_at = ?
+                WHERE memory_id = ? AND status = 'pending'
+                """,
+                (now, memory_id),
+            )
+            self._insert_memory_event(
+                connection,
+                memory_id,
+                row["session_id"],
+                "superseded",
+                {"reason": reason},
+                now,
+            )
+
+    def add_memory_candidate(
+        self,
+        session_id: str,
+        memory_id: str,
+        canonical_key: str,
+        content: str,
+        score: float,
+        reason: str,
+    ):
+        with self._connection() as connection:
+            self._insert_memory_candidate(
+                connection,
+                session_id,
+                memory_id,
+                canonical_key,
+                content,
+                score,
+                reason,
+                utc_now(),
+            )
+
+    def add_memory_event(
+        self,
+        memory_id: str,
+        session_id: str,
+        event_type: str,
+        detail,
+    ):
+        with self._connection() as connection:
+            self._insert_memory_event(
+                connection,
+                memory_id,
+                session_id,
+                event_type,
+                detail,
+            )
+
+    def add_memory_tombstone(
+        self,
+        session_id: str,
+        canonical_key: str,
+        content_hash: str,
+        forget_epoch: int,
+        through_seq: int,
+    ):
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO memory_tombstones(
+                    tombstone_id, session_id, canonical_key, content_hash,
+                    forget_epoch, through_seq, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id("tmb"),
+                    session_id,
+                    canonical_key,
+                    content_hash,
+                    int(forget_epoch),
+                    int(through_seq),
+                    utc_now(),
+                ),
+            )
+
+    def content_tombstoned(self, session_id: str, content_hash: str) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM memory_tombstones
+                WHERE session_id = ? AND content_hash = ?
+                LIMIT 1
+                """,
+                (session_id, content_hash),
+            ).fetchone()
+        return row is not None
+
+    def list_memory_tombstones(self, session_id: str):
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_tombstones
+                WHERE session_id = ?
+                ORDER BY created_at
+                """,
+                (session_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def max_message_id(self, session_id: str) -> int:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(id), 0) AS value FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row["value"])
+
+    def list_memory_evidence(self, memory_id: str):
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_evidence
+                WHERE memory_id = ?
+                ORDER BY created_at, evidence_id
+                """,
+                (memory_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_memory_events(self, memory_id: str):
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_events
+                WHERE memory_id = ?
+                ORDER BY created_at, event_id
+                """,
+                (memory_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_memory_candidates(
+        self,
+        session_id: str,
+        statuses: Optional[Iterable[str]] = None,
+        limit: int = 50,
+    ):
+        statuses = list(statuses or [])
+        with self._connection() as connection:
+            if statuses:
+                placeholders = ",".join("?" for _ in statuses)
+                rows = connection.execute(
+                    """
+                    SELECT * FROM memory_candidates
+                    WHERE session_id = ? AND status IN ({})
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """.format(placeholders),
+                    (session_id, *statuses, max(1, min(int(limit), 500))),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM memory_candidates
+                    WHERE session_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (session_id, max(1, min(int(limit), 500))),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def log_recall(
+        self,
+        session_id: str,
+        query_hash: str,
+        fact_ids: List[str],
+        scores: List[float],
+        latency_ms: float,
+    ):
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO recall_log(
+                    recall_id, session_id, query_hash, fact_ids, scores,
+                    used_in_reply, latency_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    new_id("rcl"),
+                    session_id,
+                    query_hash,
+                    json.dumps(fact_ids, ensure_ascii=False),
+                    json.dumps(scores),
+                    float(latency_ms),
+                    utc_now(),
+                ),
+            )
+
+    def list_recall_logs(self, session_id: str, limit: int = 20):
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM recall_log
+                WHERE session_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (session_id, max(1, min(int(limit), 200))),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def add_experience(
         self,
@@ -667,6 +1547,7 @@ class CompanionStore:
 
     @staticmethod
     def _memory_from_row(row):
+        keys = set(row.keys())
         return MemoryRecord(
             memory_id=row["memory_id"],
             session_id=row["session_id"],
@@ -679,4 +1560,20 @@ class CompanionStore:
             status=row["status"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            canonical_key=(
+                row["canonical_key"] if "canonical_key" in keys else ""
+            ),
+            evidence_count=(
+                row["evidence_count"] if "evidence_count" in keys else 0
+            ),
+            protected=bool(row["protected"]) if "protected" in keys else False,
+            forget_epoch=(
+                row["forget_epoch"] if "forget_epoch" in keys else 0
+            ),
+            first_seen_at=(
+                row["first_seen_at"] if "first_seen_at" in keys else ""
+            ),
+            last_seen_at=(
+                row["last_seen_at"] if "last_seen_at" in keys else ""
+            ),
         )

@@ -431,31 +431,36 @@ class CompanionWindow(QMainWindow):
         self.confirm_button = QPushButton("允许这次写入")
         self.confirm_button.setObjectName("primary")
         self.cancel_button = QPushButton("取消")
-        self.undo_button = QPushButton("撤销最近写入")
         self.confirm_button.clicked.connect(self.confirm_action)
         self.cancel_button.clicked.connect(self.cancel_action)
-        self.undo_button.clicked.connect(self.undo_last)
         confirm_buttons.addWidget(self.confirm_button)
         confirm_buttons.addWidget(self.cancel_button)
-        confirm_buttons.addWidget(self.undo_button)
         confirm_buttons.addStretch()
         confirm_layout.addWidget(self.confirm_plan)
         confirm_layout.addLayout(confirm_buttons)
         self.confirm_frame.hide()
         outer.addWidget(self.confirm_frame)
 
+        status_row = QHBoxLayout()
         self.status = QLabel()
         self.status.setObjectName("muted")
         self.status.setWordWrap(True)
-        outer.addWidget(self.status)
+        self.undo_button = QPushButton("撤销最近写入")
+        self.undo_button.clicked.connect(self.undo_last)
+        self.undo_button.hide()
+        status_row.addWidget(self.status, 1)
+        status_row.addWidget(self.undo_button)
+        outer.addLayout(status_row)
 
-        self.set_mode(AgentMode.CHAT)
+        self.set_mode(self.runtime.current_mode())
         self.refresh_workspace()
         self.refresh_history()
         self.refresh_pending()
 
     def set_mode(self, mode):
+        mode = AgentMode(mode)
         self.mode = mode
+        self.runtime.set_mode(mode)
         if mode == AgentMode.CHAT:
             self.chat_button.setObjectName("active")
             self.work_button.setObjectName("")
@@ -544,6 +549,7 @@ class CompanionWindow(QMainWindow):
         if not self.current_proposal:
             return
         action_id = self.current_proposal.action_id
+        mode = self.mode
         self.confirm_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
         self.avatar.set_state(status="写入中")
@@ -554,14 +560,25 @@ class CompanionWindow(QMainWindow):
             self.confirm_frame.hide()
             self.current_proposal = None
             self.refresh_history()
-            self.avatar.set_state(status="工作中")
+            self.refresh_workspace()
             receipt = result.get("receipt")
             if receipt:
-                self.status.setText(receipt.summary)
-                self.undo_button.show()
+                text = (
+                    receipt.summary
+                    if receipt.status == "completed"
+                    else result.get("answer", receipt.summary)
+                )
+                self.status.setText(text)
+                if receipt.undoable and receipt.undo_status == "available":
+                    self.undo_button.show()
+                else:
+                    self.undo_button.hide()
+            self.avatar.set_state(
+                status="陪伴中" if self.mode == AgentMode.CHAT else "工作中"
+            )
 
         self.run_worker(
-            lambda: self.runtime.confirm_proposal(action_id),
+            lambda: self.runtime.confirm_proposal(action_id, mode),
             done,
         )
 

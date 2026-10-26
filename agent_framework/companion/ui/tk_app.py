@@ -258,25 +258,32 @@ class CompanionTkApp:
         buttons.pack(fill="x", padx=10, pady=(0, 8))
         self.confirm_button = ttk.Button(buttons, text="允许这次写入", style="Primary.TButton", command=self.confirm_action)
         self.cancel_button = ttk.Button(buttons, text="取消", command=self.cancel_action)
-        self.undo_button = ttk.Button(buttons, text="撤销最近写入", command=self.undo_last)
         self.confirm_button.pack(side="left")
         self.cancel_button.pack(side="left", padx=6)
-        self.undo_button.pack(side="left", padx=6)
 
+        self.status_row = tk.Frame(self.root, bg=BG)
+        self.status_row.pack(fill="x", padx=18, pady=(0, 10))
         self.status = tk.Label(
-            self.root,
+            self.status_row,
             text="",
             anchor="w",
             bg=BG,
             fg=MUTED,
-            wraplength=450,
+            wraplength=330,
             font=("Microsoft YaHei UI", 8),
         )
-        self.status.pack(fill="x", padx=18, pady=(0, 10))
-        self.set_mode(AgentMode.CHAT)
+        self.status.pack(side="left", fill="x", expand=True)
+        self.undo_button = ttk.Button(
+            self.status_row,
+            text="撤销最近写入",
+            command=self.undo_last,
+        )
+        self.set_mode(self.runtime.current_mode())
 
     def set_mode(self, mode):
+        mode = AgentMode(mode)
         self.mode = mode
+        self.runtime.set_mode(mode)
         if mode == AgentMode.CHAT:
             self.chat_mode.configure(style="Primary.TButton")
             self.work_mode.configure(style="TButton")
@@ -365,6 +372,7 @@ class CompanionTkApp:
         if not self.current_proposal:
             return
         action_id = self.current_proposal.action_id
+        mode = self.mode
         self.confirm_button.configure(state="disabled")
         self.cancel_button.configure(state="disabled")
         self.avatar.set_state(status="写入中")
@@ -377,13 +385,26 @@ class CompanionTkApp:
             self.refresh_history()
             self.refresh_workspace()
             receipt = result.get("receipt")
-            self.status.configure(text=receipt.summary if receipt else "")
             if receipt:
-                self.undo_button.pack(side="left", padx=6)
-            self.avatar.set_state(status="工作中")
+                text = (
+                    receipt.summary
+                    if receipt.status == "completed"
+                    else result.get("answer", receipt.summary)
+                )
+                self.status.configure(text=text)
+                if receipt.undoable and receipt.undo_status == "available":
+                    self.undo_button.pack(side="right", padx=(6, 0))
+                else:
+                    self.undo_button.pack_forget()
+            else:
+                self.status.configure(text="")
+                self.undo_button.pack_forget()
+            self.avatar.set_state(
+                status="陪伴中" if self.mode == AgentMode.CHAT else "工作中"
+            )
 
         self.run_async(
-            lambda: self.runtime.confirm_proposal(action_id),
+            lambda: self.runtime.confirm_proposal(action_id, mode),
             success,
         )
 

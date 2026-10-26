@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 import os
 from pathlib import Path, PureWindowsPath
@@ -25,6 +25,7 @@ from .models import (
 
 MAX_NOTE_BYTES = 512 * 1024
 ALLOWED_NOTE_SUFFIXES = {".md", ".txt"}
+PROPOSAL_TTL_HOURS = 24
 BLOCKED_NAMES = {
     ".git",
     ".codex",
@@ -38,6 +39,53 @@ BLOCKED_NAMES = {
 
 class FileActionError(RuntimeError):
     pass
+
+
+class UncertainExecutionError(FileActionError):
+    """The action may have produced a side effect, but the outcome is unknown."""
+
+
+def workspace_identity(root) -> Dict:
+    path = Path(root).resolve()
+    value = os.stat(path, follow_symlinks=False)
+    return {
+        "root": str(path),
+        "device": str(value.st_dev),
+        "file_id": str(value.st_ino),
+    }
+
+
+def workspace_identity_valid(snapshot: Dict) -> bool:
+    if not snapshot or not snapshot.get("root"):
+        return False
+    root = Path(snapshot["root"])
+    if not root.exists() or not root.is_dir():
+        return False
+    try:
+        current = workspace_identity(root)
+    except OSError:
+        return False
+    return (
+        current["root"] == snapshot.get("root")
+        and current["device"] == str(snapshot.get("device"))
+        and current["file_id"] == str(snapshot.get("file_id"))
+    )
+
+
+def proposal_expired(expected_state: Dict, now=None) -> bool:
+    value = (expected_state or {}).get("expires_at")
+    if not value:
+        return False
+    try:
+        expiry = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current > expiry
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -193,6 +241,8 @@ class NoteActionService:
         content: str,
         mode: AgentMode = AgentMode.WORK,
         source_message_id: Optional[int] = None,
+        intent: str = "保存网页搜索笔记",
+        ttl_hours: float = PROPOSAL_TTL_HOURS,
     ) -> ActionProposal:
         if len(content.encode("utf-8")) > MAX_NOTE_BYTES:
             raise FileActionError("笔记内容超过大小限制。")
@@ -213,14 +263,22 @@ class NoteActionService:
             guard.root,
             relative_path.replace("/", "\\"),
         )
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(hours=float(ttl_hours))
+        ).isoformat()
+        preview = str(content)[:400]
+        if len(str(content)) > 400:
+            preview += "\n…"
         plan = (
             "在授权目录中写入一篇 Markdown 笔记。\n"
             "目标：{}\n"
             "大小：{} 字符\n"
-            "已有文件：{}".format(
+            "已有文件：{}\n"
+            "内容预览：\n{}".format(
                 target_summary,
                 len(content),
                 "是，将先备份再覆盖" if expected else "否，将新建文件",
+                preview,
             )
         )
         digest = confirmation_digest(
@@ -233,11 +291,15 @@ class NoteActionService:
             action_id=new_id("act"),
             session_id=session_id,
             mode=mode,
-            intent="保存网页搜索笔记",
+            intent=intent,
             tool_name="write_note",
             raw_arguments=dict(arguments),
             normalized_arguments=arguments,
-            expected_state={"target": expected},
+            expected_state={
+                "target": expected,
+                "workspace": workspace_identity(guard.root),
+                "expires_at": expires_at,
+            },
             risk=RiskLevel.FS_WRITE,
             target_summary=target_summary,
             reversible=True,
@@ -258,10 +320,14 @@ class NoteActionService:
         )
         if expected_digest != proposal.confirmation_digest:
             raise FileActionError("动作参数与确认内容不一致，已拒绝执行。")
-        workspace = self.store.get_workspace()
-        if not workspace:
-            raise FileActionError("工作目录授权已撤销。")
-        guard = WorkspaceGuard(workspace)
+        if proposal_expired(proposal.expected_state):
+            raise FileActionError("提案已过期，请重新生成。")
+        workspace_snapshot = proposal.expected_state.get("workspace")
+        if not workspace_snapshot:
+            raise FileActionError("提案缺少工作区快照，请重新生成。")
+        if not workspace_identity_valid(workspace_snapshot):
+            raise FileActionError("工作目录身份已变化，已拒绝执行。")
+        guard = WorkspaceGuard(workspace_snapshot["root"])
         relative_path = proposal.normalized_arguments["relative_path"]
         if not str(relative_path).replace("\\", "/").startswith("notes/"):
             raise FileActionError("第一版只允许把笔记写入 notes 子目录。")
@@ -282,6 +348,7 @@ class NoteActionService:
             backup.write_bytes(data)
             backup_path = str(backup)
         data = str(content).encode("utf-8")
+        content_sha256 = hashlib.sha256(data).hexdigest()
         descriptor, temporary = tempfile.mkstemp(
             prefix=".companion-",
             suffix=".tmp",
@@ -295,13 +362,43 @@ class NoteActionService:
             final_before = fingerprint(target)
             if final_before != before:
                 raise FileActionError("写入前文件发生变化，已停止。")
-            os.replace(temporary, str(target))
+            self.store.mark_execution_state(
+                proposal.action_id,
+                "dispatching",
+            )
+            try:
+                os.replace(temporary, str(target))
+            except Exception as error:
+                current = None
+                try:
+                    current = fingerprint(target)
+                except Exception:
+                    current = None
+                if current and current.get("sha256") == content_sha256:
+                    raise UncertainExecutionError(
+                        "文件可能已经写入，但执行回执没有完成。"
+                    ) from error
+                raise FileActionError("写入失败：{}".format(error)) from error
+            try:
+                self.store.mark_execution_state(
+                    proposal.action_id,
+                    "replaced",
+                )
+            except Exception as error:
+                raise UncertainExecutionError(
+                    "文件已经替换，但执行状态无法记录。"
+                ) from error
         finally:
             try:
                 Path(temporary).unlink()
             except FileNotFoundError:
                 pass
-        after = fingerprint(target)
+        try:
+            after = fingerprint(target)
+        except Exception as error:
+            raise UncertainExecutionError(
+                "文件已经替换，但无法确认最终状态。"
+            ) from error
         finished = utc_now()
         result = {
             "target_path": str(target),
@@ -309,6 +406,9 @@ class NoteActionService:
             "backup_path": backup_path,
             "before": before,
             "after": after,
+            "workspace": workspace_snapshot,
+            "workspace_root": workspace_snapshot["root"],
+            "content_sha256": content_sha256,
             "content_preview": str(content)[:300],
         }
         return ActionResult(
@@ -328,11 +428,18 @@ class NoteActionService:
             raise FileActionError("这条回执不可撤销或已经撤销。")
         if receipt.status != "completed":
             raise FileActionError("只有已完成的动作可以撤销。")
-        workspace = self.store.get_workspace()
-        if not workspace:
-            raise FileActionError("工作目录授权已撤销，无法安全撤销。")
-        guard = WorkspaceGuard(workspace)
+        workspace_snapshot = receipt.result.get("workspace")
+        if not workspace_snapshot:
+            raise FileActionError("回执缺少工作区快照，无法安全撤销。")
+        if not workspace_identity_valid(workspace_snapshot):
+            raise FileActionError("工作目录身份已变化，无法安全撤销。")
+        guard = WorkspaceGuard(workspace_snapshot["root"])
         target = guard.resolve(receipt.result["relative_path"])
+        recorded_target = receipt.result.get("target_path")
+        if recorded_target and os.path.normcase(str(target)) != os.path.normcase(
+            str(recorded_target)
+        ):
+            raise FileActionError("撤销目标与回执不一致。")
         expected_after = receipt.result.get("after")
         if fingerprint(target) != expected_after:
             raise FileActionError("文件已被其他程序修改，不能自动撤销。")

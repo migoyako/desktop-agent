@@ -65,6 +65,7 @@ class ProposalStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    NOT_EXECUTED = "not_executed"
     CANCELLED = "cancelled"
     UNKNOWN = "unknown"
 
@@ -126,6 +127,12 @@ class MemoryRecord:
     status: str
     created_at: str
     updated_at: str
+    canonical_key: str = ""
+    evidence_count: int = 0
+    protected: bool = False
+    forget_epoch: int = 0
+    first_seen_at: str = ""
+    last_seen_at: str = ""
 
 
 @dataclass

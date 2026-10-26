@@ -49,7 +49,7 @@ def print_affect(runtime):
 
 
 def run_cli(runtime):
-    mode = AgentMode.CHAT
+    mode = runtime.current_mode()
     print("数字分身已启动。")
     print("命令：/mode chat|work、/workspace 路径、/memory、/affect、/undo、/quit")
     while True:
@@ -68,6 +68,7 @@ def run_cli(runtime):
                 print("模式只能是 chat 或 work。")
                 continue
             mode = AgentMode(value)
+            runtime.set_mode(mode)
             print("已切换到{}模式。".format("陪伴" if value == "chat" else "工作"))
             continue
         if text.startswith("/workspace "):
@@ -106,7 +107,7 @@ def run_cli(runtime):
             print(proposal.user_visible_plan)
             answer = input("确认写入？[y/N] ").strip().lower()
             if answer in ("y", "yes", "是"):
-                executed = runtime.confirm_proposal(proposal.action_id)
+                executed = runtime.confirm_proposal(proposal.action_id, mode)
                 print("分身> " + executed["answer"])
             else:
                 print(runtime.cancel_proposal(proposal.action_id))

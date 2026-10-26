@@ -2,11 +2,13 @@
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from agent_framework.companion.models import AgentMode, SearchResult
 from agent_framework.companion.runtime import CompanionRuntime
 from agent_framework.companion.search import SearchService
 from agent_framework.companion.store import CompanionStore
@@ -19,6 +21,106 @@ try:
 except ImportError:
     QApplication = None
     CompanionWindow = None
+
+
+class StubSearch:
+    def search(self, query, limit=5):
+        self.last_query = query
+        return [
+            SearchResult(
+                title="Example result",
+                url="https://example.com/result",
+                snippet="A short search summary.",
+            )
+        ]
+
+
+class CompanionQtEndToEndTest(unittest.TestCase):
+    def setUp(self):
+        if CompanionWindow is None:
+            return
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.workspace = root / "workspace"
+        self.workspace.mkdir()
+        self.data = root / "data"
+        self.store = CompanionStore(self.data / "companion.db")
+        self.runtime = CompanionRuntime(
+            self.store,
+            OfflineLLMClient(),
+            SearchService(StubSearch()),
+            self.data,
+            offline=True,
+        )
+        self.runtime.select_workspace(str(self.workspace))
+        self.app = QApplication.instance() or QApplication([])
+        self.window = CompanionWindow(self.runtime)
+        self.window.show()
+        self.app.processEvents()
+
+    def tearDown(self):
+        if CompanionWindow is None:
+            return
+        self.window.close()
+        self.app.processEvents()
+        self.temp.cleanup()
+
+    def wait_until(self, predicate, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.app.processEvents()
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_search_confirm_undo_through_window(self):
+        if CompanionWindow is None:
+            self.skipTest("PySide6 unavailable")
+
+        self.window.work_button.click()
+        self.assertEqual(self.runtime.current_mode(), AgentMode.WORK)
+        self.window.input.setPlainText("搜索 Python Agent 并保存为笔记")
+        self.window.send_button.click()
+
+        self.assertTrue(
+            self.wait_until(lambda: self.window.current_proposal is not None),
+            "提案没有出现在窗口中",
+        )
+        proposal = self.window.current_proposal
+        self.assertTrue(self.window.confirm_frame.isVisible())
+        self.assertEqual(list(self.workspace.rglob("*.md")), [])
+
+        self.window.confirm_button.click()
+        self.assertTrue(
+            self.wait_until(
+                lambda: self.window.current_proposal is None
+                and self.window.undo_button.isVisible()
+            ),
+            "确认后没有显示撤销按钮",
+        )
+        files = list(self.workspace.rglob("*.md"))
+        self.assertEqual(len(files), 1)
+        self.assertIn("Example result", files[0].read_text(encoding="utf-8"))
+
+        receipt = self.store.get_receipt_for_action(proposal.action_id)
+        self.assertEqual(receipt.status, "completed")
+        self.assertEqual(receipt.undo_status, "available")
+        self.assertEqual(
+            self.store.get_execution(proposal.action_id)["status"],
+            "completed",
+        )
+
+        self.window.undo_button.click()
+        self.assertTrue(
+            self.wait_until(lambda: "已撤销" in self.window.status.text()),
+            "撤销没有完成",
+        )
+        self.assertEqual(list(self.workspace.rglob("*.md")), [])
+        self.assertEqual(
+            self.store.get_receipt(receipt.receipt_id).undo_status,
+            "undone",
+        )
 
 
 class CompanionQtUiSmokeTest(unittest.TestCase):
