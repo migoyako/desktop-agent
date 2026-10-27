@@ -95,7 +95,7 @@ class MemoryFtsTest(unittest.TestCase):
             connection.close()
 
     def test_new_store_reaches_current_version_with_fts(self):
-        self.assertEqual(SCHEMA_VERSION, 3)
+        self.assertEqual(SCHEMA_VERSION, 4)
         self.assertEqual(self.user_version(), SCHEMA_VERSION)
         self.assertTrue(self.store.fts_enabled)
         connection = self.raw_connection()
@@ -141,6 +141,19 @@ class MemoryFtsTest(unittest.TestCase):
         )
         logs = self.store.list_recall_logs("main")
         self.assertEqual(logs[0]["source"], "fts")
+
+    def test_single_character_query_falls_back_to_keyword_recall(self):
+        self.observe("请记住我喜欢喝茶。")
+        memory = self.confirmed()[0]
+
+        recalled = self.memory.recall("main", "茶")
+
+        self.assertEqual(
+            [item.memory_id for _, item, _ in recalled],
+            [memory.memory_id],
+        )
+        logs = self.store.list_recall_logs("main")
+        self.assertEqual(logs[0]["source"], "keyword")
 
     def test_correction_reindexes_fts(self):
         self.observe("请记住我喜欢喝咖啡。")

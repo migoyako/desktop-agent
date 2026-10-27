@@ -251,12 +251,13 @@ class MemoryDialog(QDialog):
             for item in details["recalls"]:
                 score = item.get("score")
                 lines.append(
-                    "<li>{} · {} · 评分 {}</li>".format(
+                    "<li>{} · {} · 评分 {} · {}</li>".format(
                         html.escape(item["created_at"]),
                         html.escape(item.get("source") or "-"),
                         "{:.3f}".format(score)
                         if score is not None
                         else "-",
+                        "已采用" if item.get("used_in_reply") else "未采用",
                     )
                 )
             lines.append("</ul>")

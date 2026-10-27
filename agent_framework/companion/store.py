@@ -160,7 +160,7 @@ CREATE TABLE IF NOT EXISTS workspace_grants (
 """
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 MEMORY_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
@@ -291,6 +291,21 @@ CREATE TABLE IF NOT EXISTS import_messages (
 );
 """
 
+CONTEXT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS context_checkpoints (
+    checkpoint_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    through_message_id INTEGER NOT NULL,
+    message_count INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    summary_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_checkpoints_session
+    ON context_checkpoints(session_id, through_message_id);
+"""
+
 
 def _add_column_if_missing(connection, table, column, definition):
     existing = {
@@ -404,6 +419,11 @@ def _migrate_v3(connection):
     )
 
 
+def _migrate_v4(connection):
+    """上下文压缩 checkpoint（每会话只保留最新一条）。"""
+    connection.executescript(CONTEXT_SCHEMA)
+
+
 def _reindex_memory_fts(connection):
     """从 memories 全量重建 memory_fts 索引（幂等）。"""
     connection.execute("DELETE FROM memory_fts")
@@ -451,6 +471,9 @@ class CompanionStore:
                 if version < 3:
                     _migrate_v3(connection)
                     version = 3
+                if version < 4:
+                    _migrate_v4(connection)
+                    version = 4
             connection.execute(
                 "PRAGMA user_version = {}".format(int(version))
             )
@@ -539,12 +562,90 @@ class CompanionStore:
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def list_messages_after(
+        self,
+        session_id: str,
+        after_id: int = 0,
+        limit: int = 400,
+    ) -> List[Dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, session_id, role, content, mode, created_at
+                FROM messages
+                WHERE session_id = ? AND id > ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (
+                    session_id,
+                    int(after_id or 0),
+                    max(1, min(int(limit), 1000)),
+                ),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
     def clear_messages(self, session_id: str):
         with self._connection() as connection:
             connection.execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
             )
+            connection.execute(
+                "DELETE FROM context_checkpoints WHERE session_id = ?",
+                (session_id,),
+            )
+
+    def save_context_checkpoint(
+        self,
+        session_id: str,
+        through_message_id: int,
+        message_count: int,
+        summary: str,
+    ) -> str:
+        checkpoint_id = new_id("ctx")
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO context_checkpoints(
+                    checkpoint_id, session_id, through_message_id,
+                    message_count, summary, summary_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    checkpoint_id,
+                    session_id,
+                    int(through_message_id),
+                    int(message_count),
+                    summary,
+                    hashlib.sha256(summary.encode("utf-8")).hexdigest(),
+                    utc_now(),
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM context_checkpoints
+                WHERE session_id = ? AND checkpoint_id <> ?
+                  AND through_message_id <= ?
+                """,
+                (session_id, checkpoint_id, int(through_message_id)),
+            )
+        return checkpoint_id
+
+    def get_latest_context_checkpoint(self, session_id: str) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT checkpoint_id, session_id, through_message_id,
+                       message_count, summary, summary_hash, created_at
+                FROM context_checkpoints
+                WHERE session_id = ?
+                ORDER BY through_message_id DESC, created_at DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def create_proposal(self, proposal: ActionProposal):
         with self._connection() as connection:
@@ -1656,6 +1757,7 @@ class CompanionStore:
         latency_ms: float,
         source: str = "",
     ):
+        recall_id = new_id("rcl")
         with self._connection() as connection:
             connection.execute(
                 """
@@ -1665,7 +1767,7 @@ class CompanionStore:
                 ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
                 """,
                 (
-                    new_id("rcl"),
+                    recall_id,
                     session_id,
                     query_hash,
                     json.dumps(fact_ids, ensure_ascii=False),
@@ -1674,6 +1776,16 @@ class CompanionStore:
                     source,
                     utc_now(),
                 ),
+            )
+        return recall_id
+
+    def mark_recall_used(self, recall_id: str, used: bool = True):
+        if not recall_id:
+            return
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE recall_log SET used_in_reply = ? WHERE recall_id = ?",
+                (1 if used else 0, recall_id),
             )
 
     def list_recall_logs(self, session_id: str, limit: int = 20):

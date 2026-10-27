@@ -1,8 +1,10 @@
 """Safety tests for the restricted note writer."""
 
+from datetime import datetime
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_framework.companion.file_actions import (
     FileActionError,
@@ -64,15 +66,18 @@ class NoteActionTest(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), "external")
 
     def test_undo_restores_previous_content(self):
-        relative = safe_note_filename("restore note")
-        target = self.workspace / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("before", encoding="utf-8")
-        proposal = self.service.create_proposal(
-            "session",
-            "restore note",
-            "after",
-        )
+        fixed = datetime.now()
+        with patch("agent_framework.companion.file_actions.datetime") as clock:
+            clock.now.return_value = fixed
+            relative = safe_note_filename("restore note")
+            target = self.workspace / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("before", encoding="utf-8")
+            proposal = self.service.create_proposal(
+                "session",
+                "restore note",
+                "after",
+            )
         self.store.create_proposal(proposal)
         self.assertEqual(proposal.normalized_arguments["relative_path"], relative)
         receipt = self.service.execute(proposal)

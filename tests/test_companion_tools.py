@@ -103,15 +103,21 @@ class CompanionToolTest(unittest.TestCase):
     def test_tools_are_scoped_by_mode(self):
         runtime = self.runtime(ScriptedLLM([]))
 
-        self.assertEqual(runtime.tool_names(AgentMode.CHAT), ["current_time"])
-        self.assertEqual(runtime.tool_names(AgentMode.QUIET), ["current_time"])
+        self.assertEqual(
+            runtime.tool_names(AgentMode.CHAT),
+            ["current_time", "read_tool_result"],
+        )
+        self.assertEqual(
+            runtime.tool_names(AgentMode.QUIET),
+            ["current_time", "read_tool_result"],
+        )
         self.assertEqual(
             runtime.tool_names(AgentMode.WORK),
-            ["current_time", "search_web", "write_note"],
+            ["current_time", "read_tool_result", "search_web", "write_note"],
         )
         self.assertEqual(
             runtime.tool_names(AgentMode.EXECUTE),
-            ["current_time", "search_web", "write_note"],
+            ["current_time", "read_tool_result", "search_web", "write_note"],
         )
 
     def test_model_can_search_and_answer(self):
@@ -234,7 +240,7 @@ class CompanionToolTest(unittest.TestCase):
         self.assertEqual(len(llm.calls), MAX_TOOL_ROUNDS)
 
 
-    def test_tool_round_limit(self):
+    def test_tool_round_limit_still_allows_final_answer(self):
         llm = ScriptedLLM(
             [
                 LLMResponse(
@@ -242,13 +248,34 @@ class CompanionToolTest(unittest.TestCase):
                 )
                 for _ in range(MAX_TOOL_ROUNDS)
             ]
+            + [LLMResponse(content="根据工具结果，现在是 08:00。")]
+        )
+        runtime = self.runtime(llm)
+
+        result = runtime.handle_message("现在几点", AgentMode.CHAT)
+
+        self.assertIn("08:00", result["answer"])
+        self.assertEqual(len(llm.calls), MAX_TOOL_ROUNDS + 1)
+        self.assertIsNone(llm.calls[-1]["tools"])
+        tool_messages = self.tool_messages(llm.calls[-1])
+        self.assertEqual(len(tool_messages), MAX_TOOL_ROUNDS)
+
+    def test_tool_round_limit_without_final_answer(self):
+        llm = ScriptedLLM(
+            [
+                LLMResponse(
+                    tool_calls=[ToolCall(name="current_time", arguments={})]
+                )
+                for _ in range(MAX_TOOL_ROUNDS)
+            ]
+            + [LLMResponse(content="")]
         )
         runtime = self.runtime(llm)
 
         result = runtime.handle_message("现在几点", AgentMode.CHAT)
 
         self.assertIn("轮次", result["answer"])
-        self.assertEqual(len(llm.calls), MAX_TOOL_ROUNDS)
+        self.assertEqual(len(llm.calls), MAX_TOOL_ROUNDS + 1)
 
     def test_search_failure_is_fed_back(self):
         llm = ScriptedLLM(

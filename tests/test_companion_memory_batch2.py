@@ -46,8 +46,8 @@ class MemoryBatch2Test(unittest.TestCase):
         )
         return path
 
-    def test_database_reaches_version_three_with_graph_and_import_tables(self):
-        self.assertEqual(SCHEMA_VERSION, 3)
+    def test_database_reaches_current_version_with_graph_and_import_tables(self):
+        self.assertEqual(SCHEMA_VERSION, 4)
         with self.store._connection() as connection:
             version = connection.execute(
                 "PRAGMA user_version"

@@ -813,12 +813,13 @@ class CompanionTkApp:
                 for item in details["recalls"]:
                     score = item.get("score")
                     lines.append(
-                        "- {} 来源 {} 评分 {}".format(
+                        "- {} 来源 {} 评分 {} {}".format(
                             item["created_at"],
                             item.get("source") or "-",
                             "{:.3f}".format(score)
                             if score is not None
                             else "-",
+                            "已采用" if item.get("used_in_reply") else "未采用",
                         )
                     )
             if details["derived"]:

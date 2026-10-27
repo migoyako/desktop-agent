@@ -13,6 +13,7 @@
 - 覆盖前创建备份，并支持撤销最近一次写入。
 - SQLite 保存对话、动作提案、执行回执、记忆、共同经历和情绪快照，并按 `user_version` 自动迁移。
 - 记忆以用户消息原文为证据，支持规范键、候选评分、纠正取代、查看和忘记。
+- 召回优先使用中文 2/3-gram + FTS5/BM25；中文单字查询（如“茶”）自动走关键词兜底，召回日志记录来源与是否被回复采用。
 - 遗忘会写入墓碑，阻止相同内容被重新召回或导入；由该事实派生的经历、反思和摘要同步失效。
 - 记忆窗口展示来源原文、候选评分、生命周期事件与最近召回；人设事实可设为受保护，不会被自动取代。
 - 旧聊天支持 JSON/JSONL 导入，导入前展示消息数、预计记忆数与耗时，支持暂停续跑和跨副本去重。
@@ -21,6 +22,11 @@
 - 人设包可用 `--persona <id>` 切换；缺失或损坏时回退为朴素助手人格。
 - “人设”面板可查看来源、许可、版本、大小与世界书条目，编辑称呼/关系/边界，或从本地目录导入人设包。
 - 可选世界书按当前话题触发，只注入相关条目，不进入稳定前缀，也不写入用户记忆。
+- 上下文分稳定层、会话前缀、运行时上下文与最近对话装配；稳定层哈希跨模式一致，模式与工具列表只进入会话前缀。
+- 历史超过字符预算 82% 时保留最近完整轮次，较旧消息写成抽取式 checkpoint 摘要并复用；摘要可追溯到原消息，不生成新事实。
+- 工具输出超过 16KB（UTF-8）时落盘到 `data/tool_results/`，模型只看到预览、字符数与句柄；`read_tool_result` 可按 offset/limit 分段回读，句柄仅限当前会话。
+- 未回读的落盘内容不算已读：提示词、落盘通知与回读头部都禁止模型假设或声称读取未返回部分；存储不可用时退化为仅预览。
+- 一次回复最多 3 轮工具调用、4 次调用；用满后仍会把最后一轮结果交给模型生成收尾回答，只有模型仍无输出时才提示“轮次达到上限”。
 - 情绪状态分为用户估计和角色状态，并允许用户纠正。
 - 关闭再打开后可以恢复历史会话和待确认动作。
 
@@ -114,6 +120,26 @@ python companion.py --ui cli --offline
 
 第一版尚未把现有 `keys.json` 迁移到系统钥匙串。不要提交该文件，项目已在 `.gitignore` 中忽略它。
 
+## 上下文预算
+
+默认总预算为 **24,000 字符**，这是本项目的装配上限，不是模型原生窗口（qwen-plus 常见 32k/128k）。按中文粗估约 1.6 万–2.4 万 tokens。
+
+预算内部分配：
+
+- 稳定层（安全规则 + `persona.md`/`facts.md`）始终保留，不参与裁剪；不建议把人设文件写得很长，否则会挤掉对话历史。
+- 用户称呼/关系/边界 ≤ 2,000 字符；世界书 ≤ 1,200；较早对话摘要 ≤ 1,200；召回记忆 ≤ 1,600。
+- 剩余空间放最近完整对话，约占典型可用空间的 55%–100%。
+- 历史占用可用预算 82% 时触发压缩，只丢最旧完整消息，摘要写入 `context_checkpoints`。
+
+目前没有 CLI 或环境变量入口。以后需要调整时：
+
+1. `CompanionRuntime.__init__` 已支持 `max_context_chars` 参数（下限 4,000），默认值在 `agent_framework/companion/context.py` 的 `DEFAULT_CONTEXT_CHARS`。
+2. 启动入口 `companion.py` 走 `CompanionRuntime.from_config(...)`；需要给 `from_config` 增加同名参数并透传，或新增环境变量（例如 `COMPANION_CONTEXT_CHARS`）后再接进来。
+3. 调整总预算时一并检查 `COMPRESS_TRIGGER`（默认 0.82）、`KEEP_RATIO`（默认 0.55）和 `MIN_RECENT_CHARS`（默认 4,000），避免压缩后保留窗口过小。
+4. 预算按字符计算，不绑定具体 tokenizer；换模型后建议用实际文本抽查 token 占用。
+
+工具结果落盘独立于对话预算：超过 16KB 的结果写入 `data/tool_results/`，模型上下文里只保留预览与句柄，因此不会因为一次大搜索直接撑爆窗口。落盘文件按会话隔离，单个存储副本上限 4MB；目前没有自动清理，需要时可手动删除该目录。
+
 ## 数据位置
 
 默认数据目录：
@@ -122,6 +148,7 @@ python companion.py --ui cli --offline
 data/
 ├── companion.db
 ├── backups/
+├── tool_results/   # 超过 16KB 的工具输出（JSON，按会话隔离）
 └── personas/
     └── remielle/
         ├── persona.md
@@ -130,7 +157,7 @@ data/
         └── persona.json
 ```
 
-SQLite 使用 WAL 模式。备份只保存被覆盖文件的写入前内容，撤销时会再次校验哈希。人设包是稳定资料，不写入 `memories`；角色资料与用户事实分开保存。
+SQLite 使用 WAL 模式。备份只保存被覆盖文件的写入前内容，撤销时会再次校验哈希。人设包是稳定资料，不写入 `memories`；角色资料与用户事实分开保存。`tool_results/` 保存原始工具输出，可能包含网页正文等未校验内容，只用于当前会话回读。
 
 可以通过参数指定独立数据目录：
 
@@ -168,9 +195,12 @@ python companion.py --data-dir C:\path\to\companion-data
 ## 验证
 
 ```powershell
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -t tests -v
 python -m compileall -q agent_framework companion.py tests
+python -m agent_framework.companion.eval_recall
 ```
+
+`tests/` 不是包，`-t tests` 不能省略（否则报 “Start directory is not importable”）。`eval_recall` 使用临时数据库和固定种子记忆，不调用模型；当前基线为 26 条用例 `hit@1=1.0000 hit@5=1.0000 mrr=1.0000`，调整分词、评分或衰减参数后应重跑并对比。
 
 当前测试覆盖：
 
@@ -187,4 +217,9 @@ python -m compileall -q agent_framework companion.py tests
 - 情绪纠正。
 - persona pack 稳定哈希、路径校验、提示分层、角色/用户事实隔离、删除人设不影响记忆。
 - persona 导入预览/覆盖/超限拒绝、世界书按需检索、称呼/关系/边界 protected 设定与人设面板。
+- 上下文分层与稳定哈希跨模式一致、字符预算、压缩 checkpoint 复用与迁移 v4。
+- 大工具结果落盘（UTF-8 字节阈值）、预览不含尾部、分段回读、会话隔离与坏句柄拒绝、重启后可读、未回读守卫。
+- 压缩轮次只写一条召回日志、回复引用记忆时 `used_in_reply` 置 1、中文单字查询关键词兜底。
+- 召回评测集（26 条中文查询的 hit@5/MRR 基线）与用例形状覆盖。
+- 工具轮次用满后仍能以最后一次工具结果收尾回答。
 - Tkinter 界面创建冒烟测试。

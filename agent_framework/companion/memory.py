@@ -117,8 +117,39 @@ def recall_score(query: str, content: str, activation: float) -> float:
     content_tokens = set(tokenize(content))
     if not query_tokens or not content_tokens:
         return 0.0
-    overlap = len(query_tokens & content_tokens) / float(len(query_tokens))
+    normalized_content = _normalize(content)
+    matched = 0
+    for token in query_tokens:
+        if token in content_tokens:
+            matched += 1
+        elif (
+            len(token) == 1
+            and CHINESE.fullmatch(token)
+            and token in normalized_content
+        ):
+            matched += 1
+    overlap = matched / float(len(query_tokens))
     return overlap * (0.75 + 0.25 * max(0.0, min(activation, 1.0)))
+
+
+def memory_used_in_reply(content: str, reply: str) -> bool:
+    """保守判断一条记忆是否被回复采用：原文或多数 2-gram 重合。"""
+    memory_text = _normalize(content)
+    reply_text = _normalize(reply)
+    if not memory_text or not reply_text:
+        return False
+    if memory_text in reply_text:
+        return True
+    if len(memory_text) < 2:
+        return False
+    grams = {
+        memory_text[index : index + 2]
+        for index in range(len(memory_text) - 1)
+    }
+    if not grams:
+        return False
+    hits = sum(1 for gram in grams if gram in reply_text)
+    return hits / float(len(grams)) >= 0.6
 
 
 def _clean(value: str) -> str:
@@ -194,6 +225,8 @@ class MemoryService:
     def __init__(self, store):
         self.store = store
         self.last_recall_source = "keyword"
+        self.last_recall_id = None
+        self.last_recall_memories = []
 
     def observe_user_message(
         self,
@@ -366,7 +399,7 @@ class MemoryService:
             )
             source = "keyword"
         self.last_recall_source = source
-        self.store.log_recall(
+        self.last_recall_id = self.store.log_recall(
             session_id,
             _query_hash(query),
             [memory.memory_id for _, memory, _ in ranked],
@@ -374,14 +407,18 @@ class MemoryService:
             (time.perf_counter() - started) * 1000.0,
             source=source,
         )
+        self.last_recall_memories = [memory for _, memory, _ in ranked]
         return ranked
 
     def _recall_via_fts(self, session_id, query, limit, tombstones):
         """FTS5/BM25 检索候选，再用单一衰减公式重排。
 
+        单字中文查询走关键词兜底：索引只保留 2/3-gram，单词素无法命中。
         返回 ``None`` 表示 FTS 不可用、查询失败或没有候选，
         调用方降级为关键词召回；聊天主流程永不因索引异常阻塞。
         """
+        if any(len(run) == 1 for run in CHINESE.findall(query or "")):
+            return None
         try:
             hits = self.store.search_memories_fts(
                 session_id,
