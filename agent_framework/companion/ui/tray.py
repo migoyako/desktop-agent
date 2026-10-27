@@ -83,6 +83,10 @@ class TrayController(QObject):
         self.check_action.triggered.connect(window.poll_proactive)
         menu.addAction(self.check_action)
 
+        console_action = QAction("管理台", menu)
+        console_action.triggered.connect(window.open_console)
+        menu.addAction(console_action)
+
         menu.addSeparator()
         quit_action = QAction("退出", menu)
         quit_action.triggered.connect(window.quit_application)

@@ -45,6 +45,7 @@ from ..work import FORWARD_LABELS, STATE_LABELS
 from .state import UiStateStore, clamp_position
 from .stream import StreamWorker
 from .tray import TrayController
+from .console import ManagementConsoleDialog
 
 
 class AvatarWidget(QWidget):
@@ -1308,6 +1309,7 @@ class CompanionWindow(QMainWindow):
         self.persona_dialog = None
         self.proactive_dialog = None
         self.work_dialog = None
+        self.console_dialog = None
         self.proactive_inflight = False
         self.workers = []
         self.drag_position = QPoint()
@@ -1405,11 +1407,14 @@ class CompanionWindow(QMainWindow):
         )
         self.overlay_button = QPushButton("形象")
         self.overlay_button.clicked.connect(self.toggle_overlay)
+        self.console_button = QPushButton("管理")
+        self.console_button.clicked.connect(self.open_console)
         close = QPushButton("关闭")
         close.clicked.connect(self.quit_application)
         top.addWidget(self.name_label)
         top.addStretch()
         top.addWidget(self.overlay_button)
+        top.addWidget(self.console_button)
         top.addWidget(close)
         outer.addLayout(top)
 
@@ -1826,6 +1831,12 @@ class CompanionWindow(QMainWindow):
         dialog.refresh()
         return dialog
 
+    def open_console(self):
+        return self.open_side_dialog(
+            "console_dialog",
+            ManagementConsoleDialog,
+        )
+
     def poll_proactive(self):
         if self.proactive_inflight or not self.send_button.isEnabled():
             return
@@ -1881,6 +1892,8 @@ class CompanionWindow(QMainWindow):
     def open_side_dialog(self, attribute, dialog_type):
         dialog = getattr(self, attribute)
         if dialog is not None:
+            if hasattr(dialog, "refresh_all"):
+                dialog.refresh_all()
             dialog.show()
             dialog.raise_()
             dialog.activateWindow()

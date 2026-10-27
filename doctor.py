@@ -99,12 +99,6 @@ def main():
                 uri=True,
             )
             try:
-                integrity = connection.execute(
-                    "PRAGMA integrity_check"
-                ).fetchone()[0]
-                db_version = connection.execute(
-                    "PRAGMA user_version"
-                ).fetchone()[0]
                 names = {
                     row[0]
                     for row in connection.execute(
@@ -162,22 +156,91 @@ def main():
                     )
             finally:
                 connection.close()
+            from agent_framework.companion.maintenance import integrity_report
+
+            report = integrity_report(db_path)
             fts_state = (
-                "ready" if "memory_fts" in names else "missing(启动时自愈)"
+                "{} rows".format(report["fts_rows"])
+                if report["fts_present"]
+                else "missing(启动时自愈)"
             )
             checks.append(
                 check(
                     "Database",
-                    integrity == "ok",
-                    "{} user_version={} fts={}".format(
-                        integrity,
-                        db_version,
+                    report["ok"],
+                    "{} user_version={}/{} fk={} fts={}".format(
+                        report["integrity"],
+                        report["user_version"],
+                        report["expected_version"],
+                        report["foreign_key_violations"],
                         fts_state,
                     ),
                 )
             )
+            if report["version_state"] != "current":
+                print("[WARN] {:<20} v{} / expected v{}; next launch migrates".format(
+                    "Schema version",
+                    report["user_version"],
+                    report["expected_version"],
+                ))
+            if report["missing_indexes"]:
+                print("[WARN] {:<20} {}".format(
+                    "Missing indexes",
+                    ", ".join(report["missing_indexes"]),
+                ))
+            if (
+                report["fts_present"]
+                and report["fts_rows"] != report["memory_rows"]
+            ):
+                print("[WARN] {:<20} fts={} memories={}; rebuilt on launch".format(
+                    "FTS parity",
+                    report["fts_rows"],
+                    report["memory_rows"],
+                ))
         else:
             checks.append(check("Database", True, "尚未创建"))
+
+        try:
+            from agent_framework.companion.maintenance import list_backups
+
+            backups = list_backups(ROOT / "data")
+            if backups:
+                latest = backups[0]
+                checks.append(
+                    check(
+                        "Backups",
+                        True,
+                        "count={} latest={} v{}".format(
+                            len(backups),
+                            latest["name"],
+                            latest["schema_version"],
+                        ),
+                    )
+                )
+            else:
+                print("[WARN] {:<20} {}".format(
+                    "Backups",
+                    "none yet; created before migrations",
+                ))
+        except Exception as error:
+            checks.append(check("Backups", False, str(error)))
+
+        try:
+            from agent_framework.companion.maintenance import lock_info
+
+            holder = lock_info(ROOT / "data")
+            if holder:
+                print("[WARN] {:<20} {}".format(
+                    "Instance lock",
+                    "held by pid={} since {}".format(
+                        holder.get("pid", "unknown"),
+                        holder.get("started_at", "unknown"),
+                    ),
+                ))
+            else:
+                checks.append(check("Instance lock", True, "free"))
+        except Exception as error:
+            checks.append(check("Instance lock", False, str(error)))
         if proactive_detail:
             checks.append(check("Proactive state", True, proactive_detail))
         else:
@@ -194,6 +257,39 @@ def main():
             ))
     except Exception as error:
         checks.append(check("Database", False, str(error)))
+
+    try:
+        from agent_framework.companion.runtime import CORE_TOOL_RISKS
+        from agent_framework.companion.skills import SkillLibrary
+
+        skills_root = ROOT / "data" / "skills"
+        if not skills_root.exists():
+            print("[WARN] {:<20} {}".format(
+                "Skills",
+                "no skills directory; optional",
+            ))
+        else:
+            library = SkillLibrary(skills_root)
+            skills, issues = library.scan(CORE_TOOL_RISKS)
+            checks.append(
+                check(
+                    "Skills",
+                    not issues,
+                    "valid={} invalid={} root={}".format(
+                        len(skills),
+                        len(issues),
+                        skills_root,
+                    ),
+                )
+            )
+            for issue in issues:
+                print("[WARN] {:<20} {}: {}".format(
+                    "Skill rejected",
+                    issue.skill_id or "<root>",
+                    issue.reason,
+                ))
+    except Exception as error:
+        checks.append(check("Skills", False, str(error)))
 
     try:
         from agent_framework.companion.proactive import (

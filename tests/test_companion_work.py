@@ -241,8 +241,8 @@ class WorkStoreTest(WorkTestBase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-        self.assertEqual(SCHEMA_VERSION, 7)
-        self.assertEqual(version, 7)
+        self.assertEqual(SCHEMA_VERSION, 8)
+        self.assertEqual(version, SCHEMA_VERSION)
         self.assertIn("work_tasks", tables)
         self.assertIn("work_receipts", tables)
 

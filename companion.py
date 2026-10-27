@@ -7,6 +7,7 @@ import importlib.util
 from pathlib import Path
 import sys
 
+from agent_framework.companion.maintenance import InstanceLock
 from agent_framework.companion.models import AgentMode
 from agent_framework.companion.persona import DEFAULT_PERSONA_ID
 from agent_framework.companion.runtime import CompanionRuntime
@@ -30,6 +31,11 @@ def parse_args(argv=None):
         help="人设包 ID，默认 {}（data/personas/<id>）".format(
             DEFAULT_PERSONA_ID
         ),
+    )
+    parser.add_argument(
+        "--allow-multiple",
+        action="store_true",
+        help="跳过单实例锁，仅用于调试",
     )
     return parser.parse_args(argv)
 
@@ -138,8 +144,31 @@ def run_cli(runtime):
 
 def main(argv=None):
     args = parse_args(argv)
+    root = Path(__file__).resolve().parent
+    data_dir = Path(args.data_dir) if args.data_dir else root / "data"
+    lock = None
+    if not args.allow_multiple:
+        lock = InstanceLock(data_dir)
+        if not lock.acquire():
+            info = lock.peek() or {}
+            print(
+                "另一个实例正在使用数据目录：{}（pid={}）".format(
+                    data_dir,
+                    info.get("pid", "未知"),
+                ),
+                file=sys.stderr,
+            )
+            return 3
+    try:
+        return run_app(args, data_dir)
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def run_app(args, data_dir):
     runtime = CompanionRuntime.from_config(
-        data_dir=args.data_dir,
+        data_dir=str(data_dir),
         offline=args.offline,
         session_id=args.session_id,
         persona_id=args.persona,

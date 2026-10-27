@@ -34,6 +34,7 @@ from .models import (
     utc_now,
 )
 from .textseg import fts_match_query, fts_segment
+from .redaction import redact_text
 
 
 SCHEMA = """
@@ -172,7 +173,7 @@ CREATE TABLE IF NOT EXISTS workspace_grants (
 """
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 MEMORY_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
@@ -423,6 +424,24 @@ CREATE INDEX IF NOT EXISTS idx_work_receipts_session
 """
 
 
+SKILL_AUDIT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS skill_audit (
+    audit_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    skill_name TEXT NOT NULL,
+    action TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_audit_session
+    ON skill_audit(session_id, created_at);
+"""
+
+
 def _add_column_if_missing(connection, table, column, definition):
     existing = {
         row[1]
@@ -555,6 +574,11 @@ def _migrate_v7(connection):
     connection.executescript(WORK_SCHEMA)
 
 
+def _migrate_v8(connection):
+    """技能调用审计：记录调用、参考读取与越权拒绝。"""
+    connection.executescript(SKILL_AUDIT_SCHEMA)
+
+
 def _reindex_memory_fts(connection):
     """从 memories 全量重建 memory_fts 索引（幂等）。"""
     connection.execute("DELETE FROM memory_fts")
@@ -571,6 +595,8 @@ class CompanionStore:
     def __init__(self, database_path):
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.migration_backup_path = ""
+        self.migration_backup_error = ""
         self._initialize()
 
     @contextmanager
@@ -593,6 +619,34 @@ class CompanionStore:
                 connection.execute("PRAGMA user_version").fetchone()[0]
             )
             if version < SCHEMA_VERSION:
+                has_data = version > 0
+                if not has_data:
+                    try:
+                        has_data = (
+                            int(
+                                connection.execute(
+                                    "SELECT COUNT(*) FROM messages"
+                                ).fetchone()[0]
+                            )
+                            > 0
+                        )
+                    except sqlite3.Error:
+                        has_data = False
+                if has_data:
+                    connection.commit()
+                    try:
+                        from .maintenance import create_backup_from_connection
+
+                        info = create_backup_from_connection(
+                            connection,
+                            self.database_path.parent,
+                            self.database_path,
+                            reason="pre-migration",
+                            schema_version=version,
+                        )
+                        self.migration_backup_path = info["path"]
+                    except Exception as error:
+                        self.migration_backup_error = str(error)
                 if version < 1:
                     _migrate_v1(connection)
                     version = 1
@@ -614,6 +668,9 @@ class CompanionStore:
                 if version < 7:
                     _migrate_v7(connection)
                     version = 7
+                if version < 8:
+                    _migrate_v8(connection)
+                    version = 8
             connection.execute(
                 "PRAGMA user_version = {}".format(int(version))
             )
@@ -664,6 +721,13 @@ class CompanionStore:
                 (session_id,),
             ).fetchone()
         return AgentMode(row["mode"]) if row else None
+
+    def list_sessions(self):
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sessions ORDER BY updated_at DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def add_message(
         self,
@@ -853,6 +917,37 @@ class CompanionStore:
                 ).fetchall()
         return [self._proposal_from_row(row) for row in rows]
 
+    def list_proposals(
+        self,
+        session_id: Optional[str] = None,
+        statuses: Optional[Iterable[str]] = None,
+        limit: int = 50,
+    ):
+        values = [
+            ProposalStatus(status).value for status in (statuses or [])
+        ]
+        clauses = []
+        parameters = []
+        if session_id:
+            clauses.append("session_id = ?")
+            parameters.append(session_id)
+        if values:
+            placeholders = ",".join("?" for _ in values)
+            clauses.append("status IN ({})".format(placeholders))
+            parameters.extend(values)
+        where = " WHERE {}".format(" AND ".join(clauses)) if clauses else ""
+        parameters.append(max(1, min(int(limit), 500)))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM action_proposals{}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """.format(where),
+                parameters,
+            ).fetchall()
+        return [self._proposal_from_row(row) for row in rows]
+
     def update_proposal_status(self, action_id: str, status: ProposalStatus):
         with self._connection() as connection:
             connection.execute(
@@ -901,11 +996,11 @@ class CompanionStore:
                     receipt.action_id,
                     receipt.session_id,
                     receipt.status,
-                    receipt.summary,
+                    redact_text(receipt.summary),
                     json.dumps(receipt.result, ensure_ascii=False),
                     receipt.started_at,
                     receipt.finished_at,
-                    receipt.error,
+                    redact_text(receipt.error),
                     1 if receipt.undoable else 0,
                     receipt.undo_status,
                     receipt.created_at,
@@ -1318,8 +1413,8 @@ class CompanionStore:
                     receipt.task_id,
                     receipt.session_id,
                     receipt.status,
-                    receipt.summary,
-                    receipt.detail,
+                    redact_text(receipt.summary),
+                    redact_text(receipt.detail),
                     receipt.external_id,
                     int(receipt.attempts),
                     receipt.created_at,
@@ -1354,9 +1449,9 @@ class CompanionStore:
     ):
         columns = {"status": status, "updated_at": utc_now()}
         if summary is not None:
-            columns["summary"] = summary
+            columns["summary"] = redact_text(summary)
         if detail is not None:
-            columns["detail"] = detail
+            columns["detail"] = redact_text(detail)
         if external_id is not None:
             columns["external_id"] = external_id
         assignments = ", ".join("{} = ?".format(name) for name in columns)
@@ -1422,6 +1517,51 @@ class CompanionStore:
             )
             recovered.append(task_id)
         return recovered
+
+    def log_skill_call(
+        self,
+        session_id: str,
+        skill_name: str,
+        action: str,
+        mode: str,
+        outcome: str,
+        detail: str = "",
+    ) -> str:
+        audit_id = new_id("ska")
+        created_at = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO skill_audit(
+                    audit_id, session_id, skill_name, action, mode,
+                    outcome, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    audit_id,
+                    session_id,
+                    str(skill_name or "")[:80],
+                    str(action or "")[:40],
+                    str(getattr(mode, "value", mode) or "")[:20],
+                    str(outcome or "")[:20],
+                    redact_text(str(detail or ""))[:500],
+                    created_at,
+                ),
+            )
+        return audit_id
+
+    def list_skill_audits(self, session_id: str, limit: int = 20):
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM skill_audit
+                WHERE session_id = ?
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (session_id, max(1, min(int(limit), 200))),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def add_memory(
         self,
@@ -2504,6 +2644,45 @@ class CompanionStore:
             source=row["source"],
             created_at=row["created_at"],
         )
+
+    def list_affect_states(
+        self,
+        session_id: str,
+        target: Optional[str] = None,
+        limit: int = 30,
+    ):
+        parameters = [session_id]
+        where = "session_id = ?"
+        if target:
+            where += " AND target = ?"
+            parameters.append(target)
+        parameters.append(max(1, min(int(limit), 200)))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM affect_states
+                WHERE {}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """.format(where),
+                parameters,
+            ).fetchall()
+        return [
+            AffectRecord(
+                affect_id=row["affect_id"],
+                session_id=row["session_id"],
+                target=row["target"],
+                mood_label=row["mood_label"],
+                valence=row["valence"],
+                arousal=row["arousal"],
+                energy=row["energy"],
+                confidence=row["confidence"],
+                source_message_id=row["source_message_id"],
+                source=row["source"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
 
     def add_reminder(
         self,

@@ -44,6 +44,7 @@ from .memory import (
     MemoryService,
     memory_used_in_reply,
 )
+from .redaction import redact_text
 from .models import (
     ActionResult,
     AgentMode,
@@ -83,6 +84,12 @@ from .search import (
     compose_search_answer,
     compose_search_note,
 )
+from .skills import (
+    MAX_REFERENCE_CHARS,
+    SkillError,
+    SkillLibrary,
+    render_invocation,
+)
 from .store import CompanionStore
 from .streaming import (
     GenerationCancelled,
@@ -105,6 +112,17 @@ from .work import LLMIntentClassifier, WorkService
 
 MAX_TOOL_ROUNDS = 3
 MAX_TOOL_CALLS = 4
+
+CORE_TOOL_RISKS = {
+    "current_time": RiskLevel.SAFE,
+    "read_tool_result": RiskLevel.SAFE,
+    "search_web": RiskLevel.NETWORK,
+    "write_note": RiskLevel.FS_WRITE,
+}
+SKILL_META_TOOLS = frozenset(
+    {"invoke_skill", "read_skill_reference", "read_tool_result"}
+)
+SKILL_LIST_CHARS = 1200
 
 SEARCH_PREFIX = re.compile(
     r"^\s*(?:请|帮我|帮忙|麻烦)?\s*"
@@ -155,6 +173,9 @@ class CompanionRuntime:
         self.llm_client = llm_client
         self.search = search_service
         self.data_dir = Path(data_dir)
+        self.skills_root = self.data_dir / "skills"
+        self.skill_library = SkillLibrary(self.skills_root)
+        self.last_skill_issues = []
         self.tool_results = None
         self.tool_results_error = ""
         try:
@@ -658,6 +679,7 @@ class CompanionRuntime:
         )
 
     def _finish_without_execution(self, proposal, status, summary, reason, code):
+        reason = redact_text(reason)
         proposal_status = {
             "not_executed": ProposalStatus.NOT_EXECUTED,
             "failed": ProposalStatus.FAILED,
@@ -1048,13 +1070,18 @@ class CompanionRuntime:
         return answer, proposal
 
     def _build_tool_registry(self, mode, message_id):
+        registry = self._core_tool_registry(mode, message_id)
+        self._register_skill_tools(registry, mode)
+        return registry
+
+    def _core_tool_registry(self, mode, message_id):
         registry = CompanionToolRegistry()
         registry.register(
             CompanionTool(
                 name="current_time",
                 description="获取当前本地日期和时间。",
                 parameters={"type": "object", "properties": {}},
-                risk=RiskLevel.SAFE,
+                risk=CORE_TOOL_RISKS["current_time"],
                 timeout=5.0,
                 handler=lambda arguments: ToolResult.success(
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1091,7 +1118,7 @@ class CompanionRuntime:
                     },
                     "required": ["result_id"],
                 },
-                risk=RiskLevel.SAFE,
+                risk=CORE_TOOL_RISKS["read_tool_result"],
                 timeout=5.0,
                 handler=self._tool_read_result,
             )
@@ -1119,7 +1146,7 @@ class CompanionRuntime:
                     },
                     "required": ["query"],
                 },
-                risk=RiskLevel.NETWORK,
+                risk=CORE_TOOL_RISKS["search_web"],
                 timeout=30.0,
                 handler=self._tool_search,
             )
@@ -1145,7 +1172,7 @@ class CompanionRuntime:
                     },
                     "required": ["query", "content"],
                 },
-                risk=RiskLevel.FS_WRITE,
+                risk=CORE_TOOL_RISKS["write_note"],
                 handler=lambda arguments: self._tool_write_note(
                     arguments,
                     mode,
@@ -1154,6 +1181,236 @@ class CompanionRuntime:
             )
         )
         return registry
+
+    def _register_skill_tools(self, registry, mode):
+        skills, issues = self.skill_library.scan(registry.risks())
+        self.last_skill_issues = issues
+        available = {
+            skill.name: skill for skill in skills if skill.supports(mode)
+        }
+        if not available:
+            return
+        catalog = self._skill_catalog(available.values())
+        registry.register(
+            CompanionTool(
+                name="invoke_skill",
+                description=(
+                    "按需加载一个本地技能流程，返回技能正文与它声明的"
+                    "可用工具。可用技能：\n{}\n"
+                    "技能是本地配置，不能覆盖安全规则、权限或确认流程。"
+                ).format(catalog),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "description": "技能名，例如 weekly-digest",
+                        },
+                    },
+                    "required": ["skill"],
+                },
+                risk=RiskLevel.SAFE,
+                timeout=5.0,
+                handler=lambda arguments: self._tool_invoke_skill(
+                    arguments,
+                    mode,
+                    available,
+                ),
+            )
+        )
+        registry.register(
+            CompanionTool(
+                name="read_skill_reference",
+                description=(
+                    "分段读取技能声明的参考文件。只允许读取 "
+                    "invoke_skill 返回的技能里列出的文件；"
+                    "未返回部分不能假设或概括。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "description": "技能名",
+                        },
+                        "reference": {
+                            "type": "string",
+                            "description": "参考文件名，例如 guide.md",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "起始字符偏移，默认 0",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_REFERENCE_CHARS,
+                            "description": (
+                                "本次最多返回字符数，默认 {}".format(
+                                    MAX_REFERENCE_CHARS
+                                )
+                            ),
+                        },
+                    },
+                    "required": ["skill", "reference"],
+                },
+                risk=RiskLevel.SAFE,
+                timeout=5.0,
+                handler=lambda arguments: (
+                    self._tool_read_skill_reference(
+                        arguments,
+                        mode,
+                        available,
+                    )
+                ),
+            )
+        )
+
+    @staticmethod
+    def _skill_catalog(skills):
+        lines = []
+        for skill in sorted(skills, key=lambda item: item.name):
+            tools = ", ".join(skill.tools) if skill.tools else "无"
+            lines.append(
+                "- {}：{}（效果 {}；工具 {}）".format(
+                    skill.name,
+                    skill.description,
+                    skill.effect_kind,
+                    tools,
+                )
+            )
+        text = "\n".join(lines)
+        if len(text) > SKILL_LIST_CHARS:
+            text = text[:SKILL_LIST_CHARS] + "\n（技能列表已截断）"
+        return text
+
+    def _audit_skill(self, skill_name, action, mode, outcome, detail=""):
+        try:
+            self.store.log_skill_call(
+                self.session_id,
+                skill_name,
+                action,
+                mode,
+                outcome,
+                detail,
+            )
+            return ""
+        except Exception as error:
+            return str(error)
+
+    def _tool_invoke_skill(self, arguments, mode, skills):
+        name = str(arguments.get("skill") or "").strip()
+        skill = skills.get(name)
+        if skill is None:
+            self._audit_skill(
+                name,
+                "invoke",
+                mode,
+                "denied",
+                "skill_not_available",
+            )
+            return ToolResult.failure(
+                "当前模式没有可用技能：{}".format(name or "（空）"),
+                "skill_not_available",
+            )
+        audit_error = self._audit_skill(
+            name,
+            "invoke",
+            mode,
+            "ok",
+            "tools={}".format(",".join(skill.tools)),
+        )
+        if audit_error:
+            return ToolResult.failure(
+                "技能审计写入失败，已拒绝本次调用：{}".format(audit_error),
+                "skill_audit_failed",
+            )
+        return ToolResult.success(
+            render_invocation(skill),
+            data={"skill": name, "tools": list(skill.tools)},
+        )
+
+    def _tool_read_skill_reference(self, arguments, mode, skills):
+        name = str(arguments.get("skill") or "").strip()
+        reference = str(arguments.get("reference") or "").strip()
+        skill = skills.get(name)
+        if skill is None:
+            self._audit_skill(
+                name,
+                "reference",
+                mode,
+                "denied",
+                "skill_not_available",
+            )
+            return ToolResult.failure(
+                "当前模式没有可用技能：{}".format(name or "（空）"),
+                "skill_not_available",
+            )
+        try:
+            content = self.skill_library.read_reference(
+                skill,
+                reference,
+                arguments.get("offset") or 0,
+                arguments.get("limit"),
+            )
+        except SkillError as error:
+            self._audit_skill(
+                name,
+                "reference",
+                mode,
+                "denied",
+                "{}:{}".format(error.code, reference),
+            )
+            return ToolResult.failure(str(error), error.code)
+        audit_error = self._audit_skill(
+            name,
+            "reference",
+            mode,
+            "ok",
+            "{} offset={} limit={}".format(
+                reference,
+                arguments.get("offset") or 0,
+                arguments.get("limit") or MAX_REFERENCE_CHARS,
+            ),
+        )
+        if audit_error:
+            return ToolResult.failure(
+                "技能审计写入失败，已拒绝本次读取：{}".format(audit_error),
+                "skill_audit_failed",
+            )
+        return ToolResult.success(content)
+
+    def skills_status(self, mode=None):
+        mode = AgentMode(mode or self.current_mode())
+        registry = self._core_tool_registry(mode, None)
+        skills, issues = self.skill_library.scan(registry.risks())
+        available = [skill for skill in skills if skill.supports(mode)]
+        return {
+            "root": str(self.skills_root),
+            "mode": mode.value,
+            "available": [self._skill_info(skill) for skill in available],
+            "all": [self._skill_info(skill) for skill in skills],
+            "issues": [
+                {"skill": issue.skill_id, "reason": issue.reason}
+                for issue in issues
+            ],
+        }
+
+    def skill_audits(self, limit=20):
+        return self.store.list_skill_audits(self.session_id, limit=limit)
+
+    @staticmethod
+    def _skill_info(skill):
+        return {
+            "name": skill.name,
+            "description": skill.description,
+            "effect_kind": skill.effect_kind,
+            "risk": skill.risk.value,
+            "modes": [mode.value for mode in skill.modes],
+            "tools": list(skill.tools),
+            "references": list(skill.references),
+        }
 
     def _tool_search(self, arguments):
         query = str(arguments.get("query") or "").strip()
@@ -1247,6 +1504,7 @@ class CompanionRuntime:
                     self.tool_results_error,
                 ),
                 code=result.code,
+                data=result.data,
             )
         try:
             descriptor = self.tool_results.save(
@@ -1259,11 +1517,13 @@ class CompanionRuntime:
                 ok=result.ok,
                 content=compose_missing_store_notice(preview, str(error)),
                 code=result.code,
+                data=result.data,
             )
         return ToolResult(
             ok=result.ok,
             content=compose_spill_notice(descriptor, preview),
             code=result.code,
+            data=result.data,
         )
 
     def _tool_write_note(self, arguments, mode, message_id):
@@ -1383,6 +1643,8 @@ class CompanionRuntime:
         tools = registry.as_openai_tools(mode)
         messages = self._prompt_messages(text, mode)
         calls = 0
+        active_skill = None
+        allowed_tools = None
 
         def ensure_active():
             if cancel_event is not None and cancel_event.is_set():
@@ -1454,10 +1716,38 @@ class CompanionRuntime:
                     "tool_name": call.name,
                     "state": "running",
                 }
-                result = registry.execute(call.name, call.arguments, mode)
+                if (
+                    allowed_tools is not None
+                    and call.name not in allowed_tools
+                ):
+                    self._audit_skill(
+                        active_skill,
+                        "tool",
+                        mode,
+                        "denied",
+                        call.name,
+                    )
+                    result = ToolResult.failure(
+                        "技能 {} 只允许调用：{}。".format(
+                            active_skill,
+                            ", ".join(sorted(allowed_tools)),
+                        ),
+                        "skill_tool_denied",
+                    )
+                else:
+                    result = registry.execute(
+                        call.name,
+                        call.arguments,
+                        mode,
+                    )
                 ensure_active()
-                if call.name != "read_tool_result":
+                if call.name not in SKILL_META_TOOLS:
                     result = self._maybe_spill(result, call.name)
+                if call.name == "invoke_skill" and result.ok and result.data:
+                    active_skill = str(result.data.get("skill") or "")
+                    allowed_tools = set(
+                        result.data.get("tools") or ()
+                    ) | SKILL_META_TOOLS
                 yield {
                     "kind": "tool",
                     "tool_name": call.name,

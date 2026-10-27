@@ -50,14 +50,20 @@ class ToolResult:
     content: str
     proposal: Optional[ActionProposal] = None
     code: str = ""
+    data: Optional[Dict[str, Any]] = None
 
     @classmethod
-    def success(cls, content, proposal=None):
-        return cls(ok=True, content=content, proposal=proposal)
+    def success(cls, content, proposal=None, data=None):
+        return cls(
+            ok=True,
+            content=content,
+            proposal=proposal,
+            data=data,
+        )
 
     @classmethod
-    def failure(cls, content, code="tool_error"):
-        return cls(ok=False, content=content, code=code)
+    def failure(cls, content, code="tool_error", data=None):
+        return cls(ok=False, content=content, code=code, data=data)
 
 
 @dataclass
@@ -96,6 +102,9 @@ class CompanionToolRegistry:
 
     def names(self) -> List[str]:
         return sorted(self._tools)
+
+    def risks(self) -> Dict[str, RiskLevel]:
+        return {name: tool.risk for name, tool in self._tools.items()}
 
     def available(self, mode) -> List[CompanionTool]:
         return [
