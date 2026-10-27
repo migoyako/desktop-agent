@@ -9,6 +9,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from ..models import AgentMode
+from ..proactive import status_label
+from ..work import FORWARD_LABELS, STATE_LABELS
 
 
 BG = "#10181d"
@@ -89,6 +91,7 @@ class CompanionTkApp:
         self.runtime = runtime
         self.mode = AgentMode.CHAT
         self.current_proposal = None
+        self.proactive_inflight = False
         self.jobs = queue.Queue()
         self.persona_name = (
             runtime.persona.name if getattr(runtime, "persona", None) else "数字分身"
@@ -110,6 +113,7 @@ class CompanionTkApp:
         self.refresh_history()
         self.refresh_pending()
         self.root.after(60, self.poll_jobs)
+        self.root.after(60000, self.poll_proactive)
 
     def setup_style(self):
         style = ttk.Style(self.root)
@@ -181,6 +185,8 @@ class CompanionTkApp:
         ttk.Button(mode_row, text="记忆", command=self.open_memory).pack(side="right")
         ttk.Button(mode_row, text="情绪", command=self.open_affect).pack(side="right", padx=6)
         ttk.Button(mode_row, text="人设", command=self.open_persona).pack(side="right")
+        ttk.Button(mode_row, text="主动", command=self.open_proactive).pack(side="right", padx=6)
+        ttk.Button(mode_row, text="任务", command=self.open_work).pack(side="right")
 
         workspace_row = tk.Frame(self.root, bg=BG)
         workspace_row.pack(fill="x", padx=18, pady=(4, 6))
@@ -358,6 +364,10 @@ class CompanionTkApp:
             self.refresh_history()
             if result.get("proposal"):
                 self.show_proposal(result["proposal"])
+            task = result.get("task")
+            if task is not None:
+                self.status.configure(text="任务卡已生成，请批准、修改或拒绝。")
+                self.open_work()
             self.refresh_avatar_mood()
 
         self.run_async(work, success)
@@ -1049,6 +1059,382 @@ class CompanionTkApp:
             ).pack(side="left", padx=(0, 6))
         refresh()
 
+    def open_work(self):
+        window = tk.Toplevel(self.root)
+        window.title("工作任务卡")
+        window.geometry("760x600")
+        window.configure(bg=BG)
+        note = tk.Label(
+            window,
+            text="批准前不会执行或转发；超时不自动通过；结果不确定不会重发。",
+            justify="left",
+            anchor="w",
+            bg=BG,
+            fg=MUTED,
+        )
+        note.pack(fill="x", padx=16, pady=(14, 4))
+        body = tk.Frame(window, bg=BG)
+        body.pack(fill="both", expand=True, padx=16, pady=6)
+        listbox = tk.Listbox(
+            body,
+            bg=PANEL,
+            fg=TEXT,
+            selectbackground="#2d5058",
+            borderwidth=0,
+            font=("Microsoft YaHei UI", 9),
+            width=28,
+        )
+        listbox.pack(side="left", fill="y")
+        detail = tk.Text(
+            body,
+            bg=PANEL,
+            fg=TEXT,
+            wrap="word",
+            borderwidth=0,
+            padx=10,
+            pady=8,
+            font=("Microsoft YaHei UI", 9),
+        )
+        detail.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        tasks = []
+
+        def selected():
+            selection = listbox.curselection()
+            if not selection:
+                return None
+            index = selection[0]
+            if 0 <= index < len(tasks):
+                return tasks[index]
+            return None
+
+        def show_selected(_event=None):
+            task = selected()
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            if task is None:
+                detail.insert("end", "选择一条任务查看计划。\n")
+                detail.configure(state="disabled")
+                return
+            receipt = self.runtime.work_receipt(task.task_id)
+            detail.insert("end", "标题：{}\n".format(task.card.title))
+            detail.insert("end", "目标：{}\n".format(task.card.goal))
+            detail.insert("end", "理由：{}\n".format(task.card.reason))
+            detail.insert(
+                "end",
+                "执行器：{}　项目：{}\n".format(
+                    task.card.executor,
+                    task.card.project,
+                ),
+            )
+            detail.insert("end", "口语播报：{}\n".format(task.card.spoken_summary))
+            detail.insert(
+                "end",
+                "计划状态：{}　修订：{}　已追问：{} 次\n".format(
+                    STATE_LABELS.get(task.state, task.state),
+                    task.revision,
+                    task.info_asked,
+                ),
+            )
+            if task.approval_reason:
+                detail.insert("end", "审批说明：{}\n".format(task.approval_reason))
+            if receipt:
+                detail.insert(
+                    "end",
+                    "转发回执：{}（尝试 {} 次）\n{}\n".format(
+                        FORWARD_LABELS.get(receipt.status, receipt.status),
+                        receipt.attempts,
+                        receipt.summary,
+                    ),
+                )
+                if receipt.detail:
+                    detail.insert("end", "回执详情：{}\n".format(receipt.detail))
+                if receipt.status == "unknown":
+                    detail.insert("end", "注意：结果不确定，系统不会自动重发。\n")
+            detail.configure(state="disabled")
+
+        def refresh():
+            selected_id = ""
+            current = selected()
+            if current is not None:
+                selected_id = current.task_id
+            tasks[:] = self.runtime.work_tasks(20)
+            listbox.delete(0, "end")
+            target = 0
+            for index, task in enumerate(tasks):
+                listbox.insert(
+                    "end",
+                    "{}｜{}".format(
+                        STATE_LABELS.get(task.state, task.state),
+                        task.card.title,
+                    ),
+                )
+                if task.task_id == selected_id:
+                    target = index
+            if tasks:
+                listbox.selection_set(target)
+                listbox.activate(target)
+            show_selected()
+
+        def new_task():
+            text = simpledialog.askstring(
+                "新建任务卡",
+                "描述你想完成的工作：",
+                parent=window,
+            )
+            if not text or not text.strip():
+                return
+            try:
+                self.runtime.create_work_task(text, force=True)
+            except Exception as error:
+                note.configure(text="创建失败：{}".format(error))
+                return
+            note.configure(text="任务卡已生成。")
+            self.refresh_history()
+            refresh()
+
+        def approve():
+            task = selected()
+            if task is None:
+                return
+            if not messagebox.askyesno(
+                "批准计划",
+                "批准后才会调用执行器；结果不确定时不会自动重发。继续吗？",
+                parent=window,
+            ):
+                return
+            try:
+                result = self.runtime.approve_work_task(task.task_id)
+            except Exception as error:
+                note.configure(text="批准失败：{}".format(error))
+                return
+            note.configure(text=result.get("answer", "已完成。").splitlines()[0])
+            self.refresh_history()
+            refresh()
+
+        def revise():
+            task = selected()
+            if task is None:
+                return
+            text = simpledialog.askstring(
+                "修改计划",
+                "说明要修改的目标、对象或步骤：",
+                parent=window,
+            )
+            if not text or not text.strip():
+                return
+            try:
+                result = self.runtime.revise_work_task(task.task_id, text)
+            except Exception as error:
+                note.configure(text="修改失败：{}".format(error))
+                return
+            note.configure(text=result.get("answer", "计划已更新。").splitlines()[0])
+            refresh()
+
+        def reject():
+            task = selected()
+            if task is None:
+                return
+            if not messagebox.askyesno(
+                "拒绝计划",
+                "拒绝后不会执行或转发这个任务。继续吗？",
+                parent=window,
+            ):
+                return
+            try:
+                result = self.runtime.reject_work_task(
+                    task.task_id,
+                    "用户在任务面板拒绝",
+                )
+            except Exception as error:
+                note.configure(text="拒绝失败：{}".format(error))
+                return
+            note.configure(text=result.get("answer", "已拒绝。"))
+            self.refresh_history()
+            refresh()
+
+        listbox.bind("<<ListboxSelect>>", show_selected)
+        row = tk.Frame(window, bg=BG)
+        row.pack(fill="x", padx=16, pady=(0, 12))
+        ttk.Button(row, text="新建任务卡", style="Primary.TButton", command=new_task).pack(side="left")
+        ttk.Button(row, text="批准计划", command=approve).pack(side="left", padx=6)
+        ttk.Button(row, text="修改计划", command=revise).pack(side="left")
+        ttk.Button(row, text="拒绝", command=reject).pack(side="left", padx=6)
+        ttk.Button(row, text="刷新", command=refresh).pack(side="left")
+        refresh()
+
+    def open_proactive(self):
+        window = tk.Toplevel(self.root)
+        window.title("主动陪伴")
+        window.geometry("700x560")
+        window.configure(bg=BG)
+        summary = tk.Label(
+            window,
+            text="",
+            justify="left",
+            anchor="w",
+            bg=BG,
+            fg=TEXT,
+            font=("Microsoft YaHei UI", 9),
+        )
+        summary.pack(fill="x", padx=16, pady=(14, 6))
+        note = tk.Label(
+            window,
+            text="",
+            justify="left",
+            anchor="w",
+            bg=BG,
+            fg=MUTED,
+        )
+        note.pack(fill="x", padx=16)
+        text = tk.Text(
+            window,
+            bg=PANEL,
+            fg=TEXT,
+            wrap="word",
+            borderwidth=0,
+            padx=10,
+            pady=8,
+            font=("Microsoft YaHei UI", 9),
+            height=14,
+        )
+        text.pack(fill="both", expand=True, padx=16, pady=8)
+
+        def refresh():
+            status = self.runtime.proactive_status()
+            next_due = status["next_due"]
+            lines = [
+                "状态：{}｜活动：{}".format(
+                    "开启" if status["enabled"] else "已暂停",
+                    status["activity_label"],
+                ),
+                "今日 {}/{}｜未回复 {}/{}｜未读 {}｜下一条提醒：{}".format(
+                    status["daily_count"],
+                    status["daily_limit"],
+                    status["unanswered"],
+                    status["max_unanswered"],
+                    status["unread"],
+                    (
+                        "{}（{}）".format(
+                            next_due["content"],
+                            next_due["display"],
+                        )
+                        if next_due
+                        else "无"
+                    ),
+                ),
+            ]
+            summary.configure(text="\n".join(lines))
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            events = self.runtime.proactive_events(20)
+            if not events:
+                text.insert("end", "还没有主动发言记录。\n")
+            for event in events:
+                state = status_label(event.status)
+                if event.read_at is None:
+                    state += " / 未读"
+                text.insert(
+                    "end",
+                    "[{}] {}｜{}\n原因：{}\n内容：{}\n\n".format(
+                        event.created_at[:16],
+                        event.source_type,
+                        state,
+                        event.trigger_reason,
+                        event.content,
+                    ),
+                )
+            text.configure(state="disabled")
+
+        def toggle():
+            status = self.runtime.proactive_status()
+            self.runtime.set_proactive_enabled(not status["enabled"])
+            note.configure(text="主动状态已更新。")
+            refresh()
+
+        def check_now():
+            try:
+                result = self.runtime.proactive_tick()
+            except Exception as error:
+                note.configure(text="主动检查失败：{}".format(error))
+                return
+            if result.get("spoke"):
+                note.configure(
+                    text="刚刚主动发言：{}".format(
+                        result.get("trigger_reason") or "已送达"
+                    )
+                )
+                self.refresh_history()
+            elif result.get("missed"):
+                note.configure(
+                    text="有 {} 条提醒错过送达窗口，已标记未读。".format(
+                        len(result["missed"])
+                    )
+                )
+            else:
+                note.configure(
+                    text="现在不发言：{}".format(
+                        result.get("reason_label") or result.get("reason")
+                    )
+                )
+            refresh()
+
+        def mark_all_read():
+            count = self.runtime.mark_proactive_read()
+            note.configure(text="已标记 {} 条事件为已读。".format(count))
+            refresh()
+
+        row = tk.Frame(window, bg=BG)
+        row.pack(fill="x", padx=16, pady=(0, 12))
+        ttk.Button(row, text="暂停/恢复", command=toggle).pack(side="left")
+        ttk.Button(row, text="现在检查", command=check_now).pack(
+            side="left",
+            padx=6,
+        )
+        ttk.Button(row, text="全部已读", command=mark_all_read).pack(
+            side="left"
+        )
+        ttk.Button(row, text="刷新", command=refresh).pack(side="left", padx=6)
+        refresh()
+
+    def poll_proactive(self):
+        if not self.root.winfo_exists():
+            return
+        self.root.after(60000, self.poll_proactive)
+        if self.proactive_inflight:
+            return
+        if str(self.send_button["state"]) == "disabled":
+            return
+        try:
+            status = self.runtime.proactive_status()
+        except Exception as error:
+            self.status.configure(text="主动检查失败：{}".format(error))
+            return
+        if not status["enabled"]:
+            return
+        self.proactive_inflight = True
+
+        def success(result):
+            self.proactive_inflight = False
+            if result.get("spoke"):
+                self.refresh_history()
+                self.refresh_avatar_mood()
+                self.status.configure(
+                    text="主动：{}".format(
+                        result.get("trigger_reason") or "已送达"
+                    )
+                )
+            elif result.get("missed"):
+                self.status.configure(
+                    text="有 {} 条错过的提醒，已标记未读。".format(
+                        len(result["missed"])
+                    )
+                )
+
+        def work():
+            return self.runtime.proactive_tick()
+
+        self.run_async(work, success)
+
     def run_async(self, function, on_success):
         def worker():
             try:
@@ -1072,6 +1458,7 @@ class CompanionTkApp:
             self.root.after(60, self.poll_jobs)
 
     def worker_failed(self, message):
+        self.proactive_inflight = False
         self.send_button.configure(state="normal")
         self.confirm_button.configure(state="normal")
         self.cancel_button.configure(state="normal")

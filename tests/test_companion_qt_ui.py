@@ -232,6 +232,74 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
             self.skipTest("PySide6 unavailable")
         self.assert_dialog_closes_independently("memory_dialog")
 
+    def test_work_dialog_shows_plan_and_closes_independently(self):
+        if CompanionWindow is None:
+            self.skipTest("PySide6 unavailable")
+        self.runtime.create_work_task("把周报发给张三并说明周五发送", force=True)
+        self.window.open_work()
+        dialog = self.window.work_dialog
+        self.app.processEvents()
+
+        self.assertIsNotNone(dialog)
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(dialog.table.rowCount(), 1)
+        self.assertEqual(dialog.table.item(0, 2).text(), "等待审批")
+        self.assertEqual(dialog.table.item(0, 3).text(), "等待确认")
+        self.assertIn("周五发送", dialog.detail.toPlainText())
+        self.assertTrue(dialog.approve_button.isEnabled())
+        self.assertTrue(dialog.revise_button.isEnabled())
+        self.assertTrue(dialog.reject_button.isEnabled())
+
+        dialog.close_button.click()
+        self.app.processEvents()
+        self.assertFalse(dialog.isVisible())
+        self.assertIsNone(self.window.work_dialog)
+
+    def test_proactive_dialog_saves_settings_and_shows_events(self):
+        if CompanionWindow is None:
+            self.skipTest("PySide6 unavailable")
+        self.window.open_proactive()
+        dialog = self.window.proactive_dialog
+        self.app.processEvents()
+
+        self.assertIsNotNone(dialog)
+        self.assertTrue(dialog.isVisible())
+        self.assertIn("今日主动", dialog.summary.text())
+
+        dialog.quiet_start.setValue(0)
+        dialog.quiet_end.setValue(0)
+        dialog.daily_limit.setValue(5)
+        dialog.save()
+        self.app.processEvents()
+
+        settings = self.runtime.proactive_status()["settings"]
+        self.assertEqual(settings["daily_limit"], 5)
+        self.assertEqual(settings["quiet_start"], 0)
+        self.assertEqual(settings["quiet_end"], 0)
+
+        self.store.add_proactive_event(
+            session_id="main",
+            source_type="reminder",
+            source_id="rem_ui",
+            trigger_reason="提醒到点",
+            content="提醒：喝水",
+            status="missed",
+            reason="missed_window",
+        )
+        dialog.refresh()
+        self.app.processEvents()
+        self.assertEqual(dialog.table.rowCount(), 1)
+        self.assertIn("未读", dialog.table.item(0, 2).text())
+        self.assertIn("提醒到点", dialog.table.item(0, 3).text())
+
+        dialog.mark_all_read()
+        self.app.processEvents()
+        self.assertEqual(self.runtime.proactive_status()["unread"], 0)
+
+        dialog.close()
+        self.app.processEvents()
+        self.assertIsNone(self.window.proactive_dialog)
+
     def test_memory_dialog_shows_evidence_and_protected_state(self):
         if CompanionWindow is None:
             self.skipTest("PySide6 unavailable")

@@ -61,6 +61,16 @@ from .persona import (
     select_worldbook,
 )
 from .policy import ALLOW, ASK, DENY, decide_tool_policy
+from .proactive import (
+    ProactiveEngine,
+    ProactiveService,
+    ReminderService,
+    WindowsActivityProbe,
+    classify_activity,
+    describe_activity,
+    format_due,
+    parse_reminder_request,
+)
 from .search import (
     SearchError,
     SearchService,
@@ -79,6 +89,7 @@ from .tool_results import (
     compose_spill_notice,
 )
 from .tools import CompanionTool, CompanionToolRegistry, ToolResult
+from .work import LLMIntentClassifier, WorkService
 
 
 MAX_TOOL_ROUNDS = 3
@@ -126,6 +137,8 @@ class CompanionRuntime:
         offline: bool = False,
         persona_id: str = DEFAULT_PERSONA_ID,
         max_context_chars: int = DEFAULT_CONTEXT_CHARS,
+        work_executor=None,
+        work_classifier=None,
     ):
         self.store = store
         self.llm_client = llm_client
@@ -151,8 +164,28 @@ class CompanionRuntime:
         self.memory = MemoryService(self.store)
         self.chat_import = ChatImportService(self.store, self.memory)
         self.affect = AffectService(self.store)
+        self.reminder_service = ReminderService(self.store)
+        self.proactive = ProactiveEngine(self.store, self.reminder_service)
+        self.activity_probe = WindowsActivityProbe()
+        self.proactive_service = ProactiveService(
+            self.store,
+            self.proactive,
+            self.reminder_service,
+            self.activity_probe,
+            session_id=session_id,
+        )
         if self.store.get_session_mode(session_id) is None:
             self.store.ensure_session(session_id, AgentMode.CHAT)
+        classifier = work_classifier
+        if classifier is None and not self.offline:
+            classifier = LLMIntentClassifier(llm_client)
+        self.work = WorkService(
+            self.store,
+            session_id=session_id,
+            executor=work_executor,
+            classifier=classifier,
+        )
+        self.recovered_work = self.work.recovered
         self.recovered_receipts = self.store.recover_incomplete_executions()
 
     @classmethod
@@ -284,16 +317,39 @@ class CompanionRuntime:
         )
         self.affect.observe(self.session_id, message_id, text)
         self.memory.observe_user_message(self.session_id, message_id, text)
+        self.proactive_service.on_user_message()
 
         proposal = None
         receipt = None
+        work_task = None
+        work_receipt = None
         try:
+            reminder_draft = parse_reminder_request(text)
             search_request = self._parse_search_request(text)
-            if mode == AgentMode.CHAT and search_request:
+            if reminder_draft is not None:
+                reminder = self.reminder_service.create(
+                    self.session_id,
+                    reminder_draft.content,
+                    reminder_draft.due_at,
+                    source_message_id=message_id,
+                )
+                answer = "好的，我会在{}提醒你：{}。".format(
+                    format_due(reminder.due_at),
+                    reminder.content,
+                )
+            elif mode == AgentMode.CHAT and search_request:
                 answer = (
                     "网页搜索属于工作能力。请切换到“工作”模式，"
                     "然后输入“搜索关键词并保存为笔记”。"
                 )
+            elif mode == AgentMode.WORK and self.work.should_plan(text):
+                work_result = self.work.submit(
+                    text,
+                    source_message_id=message_id,
+                )
+                answer = work_result["answer"]
+                work_task = work_result.get("task")
+                work_receipt = work_result.get("receipt")
             elif mode in (AgentMode.WORK, AgentMode.EXECUTE) and search_request:
                 answer, proposal = self._search_flow(
                     search_request,
@@ -322,6 +378,8 @@ class CompanionRuntime:
             "answer": answer,
             "proposal": proposal,
             "receipt": receipt,
+            "task": work_task,
+            "task_receipt": work_receipt,
             "affect": self.affect.snapshot(self.session_id),
         }
 
@@ -573,6 +631,58 @@ class CompanionRuntime:
     def pending_proposals(self) -> List:
         return self.store.list_pending_proposals(self.session_id)
 
+    def create_work_task(self, text, force=True, source_message_id=None):
+        result = self.work.submit(
+            text,
+            source_message_id=source_message_id,
+            force=force,
+        )
+        self._record_work_answer(result)
+        return result
+
+    def work_task(self, task_id=None):
+        if task_id:
+            return self.work.task(task_id)
+        return self.work.active_task()
+
+    def work_tasks(self, limit=20):
+        return self.work.tasks(limit=limit)
+
+    def work_status(self):
+        return self.work.status()
+
+    def work_receipt(self, task_id):
+        return self.work.receipt_for(task_id)
+
+    def approve_work_task(self, task_id, executor=None):
+        result = self.work.approve(task_id, executor=executor)
+        self._record_work_answer(result)
+        return result
+
+    def revise_work_task(self, task_id, instruction):
+        result = self.work.revise(task_id, instruction)
+        self._record_work_answer(result)
+        return result
+
+    def reject_work_task(self, task_id, reason=""):
+        result = self.work.reject(task_id, reason=reason)
+        self._record_work_answer(result)
+        return result
+
+    def expire_work_task(self, task_id):
+        return self.work.expire_if_due(task_id)
+
+    def _record_work_answer(self, result):
+        answer = (result or {}).get("answer")
+        if not answer:
+            return
+        self.store.add_message(
+            self.session_id,
+            "assistant",
+            answer,
+            self.current_mode(),
+        )
+
     def memories(self, include_candidates=True):
         statuses = ["confirmed", "candidate"] if include_candidates else ["confirmed"]
         return self.store.list_memories(self.session_id, statuses=statuses)
@@ -623,6 +733,68 @@ class CompanionRuntime:
 
     def latest_receipts(self, limit=20):
         return self.store.list_receipts(self.session_id, limit=limit)
+
+    def list_reminders(self, status="pending"):
+        return self.store.list_reminders(self.session_id, status=status)
+
+    def create_reminder(self, content, due_at):
+        return self.reminder_service.create(
+            self.session_id,
+            content,
+            due_at,
+        )
+
+    def complete_reminder(self, reminder_id):
+        return self.reminder_service.complete(reminder_id)
+
+    def dismiss_reminder(self, reminder_id):
+        return self.reminder_service.dismiss(reminder_id)
+
+    def activity_state(self):
+        snapshot = self.activity_probe.snapshot()
+        state = classify_activity(snapshot)
+        return {
+            "state": state,
+            "label": describe_activity(state),
+            "available": snapshot.available,
+            "idle_seconds": (
+                None
+                if snapshot.idle_seconds is None
+                else round(float(snapshot.idle_seconds), 1)
+            ),
+            "title": snapshot.foreground_title,
+            "process": snapshot.process_name,
+            "fullscreen": snapshot.fullscreen,
+        }
+
+    def proactive_preview(self, gate_state=None):
+        return self.proactive_service.preview(gate_state=gate_state)
+
+    def proactive_tick(self):
+        return self.proactive_service.tick()
+
+    def proactive_status(self):
+        return self.proactive_service.status()
+
+    def proactive_events(self, limit=20):
+        return self.proactive_service.events(limit=limit)
+
+    def unread_proactive_events(self, limit=20):
+        return self.proactive_service.unread_events(limit=limit)
+
+    def mark_proactive_read(self, event_id=None):
+        return self.proactive_service.mark_read(event_id)
+
+    def set_proactive_enabled(self, enabled=True):
+        self.proactive_service.update_settings(enabled=bool(enabled))
+        return self.proactive_status()
+
+    def update_proactive_settings(self, **fields):
+        self.proactive_service.update_settings(**fields)
+        return self.proactive_status()
+
+    def next_reminder(self):
+        return self.reminder_service.next_due(self.session_id)
 
     def _parse_search_request(self, text):
         match = SEARCH_PREFIX.search(text)

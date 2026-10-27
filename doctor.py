@@ -91,6 +91,8 @@ def main():
         import sqlite3
 
         db_path = ROOT / "data" / "companion.db"
+        proactive_detail = ""
+        work_detail = ""
         if db_path.exists():
             connection = sqlite3.connect(
                 "file:{}?mode=ro".format(db_path.as_posix()),
@@ -109,6 +111,55 @@ def main():
                         "SELECT name FROM sqlite_master"
                     ).fetchall()
                 }
+                if {"proactive_state", "proactive_events"} <= names:
+                    state_row = connection.execute(
+                        """
+                        SELECT enabled, daily_count, unanswered_count
+                        FROM proactive_state WHERE session_id = 'main'
+                        """
+                    ).fetchone()
+                    unread = connection.execute(
+                        """
+                        SELECT COUNT(*) FROM proactive_events
+                        WHERE session_id = 'main' AND read_at IS NULL
+                        """
+                    ).fetchone()[0]
+                    proactive_detail = (
+                        "enabled={} daily={} unanswered={} unread={}".format(
+                            (
+                                "default"
+                                if state_row is None
+                                else ("yes" if state_row[0] else "no")
+                            ),
+                            state_row[1] if state_row else 0,
+                            state_row[2] if state_row else 0,
+                            unread,
+                        )
+                    )
+                if {"work_tasks", "work_receipts"} <= names:
+                    active = connection.execute(
+                        """
+                        SELECT COUNT(*) FROM work_tasks
+                        WHERE session_id = 'main' AND state <> 'NORMAL'
+                        """
+                    ).fetchone()[0]
+                    review = connection.execute(
+                        """
+                        SELECT COUNT(*) FROM work_tasks
+                        WHERE session_id = 'main' AND state = 'PLAN_REVIEW'
+                        """
+                    ).fetchone()[0]
+                    uncertain = connection.execute(
+                        """
+                        SELECT COUNT(*) FROM work_receipts
+                        WHERE session_id = 'main' AND status = 'unknown'
+                        """
+                    ).fetchone()[0]
+                    work_detail = "active={} review={} unknown={}".format(
+                        active,
+                        review,
+                        uncertain,
+                    )
             finally:
                 connection.close()
             fts_state = (
@@ -127,8 +178,48 @@ def main():
             )
         else:
             checks.append(check("Database", True, "尚未创建"))
+        if proactive_detail:
+            checks.append(check("Proactive state", True, proactive_detail))
+        else:
+            print("[WARN] {:<20} {}".format(
+                "Proactive state",
+                "not initialised; created on next launch",
+            ))
+        if work_detail:
+            checks.append(check("Work state", True, work_detail))
+        else:
+            print("[WARN] {:<20} {}".format(
+                "Work state",
+                "not initialised; created on next launch",
+            ))
     except Exception as error:
         checks.append(check("Database", False, str(error)))
+
+    try:
+        from agent_framework.companion.proactive import (
+            WindowsActivityProbe,
+            classify_activity,
+        )
+
+        snapshot = WindowsActivityProbe().snapshot()
+        if snapshot.available:
+            checks.append(
+                check(
+                    "Activity probe",
+                    True,
+                    "{} / idle={}s".format(
+                        classify_activity(snapshot),
+                        round(float(snapshot.idle_seconds or 0.0), 1),
+                    ),
+                )
+            )
+        else:
+            print("[WARN] {:<20} {}".format(
+                "Activity probe",
+                "unavailable; proactive gating stays closed",
+            ))
+    except Exception as error:
+        print("[WARN] {:<20} {}".format("Activity probe", error))
 
     try:
         if tk is None:

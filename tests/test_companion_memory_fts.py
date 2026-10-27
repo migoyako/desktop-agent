@@ -95,7 +95,7 @@ class MemoryFtsTest(unittest.TestCase):
             connection.close()
 
     def test_new_store_reaches_current_version_with_fts(self):
-        self.assertEqual(SCHEMA_VERSION, 4)
+        self.assertEqual(SCHEMA_VERSION, 7)
         self.assertEqual(self.user_version(), SCHEMA_VERSION)
         self.assertTrue(self.store.fts_enabled)
         connection = self.raw_connection()

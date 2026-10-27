@@ -13,11 +13,23 @@ from .models import (
     ActionProposal,
     ActionResult,
     AffectRecord,
+    APPROVAL_PENDING,
     AgentMode,
     ExperienceRecord,
+    FORWARD_UNKNOWN,
     MemoryRecord,
+    ProactiveEvent,
+    ProactiveState,
     ProposalStatus,
+    ReminderRecord,
     RiskLevel,
+    TaskCard,
+    WORK_EXECUTING,
+    WORK_NORMAL,
+    WORK_PLAN_DISCUSSING,
+    WORK_PLAN_REVIEW,
+    WorkReceipt,
+    WorkTask,
     new_id,
     utc_now,
 )
@@ -160,7 +172,7 @@ CREATE TABLE IF NOT EXISTS workspace_grants (
 """
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 
 MEMORY_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
@@ -306,6 +318,110 @@ CREATE INDEX IF NOT EXISTS idx_context_checkpoints_session
     ON context_checkpoints(session_id, through_message_id);
 """
 
+PROACTIVE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS reminders (
+    reminder_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    source_message_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    acknowledged_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_reminders_due
+    ON reminders(session_id, status, due_at);
+"""
+
+PROACTIVE_STATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS proactive_state (
+    session_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    quiet_start INTEGER NOT NULL DEFAULT 22,
+    quiet_end INTEGER NOT NULL DEFAULT 8,
+    daily_limit INTEGER NOT NULL DEFAULT 2,
+    min_interval_hours REAL NOT NULL DEFAULT 3.0,
+    max_unanswered INTEGER NOT NULL DEFAULT 2,
+    include_memory INTEGER NOT NULL DEFAULT 0,
+    daily_count INTEGER NOT NULL DEFAULT 0,
+    daily_date TEXT NOT NULL DEFAULT '',
+    last_spoken_at TEXT,
+    last_event_id TEXT NOT NULL DEFAULT '',
+    unanswered_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS proactive_events (
+    event_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_message_id INTEGER,
+    trigger_reason TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    message_id INTEGER,
+    content_hash TEXT NOT NULL DEFAULT '',
+    url_hash TEXT NOT NULL DEFAULT '',
+    read_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_proactive_events_session
+    ON proactive_events(session_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_proactive_events_source
+    ON proactive_events(session_id, source_type, source_id);
+"""
+
+WORK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS work_tasks (
+    task_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    title TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    spoken_summary TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    executor TEXT NOT NULL,
+    project TEXT NOT NULL,
+    source_message_id INTEGER,
+    info_asked INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 0,
+    approval_status TEXT NOT NULL DEFAULT 'pending',
+    approval_reason TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    expires_at TEXT NOT NULL DEFAULT '',
+    approved_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_tasks_session
+    ON work_tasks(session_id, state, updated_at);
+
+CREATE TABLE IF NOT EXISTS work_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    external_id TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES work_tasks(task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_receipts_session
+    ON work_receipts(session_id, status, updated_at);
+"""
+
 
 def _add_column_if_missing(connection, table, column, definition):
     existing = {
@@ -424,6 +540,21 @@ def _migrate_v4(connection):
     connection.executescript(CONTEXT_SCHEMA)
 
 
+def _migrate_v5(connection):
+    """主动陪伴底座：本地提醒表（到点查询按 pending + due_at 索引）。"""
+    connection.executescript(PROACTIVE_SCHEMA)
+
+
+def _migrate_v6(connection):
+    """主动陪伴主体：会话级策略状态与主动发言触发日志。"""
+    connection.executescript(PROACTIVE_STATE_SCHEMA)
+
+
+def _migrate_v7(connection):
+    """工作任务卡：可审阅计划状态与转发回执。"""
+    connection.executescript(WORK_SCHEMA)
+
+
 def _reindex_memory_fts(connection):
     """从 memories 全量重建 memory_fts 索引（幂等）。"""
     connection.execute("DELETE FROM memory_fts")
@@ -474,6 +605,15 @@ class CompanionStore:
                 if version < 4:
                     _migrate_v4(connection)
                     version = 4
+                if version < 5:
+                    _migrate_v5(connection)
+                    version = 5
+                if version < 6:
+                    _migrate_v6(connection)
+                    version = 6
+                if version < 7:
+                    _migrate_v7(connection)
+                    version = 7
             connection.execute(
                 "PRAGMA user_version = {}".format(int(version))
             )
@@ -988,6 +1128,299 @@ class CompanionStore:
                 )
             self.update_proposal_status(row["action_id"], ProposalStatus.UNKNOWN)
             recovered.append(receipt)
+        return recovered
+
+    def create_work_task(self, task: WorkTask):
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO work_tasks(
+                    task_id, session_id, state, title, reason,
+                    spoken_summary, goal, executor, project,
+                    source_message_id, info_asked, revision,
+                    approval_status, approval_reason, metadata_json,
+                    expires_at, approved_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task.task_id,
+                    task.session_id,
+                    task.state,
+                    task.card.title,
+                    task.card.reason,
+                    task.card.spoken_summary,
+                    task.card.goal,
+                    task.card.executor,
+                    task.card.project,
+                    task.source_message_id,
+                    int(task.info_asked),
+                    int(task.revision),
+                    task.approval_status,
+                    task.approval_reason,
+                    json.dumps(task.metadata, ensure_ascii=False),
+                    task.expires_at,
+                    task.approved_at,
+                    task.created_at,
+                    task.updated_at,
+                ),
+            )
+
+    def get_work_task(self, task_id: str) -> Optional[WorkTask]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM work_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return self._work_task_from_row(row) if row else None
+
+    def update_work_task(self, task: WorkTask):
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE work_tasks SET
+                    state = ?, title = ?, reason = ?, spoken_summary = ?,
+                    goal = ?, executor = ?, project = ?,
+                    source_message_id = ?, info_asked = ?, revision = ?,
+                    approval_status = ?, approval_reason = ?,
+                    metadata_json = ?, expires_at = ?, approved_at = ?,
+                    updated_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    task.state,
+                    task.card.title,
+                    task.card.reason,
+                    task.card.spoken_summary,
+                    task.card.goal,
+                    task.card.executor,
+                    task.card.project,
+                    task.source_message_id,
+                    int(task.info_asked),
+                    int(task.revision),
+                    task.approval_status,
+                    task.approval_reason,
+                    json.dumps(task.metadata, ensure_ascii=False),
+                    task.expires_at,
+                    task.approved_at,
+                    task.updated_at,
+                    task.task_id,
+                ),
+            )
+
+    def transition_work_state(
+        self,
+        task_id: str,
+        from_state: str,
+        to_state: str,
+        **updates,
+    ) -> bool:
+        allowed = {
+            "approval_status",
+            "approval_reason",
+            "approved_at",
+            "info_asked",
+            "revision",
+            "expires_at",
+            "title",
+            "reason",
+            "spoken_summary",
+            "goal",
+            "executor",
+            "project",
+        }
+        columns = {"state": to_state, "updated_at": utc_now()}
+        for key, value in updates.items():
+            if key == "metadata":
+                columns["metadata_json"] = json.dumps(value, ensure_ascii=False)
+            elif key in allowed:
+                columns[key] = value
+            else:
+                raise ValueError("不支持的任务状态字段：{}".format(key))
+        assignments = ", ".join("{} = ?".format(name) for name in columns)
+        values = list(columns.values()) + [task_id, from_state]
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE work_tasks SET {} WHERE task_id = ? AND state = ?".format(
+                    assignments
+                ),
+                values,
+            )
+            return cursor.rowcount == 1
+
+    def list_work_tasks(
+        self,
+        session_id: str,
+        state: Optional[str] = None,
+        limit: int = 20,
+    ):
+        with self._connection() as connection:
+            if state:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM work_tasks
+                    WHERE session_id = ? AND state = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (session_id, state, max(1, min(int(limit), 100))),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM work_tasks
+                    WHERE session_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (session_id, max(1, min(int(limit), 100))),
+                ).fetchall()
+        return [self._work_task_from_row(row) for row in rows]
+
+    def latest_work_task(
+        self,
+        session_id: str,
+        active_only: bool = False,
+    ) -> Optional[WorkTask]:
+        with self._connection() as connection:
+            if active_only:
+                row = connection.execute(
+                    """
+                    SELECT * FROM work_tasks
+                    WHERE session_id = ? AND state <> ?
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (session_id, WORK_NORMAL),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT * FROM work_tasks
+                    WHERE session_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+        return self._work_task_from_row(row) if row else None
+
+    def create_work_receipt(self, receipt: WorkReceipt):
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO work_receipts(
+                    receipt_id, task_id, session_id, status, summary,
+                    detail, external_id, attempts, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    receipt.receipt_id,
+                    receipt.task_id,
+                    receipt.session_id,
+                    receipt.status,
+                    receipt.summary,
+                    receipt.detail,
+                    receipt.external_id,
+                    int(receipt.attempts),
+                    receipt.created_at,
+                    receipt.updated_at,
+                ),
+            )
+
+    def get_work_receipt(self, receipt_id: str) -> Optional[WorkReceipt]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM work_receipts WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchone()
+        return self._work_receipt_from_row(row) if row else None
+
+    def get_work_receipt_for_task(self, task_id: str) -> Optional[WorkReceipt]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM work_receipts WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return self._work_receipt_from_row(row) if row else None
+
+    def update_work_receipt(
+        self,
+        receipt_id: str,
+        status: str,
+        summary: Optional[str] = None,
+        detail: Optional[str] = None,
+        external_id: Optional[str] = None,
+        increment_attempt: bool = False,
+    ):
+        columns = {"status": status, "updated_at": utc_now()}
+        if summary is not None:
+            columns["summary"] = summary
+        if detail is not None:
+            columns["detail"] = detail
+        if external_id is not None:
+            columns["external_id"] = external_id
+        assignments = ", ".join("{} = ?".format(name) for name in columns)
+        if increment_attempt:
+            assignments += ", attempts = attempts + 1"
+        values = list(columns.values()) + [receipt_id]
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE work_receipts SET {} WHERE receipt_id = ?".format(
+                    assignments
+                ),
+                values,
+            )
+
+    def list_work_receipts(self, session_id: str, limit: int = 20):
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM work_receipts
+                WHERE session_id = ?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (session_id, max(1, min(int(limit), 100))),
+            ).fetchall()
+        return [self._work_receipt_from_row(row) for row in rows]
+
+    def recover_incomplete_work(self):
+        """把中断的审阅/执行任务退回讨论态，并把转发中的回执标为 unknown。
+
+        恢复过程绝不重发，也不自动批准。
+        """
+        recovered = []
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT task_id, state FROM work_tasks
+                WHERE state IN (?, ?)
+                """,
+                (WORK_PLAN_REVIEW, WORK_EXECUTING),
+            ).fetchall()
+        for row in rows:
+            task_id = row["task_id"]
+            receipt = self.get_work_receipt_for_task(task_id)
+            if (
+                row["state"] == WORK_EXECUTING
+                and receipt is not None
+                and receipt.status not in ("awaiting_confirmation", "unavailable")
+            ):
+                self.update_work_receipt(
+                    receipt.receipt_id,
+                    FORWARD_UNKNOWN,
+                    summary="上次转发未完成，结果不确定。系统不会自动重发。",
+                    detail="process interrupted while forwarding",
+                )
+            self.transition_work_state(
+                task_id,
+                row["state"],
+                WORK_PLAN_DISCUSSING,
+                approval_status=APPROVAL_PENDING,
+                approval_reason="崩溃恢复：请重新审阅计划后再确认。",
+                approved_at=None,
+            )
+            recovered.append(task_id)
         return recovered
 
     def add_memory(
@@ -2072,6 +2505,389 @@ class CompanionStore:
             created_at=row["created_at"],
         )
 
+    def add_reminder(
+        self,
+        session_id: str,
+        content: str,
+        due_at: str,
+        source_message_id: Optional[int] = None,
+    ) -> ReminderRecord:
+        reminder_id = new_id("rem")
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO reminders(
+                    reminder_id, session_id, content, due_at, status,
+                    source_message_id, created_at, updated_at, acknowledged_at
+                ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, NULL)
+                """,
+                (
+                    reminder_id,
+                    session_id,
+                    content,
+                    due_at,
+                    source_message_id,
+                    now,
+                    now,
+                ),
+            )
+        return self.get_reminder(reminder_id)
+
+    def get_reminder(self, reminder_id: str) -> Optional[ReminderRecord]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM reminders WHERE reminder_id = ?",
+                (reminder_id,),
+            ).fetchone()
+        return self._reminder_from_row(row) if row else None
+
+    def due_reminders(
+        self,
+        session_id: str,
+        now: str,
+        limit: int = 5,
+    ) -> List[ReminderRecord]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM reminders
+                WHERE session_id = ? AND status = 'pending' AND due_at <= ?
+                ORDER BY due_at ASC, rowid ASC
+                LIMIT ?
+                """,
+                (session_id, now, max(1, min(int(limit), 20))),
+            ).fetchall()
+        return [self._reminder_from_row(row) for row in rows]
+
+    def next_reminder_due(self, session_id: str) -> Optional[ReminderRecord]:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM reminders
+                WHERE session_id = ? AND status = 'pending'
+                ORDER BY due_at ASC, rowid ASC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+        return self._reminder_from_row(row) if row else None
+
+    def list_reminders(
+        self,
+        session_id: str,
+        status: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[ReminderRecord]:
+        query = "SELECT * FROM reminders WHERE session_id = ?"
+        params = [session_id]
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY due_at ASC, rowid ASC LIMIT ?"
+        params.append(max(1, min(int(limit), 50)))
+        with self._connection() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [self._reminder_from_row(row) for row in rows]
+
+    def close_reminder(self, reminder_id: str, status: str):
+        if status not in ("done", "dismissed"):
+            raise ValueError("未知的提醒状态：{}".format(status))
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE reminders
+                SET status = ?, updated_at = ?, acknowledged_at = ?
+                WHERE reminder_id = ? AND status = 'pending'
+                """,
+                (status, now, now, reminder_id),
+            )
+            updated = cursor.rowcount
+        return self.get_reminder(reminder_id) if updated else None
+
+    def get_proactive_state(self, session_id: str) -> ProactiveState:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM proactive_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return ProactiveState(session_id=session_id)
+        return self._proactive_state_from_row(row)
+
+    def ensure_proactive_state(self, session_id: str) -> ProactiveState:
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO proactive_state(session_id, updated_at)
+                VALUES (?, ?)
+                ON CONFLICT(session_id) DO NOTHING
+                """,
+                (session_id, now),
+            )
+        return self.get_proactive_state(session_id)
+
+    def update_proactive_state(self, session_id: str, **fields) -> ProactiveState:
+        allowed = {
+            "enabled",
+            "quiet_start",
+            "quiet_end",
+            "daily_limit",
+            "min_interval_hours",
+            "max_unanswered",
+            "include_memory",
+            "daily_count",
+            "daily_date",
+            "last_spoken_at",
+            "last_event_id",
+            "unanswered_count",
+        }
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(
+                "未知的主动状态字段：{}".format("、".join(sorted(unknown)))
+            )
+        self.ensure_proactive_state(session_id)
+        values = {}
+        for key, value in fields.items():
+            if key in ("enabled", "include_memory"):
+                value = 1 if value else 0
+            elif key in ("daily_count", "unanswered_count"):
+                value = max(0, int(value))
+            elif key in ("quiet_start", "quiet_end", "daily_limit", "max_unanswered"):
+                value = int(value)
+            elif key == "min_interval_hours":
+                value = float(value)
+            values[key] = value
+        values["updated_at"] = utc_now()
+        assignments = ", ".join("{} = ?".format(key) for key in values)
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE proactive_state SET {} WHERE session_id = ?".format(
+                    assignments
+                ),
+                tuple(values.values()) + (session_id,),
+            )
+        return self.get_proactive_state(session_id)
+
+    def add_proactive_event(
+        self,
+        session_id: str,
+        source_type: str,
+        source_id: str,
+        trigger_reason: str,
+        content: str,
+        status: str,
+        reason: str = "",
+        source_message_id: Optional[int] = None,
+        message_id: Optional[int] = None,
+        content_hash: str = "",
+        url_hash: str = "",
+        read_at: Optional[str] = None,
+        created_at: Optional[str] = None,
+    ) -> ProactiveEvent:
+        event_id = new_id("pev")
+        created_at = created_at or utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO proactive_events(
+                    event_id, session_id, source_type, source_id,
+                    source_message_id, trigger_reason, content, status,
+                    reason, message_id, content_hash, url_hash, read_at,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    session_id,
+                    source_type,
+                    source_id,
+                    source_message_id,
+                    trigger_reason,
+                    content,
+                    status,
+                    reason,
+                    message_id,
+                    content_hash,
+                    url_hash,
+                    read_at,
+                    created_at,
+                ),
+            )
+        return self.get_proactive_event(event_id)
+
+    def get_proactive_event(self, event_id: str) -> Optional[ProactiveEvent]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM proactive_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        return self._proactive_event_from_row(row) if row else None
+
+    def list_proactive_events(
+        self,
+        session_id: str,
+        limit: int = 20,
+        status: Optional[str] = None,
+    ) -> List[ProactiveEvent]:
+        query = "SELECT * FROM proactive_events WHERE session_id = ?"
+        params = [session_id]
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 200)))
+        with self._connection() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [self._proactive_event_from_row(row) for row in rows]
+
+    def latest_proactive_event(
+        self,
+        session_id: str,
+        status: Optional[str] = None,
+    ) -> Optional[ProactiveEvent]:
+        events = self.list_proactive_events(session_id, limit=1, status=status)
+        return events[0] if events else None
+
+    def count_proactive_events_since(
+        self,
+        session_id: str,
+        since: str,
+        status: str = "delivered",
+    ) -> int:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS value FROM proactive_events
+                WHERE session_id = ? AND status = ? AND created_at >= ?
+                """,
+                (session_id, status, since),
+            ).fetchone()
+        return int(row["value"])
+
+    def proactive_source_exists(
+        self,
+        session_id: str,
+        source_type: str,
+        source_id: str,
+        statuses: Optional[Iterable[str]] = None,
+    ) -> bool:
+        statuses = list(statuses or ["delivered", "missed"])
+        if not statuses:
+            return False
+        placeholders = ",".join("?" for _ in statuses)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM proactive_events
+                WHERE session_id = ? AND source_type = ? AND source_id = ?
+                  AND status IN ({})
+                LIMIT 1
+                """.format(placeholders),
+                (session_id, source_type, source_id, *statuses),
+            ).fetchone()
+        return row is not None
+
+    def last_user_message_id(self, session_id: str) -> int:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(id), 0) AS value FROM messages
+                WHERE session_id = ? AND role = 'user'
+                """,
+                (session_id,),
+            ).fetchone()
+        return int(row["value"])
+
+    def count_proactive_delivered_after(
+        self,
+        session_id: str,
+        message_id: int,
+    ) -> int:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS value FROM proactive_events
+                WHERE session_id = ? AND status = 'delivered'
+                  AND message_id IS NOT NULL AND message_id > ?
+                """,
+                (session_id, int(message_id or 0)),
+            ).fetchone()
+        return int(row["value"])
+
+    def count_unread_proactive_events(self, session_id: str) -> int:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS value FROM proactive_events
+                WHERE session_id = ? AND read_at IS NULL
+                """,
+                (session_id,),
+            ).fetchone()
+        return int(row["value"])
+
+    def mark_proactive_read(self, session_id: str, event_id: Optional[str] = None):
+        now = utc_now()
+        with self._connection() as connection:
+            if event_id:
+                cursor = connection.execute(
+                    """
+                    UPDATE proactive_events SET read_at = ?
+                    WHERE session_id = ? AND event_id = ? AND read_at IS NULL
+                    """,
+                    (now, session_id, event_id),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE proactive_events SET read_at = ?
+                    WHERE session_id = ? AND read_at IS NULL
+                    """,
+                    (now, session_id),
+                )
+        return int(cursor.rowcount)
+
+    @staticmethod
+    def _proactive_state_from_row(row):
+        return ProactiveState(
+            session_id=row["session_id"],
+            enabled=bool(row["enabled"]),
+            quiet_start=row["quiet_start"],
+            quiet_end=row["quiet_end"],
+            daily_limit=row["daily_limit"],
+            min_interval_hours=row["min_interval_hours"],
+            max_unanswered=row["max_unanswered"],
+            include_memory=bool(row["include_memory"]),
+            daily_count=row["daily_count"],
+            daily_date=row["daily_date"],
+            last_spoken_at=row["last_spoken_at"],
+            last_event_id=row["last_event_id"],
+            unanswered_count=row["unanswered_count"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _proactive_event_from_row(row):
+        return ProactiveEvent(
+            event_id=row["event_id"],
+            session_id=row["session_id"],
+            source_type=row["source_type"],
+            source_id=row["source_id"],
+            source_message_id=row["source_message_id"],
+            trigger_reason=row["trigger_reason"],
+            content=row["content"],
+            status=row["status"],
+            reason=row["reason"],
+            message_id=row["message_id"],
+            content_hash=row["content_hash"],
+            url_hash=row["url_hash"],
+            read_at=row["read_at"],
+            created_at=row["created_at"],
+        )
+
     def set_workspace(self, path: str):
         with self._connection() as connection:
             connection.execute(
@@ -2136,6 +2952,61 @@ class CompanionStore:
             undoable=bool(row["undoable"]),
             undo_status=row["undo_status"],
             created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _work_task_from_row(row):
+        return WorkTask(
+            task_id=row["task_id"],
+            session_id=row["session_id"],
+            state=row["state"],
+            card=TaskCard(
+                title=row["title"],
+                reason=row["reason"],
+                spoken_summary=row["spoken_summary"],
+                goal=row["goal"],
+                executor=row["executor"],
+                project=row["project"],
+            ),
+            source_message_id=row["source_message_id"],
+            info_asked=int(row["info_asked"]),
+            revision=int(row["revision"]),
+            approval_status=row["approval_status"],
+            approval_reason=row["approval_reason"],
+            metadata=json.loads(row["metadata_json"] or "{}"),
+            expires_at=row["expires_at"],
+            approved_at=row["approved_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _work_receipt_from_row(row):
+        return WorkReceipt(
+            receipt_id=row["receipt_id"],
+            task_id=row["task_id"],
+            session_id=row["session_id"],
+            status=row["status"],
+            summary=row["summary"],
+            detail=row["detail"],
+            external_id=row["external_id"],
+            attempts=int(row["attempts"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _reminder_from_row(row):
+        return ReminderRecord(
+            reminder_id=row["reminder_id"],
+            session_id=row["session_id"],
+            content=row["content"],
+            due_at=row["due_at"],
+            status=row["status"],
+            source_message_id=row["source_message_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            acknowledged_at=row["acknowledged_at"],
         )
 
     @staticmethod

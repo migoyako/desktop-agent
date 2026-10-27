@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import html
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QThread, Qt, Signal
+from PySide6.QtCore import QPoint, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -20,6 +23,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -28,8 +32,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..models import AgentMode, ProposalStatus
+from ..models import (
+    AgentMode,
+    ProposalStatus,
+    WORK_PLAN_DISCUSSING,
+    WORK_PLAN_REVIEW,
+)
 from ..policy import mode_label
+from ..proactive import status_label
+from ..work import FORWARD_LABELS, STATE_LABELS
 
 
 class AvatarWidget(QWidget):
@@ -447,6 +458,214 @@ class AffectDialog(QDialog):
         self.refresh()
 
 
+class ProactiveDialog(QDialog):
+    spoke = Signal()
+
+    def __init__(self, runtime, parent=None):
+        super().__init__(parent)
+        self.runtime = runtime
+        self.setWindowTitle("主动陪伴")
+        self.resize(700, 600)
+        layout = QVBoxLayout(self)
+        title = QLabel("主动陪伴")
+        title.setObjectName("heading")
+        layout.addWidget(title)
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        self.summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.summary)
+        info = QLabel(
+            "主动消息只来自到点提醒、未完成话题或你近期用过的记忆；"
+            "没有可追溯来源时不会发言。错过的提醒不会补发，只标记为未读。"
+        )
+        info.setObjectName("muted")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        self.enabled_box = QCheckBox("开启主动发言")
+        form.addRow("状态", self.enabled_box)
+        quiet_row = QHBoxLayout()
+        self.quiet_start = QSpinBox()
+        self.quiet_start.setRange(0, 23)
+        self.quiet_start.setSuffix(" 点")
+        self.quiet_end = QSpinBox()
+        self.quiet_end.setRange(0, 23)
+        self.quiet_end.setSuffix(" 点")
+        quiet_row.addWidget(self.quiet_start)
+        quiet_row.addWidget(QLabel("至"))
+        quiet_row.addWidget(self.quiet_end)
+        quiet_row.addWidget(QLabel("（相同则关闭免打扰）"))
+        quiet_row.addStretch()
+        form.addRow("免打扰", quiet_row)
+        self.daily_limit = QSpinBox()
+        self.daily_limit.setRange(0, 20)
+        self.daily_limit.setSuffix(" 次/天")
+        form.addRow("每日上限", self.daily_limit)
+        self.interval = QDoubleSpinBox()
+        self.interval.setRange(0, 168)
+        self.interval.setDecimals(1)
+        self.interval.setSuffix(" 小时")
+        form.addRow("最小间隔", self.interval)
+        self.max_unanswered = QSpinBox()
+        self.max_unanswered.setRange(0, 20)
+        self.max_unanswered.setSuffix(" 次")
+        form.addRow("连续未回复", self.max_unanswered)
+        self.include_memory = QCheckBox("允许近期用过的记忆作为来源")
+        form.addRow("记忆来源", self.include_memory)
+        layout.addLayout(form)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["时间", "来源", "状态", "触发原因"]
+        )
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table, 1)
+        self.note = QLabel()
+        self.note.setObjectName("muted")
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
+
+        actions = QHBoxLayout()
+        save = QPushButton("保存设置")
+        save.setObjectName("primary")
+        refresh = QPushButton("刷新")
+        read_all = QPushButton("全部已读")
+        check_now = QPushButton("现在检查")
+        close = QPushButton("关闭")
+        actions.addWidget(save)
+        actions.addWidget(check_now)
+        actions.addWidget(read_all)
+        actions.addWidget(refresh)
+        actions.addStretch()
+        actions.addWidget(close)
+        layout.addLayout(actions)
+        save.clicked.connect(self.save)
+        check_now.clicked.connect(self.check_now)
+        read_all.clicked.connect(self.mark_all_read)
+        refresh.clicked.connect(self.refresh)
+        close.clicked.connect(self.close)
+        self.refresh()
+
+    def refresh(self):
+        status = self.runtime.proactive_status()
+        settings = status["settings"]
+        next_due = status["next_due"]
+        lines = [
+            "状态：{}｜当前活动：{}（空闲 {:.0f} 秒）".format(
+                "开启" if status["enabled"] else "已暂停",
+                status["activity_label"],
+                status["idle_seconds"],
+            ),
+            "今日主动：{}/{} 次｜连续未回复：{}/{}｜未读事件：{} 条".format(
+                status["daily_count"],
+                status["daily_limit"],
+                status["unanswered"],
+                status["max_unanswered"],
+                status["unread"],
+            ),
+        ]
+        if next_due:
+            lines.append(
+                "下一条提醒：{}（{}）".format(
+                    next_due["content"],
+                    next_due["display"],
+                )
+            )
+        else:
+            lines.append("下一条提醒：无")
+        if status["last_event"]:
+            last = status["last_event"]
+            lines.append(
+                "最近一次：{}｜{}｜{}".format(
+                    last["status_label"],
+                    last["trigger_reason"],
+                    last["created_at"],
+                )
+            )
+        self.summary.setText("\n".join(lines))
+        self.enabled_box.setChecked(bool(status["enabled"]))
+        self.quiet_start.setValue(int(settings["quiet_start"]))
+        self.quiet_end.setValue(int(settings["quiet_end"]))
+        self.daily_limit.setValue(int(settings["daily_limit"]))
+        self.interval.setValue(float(settings["min_interval_hours"]))
+        self.max_unanswered.setValue(int(settings["max_unanswered"]))
+        self.include_memory.setChecked(bool(settings["include_memory"]))
+
+        events = self.runtime.proactive_events(20)
+        self.table.setRowCount(len(events))
+        for row, event in enumerate(events):
+            try:
+                moment = datetime.fromisoformat(event.created_at)
+                when = moment.astimezone().strftime("%m-%d %H:%M")
+            except ValueError:
+                when = event.created_at
+            state = status_label(event.status)
+            if event.read_at is None:
+                state += " / 未读"
+            values = [
+                when,
+                event.source_type,
+                state,
+                event.trigger_reason,
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(row, column, item)
+            self.table.item(row, 3).setToolTip(event.content)
+        self.table.resizeColumnsToContents()
+
+    def save(self):
+        try:
+            self.runtime.update_proactive_settings(
+                enabled=self.enabled_box.isChecked(),
+                quiet_start=self.quiet_start.value(),
+                quiet_end=self.quiet_end.value(),
+                daily_limit=self.daily_limit.value(),
+                min_interval_hours=self.interval.value(),
+                max_unanswered=self.max_unanswered.value(),
+                include_memory=self.include_memory.isChecked(),
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "设置不可用", str(error))
+            return
+        self.note.setText("设置已保存。")
+        self.refresh()
+
+    def check_now(self):
+        try:
+            result = self.runtime.proactive_tick()
+        except Exception as error:
+            QMessageBox.warning(self, "主动检查失败", str(error))
+            return
+        if result.get("spoke"):
+            self.note.setText(
+                "刚刚主动发言：{}".format(
+                    result.get("trigger_reason") or "已送达"
+                )
+            )
+            self.spoke.emit()
+        elif result.get("missed"):
+            self.note.setText(
+                "有 {} 条提醒错过送达窗口，已标记未读。".format(
+                    len(result["missed"])
+                )
+            )
+        else:
+            self.note.setText(
+                "现在不发言：{}".format(
+                    result.get("reason_label") or result.get("reason")
+                )
+            )
+        self.refresh()
+
+    def mark_all_read(self):
+        count = self.runtime.mark_proactive_read()
+        self.note.setText("已标记 {} 条事件为已读。".format(count))
+        self.refresh()
+
+
 class PersonaDialog(QDialog):
     persona_changed = Signal()
 
@@ -673,6 +892,269 @@ class PersonaDialog(QDialog):
         self.persona_changed.emit()
 
 
+class WorkDialog(QDialog):
+    work_changed = Signal()
+
+    def __init__(self, runtime, parent=None):
+        super().__init__(parent)
+        self.runtime = runtime
+        self.tasks = []
+        self.worker = None
+        self.busy = False
+        self.setWindowTitle("工作任务卡")
+        self.resize(760, 620)
+        layout = QVBoxLayout(self)
+        title = QLabel("工作任务卡与计划模式")
+        title.setObjectName("heading")
+        layout.addWidget(title)
+        note = QLabel(
+            "任务先落库为计划，批准前不会执行或转发。确认超时只会退回讨论，"
+            "不会自动通过；转发结果不确定时不会自动重发。"
+        )
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["更新时间", "任务", "计划状态", "转发回执"]
+        )
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        layout.addWidget(self.table, 1)
+        self.detail = QTextBrowser()
+        self.detail.setMinimumHeight(180)
+        layout.addWidget(self.detail, 1)
+        self.note = QLabel()
+        self.note.setObjectName("muted")
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
+
+        actions = QHBoxLayout()
+        new_button = QPushButton("新建任务卡")
+        new_button.setObjectName("primary")
+        self.approve_button = QPushButton("批准计划")
+        self.revise_button = QPushButton("修改计划")
+        self.reject_button = QPushButton("拒绝")
+        refresh = QPushButton("刷新")
+        close = QPushButton("关闭")
+        self.close_button = close
+        actions.addWidget(new_button)
+        actions.addWidget(self.approve_button)
+        actions.addWidget(self.revise_button)
+        actions.addWidget(self.reject_button)
+        actions.addStretch()
+        actions.addWidget(refresh)
+        actions.addWidget(close)
+        layout.addLayout(actions)
+        new_button.clicked.connect(self.new_task)
+        self.approve_button.clicked.connect(self.approve)
+        self.revise_button.clicked.connect(self.revise)
+        self.reject_button.clicked.connect(self.reject_task)
+        refresh.clicked.connect(self.refresh)
+        close.clicked.connect(self.close)
+        self.table.itemSelectionChanged.connect(self.show_selected)
+        self.refresh()
+
+    def selected_task(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        row = rows[0].row()
+        if 0 <= row < len(self.tasks):
+            return self.tasks[row]
+        return None
+
+    def refresh(self):
+        selected = self.selected_task()
+        selected_id = selected.task_id if selected else ""
+        self.tasks = self.runtime.work_tasks(20)
+        self.table.setRowCount(len(self.tasks))
+        for row, task in enumerate(self.tasks):
+            try:
+                moment = datetime.fromisoformat(task.updated_at)
+                when = moment.astimezone().strftime("%m-%d %H:%M")
+            except ValueError:
+                when = task.updated_at
+            receipt = self.runtime.work_receipt(task.task_id)
+            values = [
+                when,
+                task.card.title,
+                STATE_LABELS.get(task.state, task.state),
+                FORWARD_LABELS.get(receipt.status, receipt.status) if receipt else "-",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(row, column, item)
+        self.table.resizeColumnsToContents()
+        if self.tasks:
+            target = 0
+            for index, task in enumerate(self.tasks):
+                if task.task_id == selected_id:
+                    target = index
+                    break
+            self.table.selectRow(target)
+        else:
+            self.detail.setHtml("<p>还没有任务卡。</p>")
+        self.update_buttons()
+
+    def show_selected(self):
+        task = self.selected_task()
+        self.update_buttons()
+        if task is None:
+            self.detail.setHtml("<p>选择一条任务查看计划。</p>")
+            return
+        receipt = self.runtime.work_receipt(task.task_id)
+        lines = [
+            "<p><b>标题</b>：{}</p>".format(html.escape(task.card.title)),
+            "<p><b>目标</b>：{}</p>".format(
+                html.escape(task.card.goal).replace("\n", "<br>")
+            ),
+            "<p><b>理由</b>：{}</p>".format(html.escape(task.card.reason)),
+            "<p><b>执行器</b>：{}　<b>项目</b>：{}</p>".format(
+                html.escape(task.card.executor),
+                html.escape(task.card.project),
+            ),
+            "<p><b>口语播报</b>：{}</p>".format(
+                html.escape(task.card.spoken_summary)
+            ),
+            "<p><b>计划状态</b>：{}　<b>修订</b>：{}　"
+            "<b>已追问</b>：{} 次</p>".format(
+                STATE_LABELS.get(task.state, task.state),
+                task.revision,
+                task.info_asked,
+            ),
+        ]
+        if task.approval_reason:
+            lines.append(
+                "<p><b>审批说明</b>：{}</p>".format(
+                    html.escape(task.approval_reason)
+                )
+            )
+        if receipt:
+            lines.append(
+                "<p><b>转发回执</b>：{}（尝试 {} 次）<br>{}</p>".format(
+                    FORWARD_LABELS.get(receipt.status, receipt.status),
+                    receipt.attempts,
+                    html.escape(receipt.summary),
+                )
+            )
+            if receipt.detail:
+                lines.append(
+                    "<p><b>回执详情</b>：{}</p>".format(
+                        html.escape(receipt.detail)
+                    )
+                )
+            if receipt.status == "unknown":
+                lines.append(
+                    "<p><b>注意</b>：结果不确定，系统不会自动重发。</p>"
+                )
+        self.detail.setHtml("".join(lines))
+
+    def update_buttons(self):
+        task = self.selected_task()
+        actionable = (
+            task is not None
+            and not self.busy
+            and task.state in (WORK_PLAN_REVIEW, WORK_PLAN_DISCUSSING)
+        )
+        self.approve_button.setEnabled(
+            actionable and task.state == WORK_PLAN_REVIEW
+        )
+        self.revise_button.setEnabled(actionable)
+        self.reject_button.setEnabled(actionable)
+
+    def set_busy(self, busy):
+        self.busy = busy
+        self.update_buttons()
+
+    def new_task(self):
+        text, accepted = QInputDialog.getMultiLineText(
+            self,
+            "新建任务卡",
+            "描述你想完成的工作：",
+        )
+        if not accepted or not text.strip():
+            return
+        self._run(lambda: self.runtime.create_work_task(text, force=True))
+
+    def approve(self):
+        task = self.selected_task()
+        if task is None:
+            return
+        if QMessageBox.question(
+            self,
+            "批准计划",
+            "批准后才会调用执行器。若结果不确定，系统不会自动重发。继续吗？",
+        ) != QMessageBox.Yes:
+            return
+        self._run(lambda: self.runtime.approve_work_task(task.task_id))
+
+    def revise(self):
+        task = self.selected_task()
+        if task is None:
+            return
+        text, accepted = QInputDialog.getMultiLineText(
+            self,
+            "修改计划",
+            "说明要修改的目标、对象或步骤：",
+        )
+        if not accepted or not text.strip():
+            return
+        self._run(
+            lambda: self.runtime.revise_work_task(task.task_id, text)
+        )
+
+    def reject_task(self):
+        task = self.selected_task()
+        if task is None:
+            return
+        if QMessageBox.question(
+            self,
+            "拒绝计划",
+            "拒绝后不会执行或转发这个任务。继续吗？",
+        ) != QMessageBox.Yes:
+            return
+        self._run(
+            lambda: self.runtime.reject_work_task(
+                task.task_id,
+                "用户在任务面板拒绝",
+            )
+        )
+
+    def _run(self, function, on_success=None):
+        if self.worker is not None:
+            return
+        self.set_busy(True)
+        self.note.setText("处理中…")
+        worker = QtWorker(function)
+        self.worker = worker
+
+        def done(result):
+            self.worker = None
+            self.set_busy(False)
+            self.note.setText(
+                (result or {}).get("answer", "已完成。").splitlines()[0]
+            )
+            self.refresh()
+            self.work_changed.emit()
+            if on_success is not None:
+                on_success(result)
+
+        def failed(message):
+            self.worker = None
+            self.set_busy(False)
+            self.note.setText("操作失败：{}".format(message))
+            QMessageBox.warning(self, "任务操作失败", message)
+
+        worker.completed.connect(done)
+        worker.failed.connect(failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+
 class CompanionWindow(QMainWindow):
     def __init__(self, runtime):
         super().__init__()
@@ -685,6 +1167,9 @@ class CompanionWindow(QMainWindow):
         self.memory_dialog = None
         self.affect_dialog = None
         self.persona_dialog = None
+        self.proactive_dialog = None
+        self.work_dialog = None
+        self.proactive_inflight = False
         self.workers = []
         self.drag_position = QPoint()
         self.persona_name = (
@@ -794,9 +1279,15 @@ class CompanionWindow(QMainWindow):
         self.memory_button = QPushButton("记忆")
         self.affect_button = QPushButton("情绪")
         self.persona_button = QPushButton("人设")
+        self.proactive_button = QPushButton("主动")
+        self.task_button = QPushButton("任务")
         self.memory_button.clicked.connect(self.open_memory)
         self.affect_button.clicked.connect(self.open_affect)
         self.persona_button.clicked.connect(self.open_persona)
+        self.proactive_button.clicked.connect(self.open_proactive)
+        self.task_button.clicked.connect(self.open_work)
+        mode_row.addWidget(self.task_button)
+        mode_row.addWidget(self.proactive_button)
         mode_row.addWidget(self.memory_button)
         mode_row.addWidget(self.affect_button)
         mode_row.addWidget(self.persona_button)
@@ -866,6 +1357,10 @@ class CompanionWindow(QMainWindow):
         self.refresh_workspace()
         self.refresh_history()
         self.refresh_pending()
+        self.proactive_timer = QTimer(self)
+        self.proactive_timer.setInterval(60000)
+        self.proactive_timer.timeout.connect(self.poll_proactive)
+        self.proactive_timer.start()
 
     def set_mode(self, mode):
         mode = AgentMode(mode)
@@ -936,6 +1431,14 @@ class CompanionWindow(QMainWindow):
             self.refresh_workspace()
             if result.get("proposal"):
                 self.show_proposal(result["proposal"])
+            task = result.get("task")
+            if task is not None:
+                self.open_work()
+                if task.state == WORK_PLAN_REVIEW:
+                    self.avatar.set_state(status="等待审批")
+                    self.status.setText("任务卡已生成，请批准、修改或拒绝。")
+                elif task.state == WORK_PLAN_DISCUSSING:
+                    self.avatar.set_state(status="等待补充")
             self.refresh_affect_avatar()
 
         self.run_worker(
@@ -1035,6 +1538,48 @@ class CompanionWindow(QMainWindow):
     def open_persona(self):
         self.open_side_dialog("persona_dialog", PersonaDialog)
 
+    def open_proactive(self):
+        self.open_side_dialog("proactive_dialog", ProactiveDialog)
+
+    def open_work(self):
+        dialog = self.open_side_dialog("work_dialog", WorkDialog)
+        dialog.refresh()
+        return dialog
+
+    def poll_proactive(self):
+        if self.proactive_inflight or not self.send_button.isEnabled():
+            return
+        try:
+            status = self.runtime.proactive_status()
+        except Exception as error:
+            self.status.setText("主动检查失败：{}".format(error))
+            return
+        if not status["enabled"]:
+            return
+        self.proactive_inflight = True
+
+        def done(result):
+            self.proactive_inflight = False
+            if result.get("spoke"):
+                self.refresh_history()
+                self.refresh_affect_avatar()
+                self.avatar.set_state(status="有话说")
+                self.status.setText(
+                    "主动：{}".format(
+                        result.get("trigger_reason") or "已送达"
+                    )
+                )
+            elif result.get("missed"):
+                self.status.setText(
+                    "有 {} 条错过的提醒，已标记未读。".format(
+                        len(result["missed"])
+                    )
+                )
+            if self.proactive_dialog is not None:
+                self.proactive_dialog.refresh()
+
+        self.run_worker(self.runtime.proactive_tick, done)
+
     def refresh_persona(self):
         self.persona_name = (
             self.runtime.persona.name
@@ -1067,6 +1612,10 @@ class CompanionWindow(QMainWindow):
         setattr(self, attribute, dialog)
         if hasattr(dialog, "persona_changed"):
             dialog.persona_changed.connect(self.refresh_persona)
+        if hasattr(dialog, "spoke"):
+            dialog.spoke.connect(self.refresh_history)
+        if hasattr(dialog, "work_changed"):
+            dialog.work_changed.connect(self.refresh_history)
 
         def closed(_result=0):
             if getattr(self, attribute) is dialog:
@@ -1134,7 +1683,14 @@ class CompanionWindow(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
-        for attribute in ("memory_dialog", "affect_dialog", "persona_dialog"):
+        if self.proactive_timer.isActive():
+            self.proactive_timer.stop()
+        for attribute in (
+            "memory_dialog",
+            "affect_dialog",
+            "persona_dialog",
+            "proactive_dialog",
+        ):
             dialog = getattr(self, attribute)
             if dialog is not None:
                 dialog.close()
@@ -1157,6 +1713,7 @@ class CompanionWindow(QMainWindow):
         worker.start()
 
     def worker_failed(self, message):
+        self.proactive_inflight = False
         self.send_button.setEnabled(True)
         self.confirm_button.setEnabled(True)
         self.cancel_button.setEnabled(True)

@@ -161,3 +161,135 @@ class AffectRecord:
     source_message_id: Optional[int]
     source: str
     created_at: str
+
+
+@dataclass
+class ReminderRecord:
+    reminder_id: str
+    session_id: str
+    content: str
+    due_at: str
+    status: str
+    source_message_id: Optional[int]
+    created_at: str
+    updated_at: str
+    acknowledged_at: Optional[str] = None
+
+
+REMINDER_PENDING = "pending"
+REMINDER_DONE = "done"
+REMINDER_DISMISSED = "dismissed"
+
+
+@dataclass
+class ProactiveState:
+    session_id: str
+    enabled: bool = True
+    quiet_start: int = 22
+    quiet_end: int = 8
+    daily_limit: int = 2
+    min_interval_hours: float = 3.0
+    max_unanswered: int = 2
+    include_memory: bool = False
+    daily_count: int = 0
+    daily_date: str = ""
+    last_spoken_at: Optional[str] = None
+    last_event_id: str = ""
+    unanswered_count: int = 0
+    updated_at: str = ""
+
+
+@dataclass
+class ProactiveEvent:
+    event_id: str
+    session_id: str
+    source_type: str
+    source_id: str
+    source_message_id: Optional[int]
+    trigger_reason: str
+    content: str
+    status: str
+    reason: str
+    message_id: Optional[int]
+    content_hash: str
+    url_hash: str
+    read_at: Optional[str]
+    created_at: str
+
+
+PROACTIVE_DELIVERED = "delivered"
+PROACTIVE_MISSED = "missed"
+
+
+WORK_NORMAL = "NORMAL"
+WORK_PLAN_DISCUSSING = "PLAN_DISCUSSING"
+WORK_PLAN_REVIEW = "PLAN_REVIEW"
+WORK_EXECUTING = "EXECUTING"
+WORK_STATES = (
+    WORK_NORMAL,
+    WORK_PLAN_DISCUSSING,
+    WORK_PLAN_REVIEW,
+    WORK_EXECUTING,
+)
+
+APPROVAL_PENDING = "pending"
+APPROVAL_APPROVED = "approved"
+APPROVAL_REJECTED = "rejected"
+APPROVAL_EXPIRED = "expired"
+
+FORWARD_AWAITING_CONFIRMATION = "awaiting_confirmation"
+FORWARD_FORWARDING = "forwarding"
+FORWARD_ACCEPTED = "accepted"
+FORWARD_COMPLETED = "completed"
+FORWARD_UNKNOWN = "unknown"
+FORWARD_UNAVAILABLE = "unavailable"
+FORWARD_STATUSES = (
+    FORWARD_AWAITING_CONFIRMATION,
+    FORWARD_FORWARDING,
+    FORWARD_ACCEPTED,
+    FORWARD_COMPLETED,
+    FORWARD_UNKNOWN,
+    FORWARD_UNAVAILABLE,
+)
+
+
+@dataclass
+class TaskCard:
+    title: str
+    reason: str
+    spoken_summary: str
+    goal: str
+    executor: str
+    project: str
+
+
+@dataclass
+class WorkTask:
+    task_id: str
+    session_id: str
+    state: str
+    card: TaskCard
+    source_message_id: Optional[int] = None
+    info_asked: int = 0
+    revision: int = 0
+    approval_status: str = APPROVAL_PENDING
+    approval_reason: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    expires_at: str = ""
+    approved_at: Optional[str] = None
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+
+
+@dataclass
+class WorkReceipt:
+    receipt_id: str
+    task_id: str
+    session_id: str
+    status: str
+    summary: str
+    detail: str = ""
+    external_id: str = ""
+    attempts: int = 0
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
