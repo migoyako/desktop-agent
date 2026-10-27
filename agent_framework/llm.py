@@ -33,11 +33,25 @@ class LLMResponse:
     tool_calls: List[ToolCall] = field(default_factory=list)
 
 
+@dataclass
+class StreamEvent:
+    kind: str = "delta"
+    text: str = ""
+    response: Optional[LLMResponse] = None
+    error: str = ""
+
+
 class LLMClient:
     """Small interface shared by remote and offline clients."""
 
     def chat(self, messages, tools=None) -> LLMResponse:
         raise NotImplementedError
+
+    def stream_chat(self, messages, tools=None):
+        response = self.chat(messages, tools)
+        if response.content:
+            yield StreamEvent(kind="delta", text=response.content)
+        yield StreamEvent(kind="done", response=response)
 
 
 class OfflineLLMClient(LLMClient):
@@ -151,6 +165,79 @@ class RemoteLLMClient(LLMClient):
             content=message.content or "",
             tool_calls=parsed_calls,
         )
+
+    def stream_chat(self, messages, tools=None):
+        request: Dict[str, Any] = {
+            "model": self.config.model,
+            "messages": [message.to_api_dict() for message in messages],
+            "temperature": self.config.temperature,
+            "stream": True,
+        }
+        if tools:
+            request["tools"] = tools
+            request["tool_choice"] = "auto"
+
+        stream = None
+        content_parts: List[str] = []
+        call_parts: Dict[int, Dict[str, str]] = {}
+        try:
+            stream = self.client.chat.completions.create(**request)
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
+                if delta.content:
+                    content_parts.append(delta.content)
+                    yield StreamEvent(kind="delta", text=delta.content)
+                for tool_delta in delta.tool_calls or []:
+                    index = int(getattr(tool_delta, "index", 0) or 0)
+                    entry = call_parts.setdefault(
+                        index,
+                        {"id": "", "name": "", "arguments": ""},
+                    )
+                    if tool_delta.id:
+                        entry["id"] = tool_delta.id
+                    function = getattr(tool_delta, "function", None)
+                    if function is not None:
+                        if function.name and not entry["name"]:
+                            entry["name"] = function.name
+                        if function.arguments:
+                            entry["arguments"] += function.arguments
+
+            parsed_calls = []
+            for index in sorted(call_parts):
+                entry = call_parts[index]
+                if not entry["name"]:
+                    continue
+                try:
+                    arguments = json.loads(entry["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                parsed_calls.append(
+                    ToolCall(
+                        name=entry["name"],
+                        arguments=arguments,
+                        call_id=entry["id"] or "call_" + uuid.uuid4().hex[:12],
+                    )
+                )
+            yield StreamEvent(
+                kind="done",
+                response=LLMResponse(
+                    content="".join(content_parts),
+                    tool_calls=parsed_calls,
+                ),
+            )
+        except Exception as error:
+            yield StreamEvent(kind="error", error=str(error) or error.__class__.__name__)
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    pass
 
 
 def create_llm_client(config: AgentConfig, offline: bool = False) -> LLMClient:

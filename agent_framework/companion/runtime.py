@@ -47,8 +47,14 @@ from .memory import (
 from .models import (
     ActionResult,
     AgentMode,
+    FORWARD_AWAITING_CONFIRMATION,
+    FORWARD_FORWARDING,
+    FORWARD_UNKNOWN,
     ProposalStatus,
     RiskLevel,
+    WORK_EXECUTING,
+    WORK_PLAN_DISCUSSING,
+    WORK_PLAN_REVIEW,
     new_id,
     utc_now,
 )
@@ -78,6 +84,11 @@ from .search import (
     compose_search_note,
 )
 from .store import CompanionStore
+from .streaming import (
+    GenerationCancelled,
+    MarkerFilter,
+    strip_control_markers,
+)
 from .tool_results import (
     PREVIEW_CHARS,
     READ_DEFAULT_CHARS,
@@ -303,11 +314,46 @@ class CompanionRuntime:
         return self.store.list_messages(self.session_id, limit=limit)
 
     def handle_message(self, text: str, mode: AgentMode = AgentMode.CHAT):
+        result = None
+        for event in self._run_turn(text, mode):
+            if event.get("kind") == "done":
+                result = event.get("result")
+        return result or {
+            "answer": "处理消息时遇到问题。",
+            "proposal": None,
+            "receipt": None,
+            "task": None,
+            "task_receipt": None,
+        }
+
+    def stream_message(
+        self,
+        text: str,
+        mode: AgentMode = AgentMode.CHAT,
+        generation_id: str = "",
+        cancel_event=None,
+    ):
+        for event in self._run_turn(text, mode, cancel_event=cancel_event):
+            payload = dict(event)
+            payload["generation_id"] = generation_id
+            yield payload
+
+    def _run_turn(self, text, mode, cancel_event=None):
         text = (text or "").strip()
         mode = AgentMode(mode)
         self.set_mode(mode)
         if not text:
-            return {"answer": "请输入内容。", "proposal": None, "receipt": None}
+            yield {
+                "kind": "done",
+                "result": {
+                    "answer": "请输入内容。",
+                    "proposal": None,
+                    "receipt": None,
+                    "task": None,
+                    "task_receipt": None,
+                },
+            }
+            return
         self._turn_recalls = []
         message_id = self.store.add_message(
             self.session_id,
@@ -323,6 +369,7 @@ class CompanionRuntime:
         receipt = None
         work_task = None
         work_receipt = None
+        streamed = False
         try:
             reminder_draft = parse_reminder_request(text)
             search_request = self._parse_search_request(text)
@@ -356,16 +403,81 @@ class CompanionRuntime:
                     mode,
                     message_id,
                 )
-            elif self.offline:
-                answer = self._llm_answer(text, mode)
-            elif not self.tool_calling_supported:
-                answer = self._llm_answer(text, mode)
+            elif self.offline or not self.tool_calling_supported:
+                answer, proposal = yield from self._answer_turn(
+                    text,
+                    mode,
+                    message_id,
+                    cancel_event,
+                )
+                streamed = True
             else:
-                answer, proposal = self._tool_loop(text, mode, message_id)
+                answer, proposal = yield from self._answer_turn(
+                    text,
+                    mode,
+                    message_id,
+                    cancel_event,
+                )
+                streamed = True
+        except GenerationCancelled as error:
+            answer = (error.partial or "").strip()
+            answer = (
+                "{}\n（已停止生成）".format(answer)
+                if answer
+                else "已停止生成。"
+            )
+            self.store.add_message(
+                self.session_id,
+                "assistant",
+                answer,
+                mode,
+            )
+            yield {
+                "kind": "done",
+                "result": {
+                    "answer": answer,
+                    "proposal": None,
+                    "receipt": None,
+                    "task": None,
+                    "task_receipt": None,
+                    "cancelled": True,
+                    "affect": self.affect.snapshot(self.session_id),
+                },
+            }
+            return
         except SearchError as error:
             answer = "搜索没有完成：{}".format(error)
+            streamed = True
+            yield {"kind": "error", "message": answer}
         except Exception as error:
             answer = "处理消息时遇到问题：{}".format(error)
+            streamed = True
+            yield {"kind": "error", "message": answer}
+
+        if cancel_event is not None and cancel_event.is_set():
+            answer = "{}\n（已停止生成）".format(answer.strip())
+            self.store.add_message(
+                self.session_id,
+                "assistant",
+                answer,
+                mode,
+            )
+            yield {
+                "kind": "done",
+                "result": {
+                    "answer": answer,
+                    "proposal": None,
+                    "receipt": None,
+                    "task": None,
+                    "task_receipt": None,
+                    "cancelled": True,
+                    "affect": self.affect.snapshot(self.session_id),
+                },
+            }
+            return
+
+        if not streamed and answer:
+            yield {"kind": "delta", "text": answer}
 
         self._mark_recall_usage(answer)
         self.store.add_message(
@@ -374,13 +486,16 @@ class CompanionRuntime:
             answer,
             mode,
         )
-        return {
-            "answer": answer,
-            "proposal": proposal,
-            "receipt": receipt,
-            "task": work_task,
-            "task_receipt": work_receipt,
-            "affect": self.affect.snapshot(self.session_id),
+        yield {
+            "kind": "done",
+            "result": {
+                "answer": answer,
+                "proposal": proposal,
+                "receipt": receipt,
+                "task": work_task,
+                "task_receipt": work_receipt,
+                "affect": self.affect.snapshot(self.session_id),
+            },
         }
 
     def confirm_proposal(self, action_id, current_mode=None):
@@ -734,6 +849,104 @@ class CompanionRuntime:
     def latest_receipts(self, limit=20):
         return self.store.list_receipts(self.session_id, limit=limit)
 
+    def desktop_status(self):
+        """Bubble text derived only from persisted proposals, tasks and receipts."""
+        pending = self.pending_proposals()
+        if pending:
+            proposal = pending[0]
+            return {
+                "state": "awaiting_confirmation",
+                "label": "等待确认写入",
+                "detail": (proposal.user_visible_plan or "").strip()[:160],
+                "source": "proposal",
+                "proposal_id": proposal.action_id,
+            }
+
+        task = self.work.active_task()
+        if task is not None:
+            if task.state == WORK_PLAN_REVIEW:
+                return {
+                    "state": "awaiting_approval",
+                    "label": "等待批准计划",
+                    "detail": task.card.title,
+                    "source": "task",
+                    "task_id": task.task_id,
+                }
+            if task.state == WORK_PLAN_DISCUSSING:
+                return {
+                    "state": "awaiting_input",
+                    "label": "等待补充信息",
+                    "detail": task.card.title,
+                    "source": "task",
+                    "task_id": task.task_id,
+                }
+            if task.state == WORK_EXECUTING:
+                receipt = self.work.receipt_for(task.task_id)
+                if receipt is not None and receipt.status == FORWARD_UNKNOWN:
+                    return {
+                        "state": "unknown",
+                        "label": "转发结果不确定",
+                        "detail": receipt.summary,
+                        "source": "work_receipt",
+                        "task_id": task.task_id,
+                        "receipt_id": receipt.receipt_id,
+                    }
+                if receipt is not None and receipt.status in (
+                    FORWARD_AWAITING_CONFIRMATION,
+                    FORWARD_FORWARDING,
+                ):
+                    return {
+                        "state": "forwarding",
+                        "label": "正在转发",
+                        "detail": receipt.summary,
+                        "source": "work_receipt",
+                        "task_id": task.task_id,
+                        "receipt_id": receipt.receipt_id,
+                    }
+
+        receipts = self.latest_receipts(5)
+        if receipts:
+            receipt = receipts[0]
+            if receipt.status == "unknown":
+                return {
+                    "state": "unknown",
+                    "label": "结果不确定",
+                    "detail": receipt.summary,
+                    "source": "receipt",
+                    "receipt_id": receipt.receipt_id,
+                }
+            if receipt.undo_status == "undone":
+                return {
+                    "state": "undone",
+                    "label": "已撤销",
+                    "detail": receipt.summary,
+                    "source": "receipt",
+                    "receipt_id": receipt.receipt_id,
+                }
+            if receipt.status == "completed":
+                return {
+                    "state": "completed",
+                    "label": "已写入",
+                    "detail": receipt.summary,
+                    "source": "receipt",
+                    "receipt_id": receipt.receipt_id,
+                }
+            if receipt.status == "failed":
+                return {
+                    "state": "failed",
+                    "label": "写入失败",
+                    "detail": receipt.summary,
+                    "source": "receipt",
+                    "receipt_id": receipt.receipt_id,
+                }
+
+        return {
+            "state": "idle",
+            "label": "待机",
+            "detail": "",
+            "source": "idle",
+        }
+
     def list_reminders(self, status="pending"):
         return self.store.list_reminders(self.session_id, status=status)
 
@@ -1076,14 +1289,115 @@ class CompanionRuntime:
             proposal=proposal,
         )
 
-    def _tool_loop(self, text, mode, message_id):
+    def _answer_turn(self, text, mode, message_id, cancel_event):
+        if self.offline or not self.tool_calling_supported:
+            answer = self._llm_answer(text, mode)
+            visible = yield from self._stream_chunks(
+                self._chunk_text(answer),
+                cancel_event,
+            )
+            return (visible.strip() or strip_control_markers(answer).strip()), None
+        return (
+            yield from self._tool_loop_stream(
+                text,
+                mode,
+                message_id,
+                cancel_event,
+            )
+        )
+
+    @staticmethod
+    def _chunk_text(text, size=24):
+        text = text or ""
+        for index in range(0, len(text), size):
+            yield text[index : index + size]
+
+    def _stream_chunks(self, chunks, cancel_event):
+        marker_filter = MarkerFilter()
+        parts = []
+        for chunk in chunks:
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationCancelled("".join(parts))
+            visible = marker_filter.feed(chunk)
+            if visible:
+                parts.append(visible)
+                yield {"kind": "delta", "text": visible}
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled("".join(parts))
+        tail = marker_filter.finish()
+        if tail:
+            parts.append(tail)
+            yield {"kind": "delta", "text": tail}
+        return "".join(parts)
+
+    def _consume_stream(self, messages, tools, cancel_event):
+        stream_fn = getattr(self.llm_client, "stream_chat", None)
+        if stream_fn is None:
+            response = self.llm_client.chat(messages, tools=tools)
+            visible = strip_control_markers(response.content or "")
+            shown = []
+            for chunk in self._chunk_text(visible):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GenerationCancelled("".join(shown))
+                shown.append(chunk)
+                yield {"kind": "delta", "text": chunk}
+            return response, visible
+
+        marker_filter = MarkerFilter()
+        parts = []
+
+        def ensure_active():
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationCancelled("".join(parts))
+
+        response = None
+        for event in stream_fn(messages, tools=tools):
+            ensure_active()
+            kind = getattr(event, "kind", "delta")
+            if kind == "delta":
+                visible = marker_filter.feed(getattr(event, "text", ""))
+                if visible:
+                    parts.append(visible)
+                    yield {"kind": "delta", "text": visible}
+            elif kind == "error":
+                raise RuntimeError(
+                    getattr(event, "error", "") or "模型流式调用失败。"
+                )
+            elif kind == "done":
+                response = getattr(event, "response", None)
+        tail = marker_filter.finish()
+        if tail:
+            parts.append(tail)
+            yield {"kind": "delta", "text": tail}
+        if response is None:
+            raise RuntimeError("模型没有返回流式结果。")
+        return response, "".join(parts)
+
+    @staticmethod
+    def _tool_summary(result):
+        content = " ".join((getattr(result, "content", "") or "").split())
+        return content[:120]
+
+    def _tool_loop_stream(self, text, mode, message_id, cancel_event):
         registry = self._build_tool_registry(mode, message_id)
         tools = registry.as_openai_tools(mode)
         messages = self._prompt_messages(text, mode)
         calls = 0
+
+        def ensure_active():
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationCancelled()
+
         for round_index in range(MAX_TOOL_ROUNDS):
+            ensure_active()
             try:
-                response = self.llm_client.chat(messages, tools=tools or None)
+                response, visible = yield from self._consume_stream(
+                    messages,
+                    tools or None,
+                    cancel_event,
+                )
+            except GenerationCancelled:
+                raise
             except Exception as error:
                 if (
                     round_index == 0
@@ -1092,18 +1406,31 @@ class CompanionRuntime:
                 ):
                     self.tool_calling_supported = False
                     answer = self._llm_answer(text, mode)
-                    return (
+                    answer = (
                         "{}\n\n（当前模型不支持工具调用，"
                         "已切换为普通对话；搜索和保存笔记仍可用显式指令。）"
-                        .format(answer),
-                        None,
+                        .format(answer)
                     )
+                    streamed = yield from self._stream_chunks(
+                        self._chunk_text(answer),
+                        cancel_event,
+                    )
+                    return (streamed.strip() or answer), None
                 raise
+
             if not response.tool_calls:
-                return (
-                    (response.content or "").strip() or "我没有生成有效回复。",
-                    None,
-                )
+                answer = visible.strip() or strip_control_markers(
+                    response.content or ""
+                ).strip()
+                if not answer:
+                    answer = "我没有生成有效回复。"
+                    for chunk in self._chunk_text(answer):
+                        ensure_active()
+                        yield {"kind": "delta", "text": chunk}
+                return answer, None
+
+            if visible:
+                yield {"kind": "reset"}
             messages.append(
                 Message(
                     role="assistant",
@@ -1114,15 +1441,29 @@ class CompanionRuntime:
                 )
             )
             for call in response.tool_calls:
+                ensure_active()
                 calls += 1
                 if calls > MAX_TOOL_CALLS:
-                    return (
-                        "工具调用次数达到上限，请把任务拆小一些再试。",
-                        None,
-                    )
+                    answer = "工具调用次数达到上限，请把任务拆小一些再试。"
+                    for chunk in self._chunk_text(answer):
+                        ensure_active()
+                        yield {"kind": "delta", "text": chunk}
+                    return answer, None
+                yield {
+                    "kind": "tool",
+                    "tool_name": call.name,
+                    "state": "running",
+                }
                 result = registry.execute(call.name, call.arguments, mode)
+                ensure_active()
                 if call.name != "read_tool_result":
                     result = self._maybe_spill(result, call.name)
+                yield {
+                    "kind": "tool",
+                    "tool_name": call.name,
+                    "state": "done",
+                    "summary": self._tool_summary(result),
+                }
                 messages.append(
                     Message(
                         role="tool",
@@ -1134,27 +1475,40 @@ class CompanionRuntime:
                     try:
                         self.store.create_proposal(result.proposal)
                     except Exception as error:
-                        return (
-                            "写入提案没有保存成功：{}".format(error),
-                            None,
-                        )
-                    return (
+                        answer = "写入提案没有保存成功：{}".format(error)
+                        for chunk in self._chunk_text(answer):
+                            ensure_active()
+                            yield {"kind": "delta", "text": chunk}
+                        return answer, None
+                    answer = (
                         "{}\n\n我已生成写入提案。"
                         "请核对目标和内容后确认；确认前不会写入文件。".format(
                             result.content
-                        ),
-                        result.proposal,
+                        )
                     )
-        # 最后一轮的工具结果也要交给模型收尾，否则模型刚拿到数据就被截断。
-        response = self.llm_client.chat(messages, tools=None)
-        answer = (response.content or "").strip()
-        if answer:
-            return (answer, None)
-        return (
-            "工具调用轮次达到上限，模型没有给出最终回复。"
-            "你可以把任务拆小一些再试。",
+                    for chunk in self._chunk_text(answer):
+                        ensure_active()
+                        yield {"kind": "delta", "text": chunk}
+                    return answer, result.proposal
+
+        ensure_active()
+        response, visible = yield from self._consume_stream(
+            messages,
             None,
+            cancel_event,
         )
+        answer = visible.strip() or strip_control_markers(
+            response.content or ""
+        ).strip()
+        if not answer:
+            answer = (
+                "工具调用轮次达到上限，模型没有给出最终回复。"
+                "你可以把任务拆小一些再试。"
+            )
+            for chunk in self._chunk_text(answer):
+                ensure_active()
+                yield {"kind": "delta", "text": chunk}
+        return answer, None
 
     def _prompt_messages(self, text, mode):
         build = self._build_prompt(text, mode)

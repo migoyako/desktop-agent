@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QCursor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -41,6 +42,9 @@ from ..models import (
 from ..policy import mode_label
 from ..proactive import status_label
 from ..work import FORWARD_LABELS, STATE_LABELS
+from .state import UiStateStore, clamp_position
+from .stream import StreamWorker
+from .tray import TrayController
 
 
 class AvatarWidget(QWidget):
@@ -115,6 +119,141 @@ class AvatarWidget(QWidget):
             Qt.AlignCenter,
             self.status,
         )
+
+
+class AvatarOverlay(QWidget):
+    """Transparent always-on-top avatar with an executor-derived status bubble."""
+
+    def __init__(self, runtime, state_store=None):
+        super().__init__(None)
+        self.runtime = runtime
+        self.state_store = state_store or UiStateStore(runtime.data_dir)
+        self._dragging = False
+        self._drag_offset = QPoint()
+        self._interactive = False
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setStyleSheet(
+            "QLabel#bubble {"
+            " background: rgba(16, 24, 29, 225);"
+            " border: 1px solid #38545d;"
+            " border-radius: 8px;"
+            " padding: 6px 8px;"
+            " color: #e7f2f3;"
+            " font-family: 'Microsoft YaHei UI';"
+            " font-size: 12px;"
+            "}"
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self.bubble = QLabel()
+        self.bubble.setObjectName("bubble")
+        self.bubble.setWordWrap(True)
+        self.bubble.setFixedWidth(210)
+        self.bubble.setMaximumHeight(76)
+        self.avatar = AvatarWidget()
+        layout.addWidget(self.bubble, 0, Qt.AlignHCenter)
+        layout.addWidget(self.avatar, 0, Qt.AlignHCenter)
+        self.adjustSize()
+
+        self.hit_timer = QTimer(self)
+        self.hit_timer.setInterval(120)
+        self.hit_timer.timeout.connect(self.update_hit_test)
+        self.hit_timer.start()
+        self.status_timer = QTimer(self)
+        self.status_timer.setInterval(1000)
+        self.status_timer.timeout.connect(self.refresh_status)
+        self.status_timer.start()
+
+        self.restore_position()
+        self.refresh_status()
+
+    def refresh_status(self):
+        try:
+            status = self.runtime.desktop_status()
+        except Exception:
+            status = {"state": "idle", "label": "待机", "detail": ""}
+        self.avatar.set_state(status=status["label"], mood=self._mood())
+        detail = (status.get("detail") or "").strip()
+        if status.get("state") == "idle" or not detail:
+            self.bubble.hide()
+        else:
+            self.bubble.setText(detail)
+            self.bubble.show()
+        self.adjustSize()
+
+    def _mood(self):
+        try:
+            return self.runtime.affect_snapshot()["agent"]["mood_label"]
+        except Exception:
+            return None
+
+    def update_hit_test(self):
+        inside = self.avatar.rect().contains(
+            self.avatar.mapFromGlobal(QCursor.pos())
+        )
+        interactive = bool(inside or self._dragging)
+        if interactive != self._interactive:
+            self._interactive = interactive
+            self.setAttribute(Qt.WA_TransparentForMouseEvents, not interactive)
+
+    def restore_position(self):
+        screens = [
+            tuple(screen.availableGeometry().getRect())
+            for screen in QApplication.screens()
+        ]
+        stored = self.state_store.overlay_position()
+        if stored is not None:
+            x, y = stored
+        else:
+            available = (
+                QApplication.primaryScreen().availableGeometry()
+                if QApplication.primaryScreen()
+                else None
+            )
+            if available is None:
+                x, y = 40, 40
+            else:
+                x = available.x() + available.width() - self.width() - 24
+                y = available.y() + available.height() - self.height() - 24
+        x, y = clamp_position(x, y, self.width(), self.height(), screens)
+        self.move(x, y)
+
+    def save_position(self):
+        self.state_store.set_overlay_position(self.x(), self.y())
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._drag_offset = (
+                event.globalPosition().toPoint()
+                - self.frameGeometry().topLeft()
+            )
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging:
+            self._dragging = False
+            self.save_position()
+            event.accept()
+
+    def closeEvent(self, event):
+        self.save_position()
+        self.hit_timer.stop()
+        self.status_timer.stop()
+        event.accept()
 
 
 class QtWorker(QThread):
@@ -1172,6 +1311,13 @@ class CompanionWindow(QMainWindow):
         self.proactive_inflight = False
         self.workers = []
         self.drag_position = QPoint()
+        self.ui_state = UiStateStore(runtime.data_dir)
+        self.overlay = None
+        self.tray = None
+        self.generation_seq = 0
+        self.active_generation = None
+        self.stream_worker = None
+        self.stream_text = ""
         self.persona_name = (
             runtime.persona.name if getattr(runtime, "persona", None) else "数字分身"
         )
@@ -1253,10 +1399,17 @@ class CompanionWindow(QMainWindow):
         top = QHBoxLayout()
         self.name_label = QLabel("{}  /  Companion".format(self.persona_name))
         self.name_label.setObjectName("heading")
+        self.name_label.setMinimumWidth(0)
+        self.name_label.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred
+        )
+        self.overlay_button = QPushButton("形象")
+        self.overlay_button.clicked.connect(self.toggle_overlay)
         close = QPushButton("关闭")
         close.clicked.connect(self.quit_application)
         top.addWidget(self.name_label)
         top.addStretch()
+        top.addWidget(self.overlay_button)
         top.addWidget(close)
         outer.addLayout(top)
 
@@ -1318,8 +1471,13 @@ class CompanionWindow(QMainWindow):
         self.send_button.setObjectName("primary")
         self.send_button.setFixedWidth(82)
         self.send_button.clicked.connect(self.send)
+        self.stop_button = QPushButton("停止")
+        self.stop_button.setFixedWidth(60)
+        self.stop_button.clicked.connect(self.stop_stream)
+        self.stop_button.hide()
         input_row.addWidget(self.input, 1)
         input_row.addWidget(self.send_button)
+        input_row.addWidget(self.stop_button)
         outer.addLayout(input_row)
 
         self.confirm_frame = QFrame()
@@ -1362,6 +1520,11 @@ class CompanionWindow(QMainWindow):
         self.proactive_timer.timeout.connect(self.poll_proactive)
         self.proactive_timer.start()
 
+        self.overlay = AvatarOverlay(runtime, self.ui_state)
+        if self.ui_state.overlay_visible():
+            self.overlay.show()
+        self.tray = TrayController(self, runtime)
+
     def set_mode(self, mode):
         mode = AgentMode(mode)
         self.mode = mode
@@ -1378,6 +1541,10 @@ class CompanionWindow(QMainWindow):
         self.chat_button.style().polish(self.chat_button)
         self.work_button.style().unpolish(self.work_button)
         self.work_button.style().polish(self.work_button)
+        if getattr(self, "tray", None) is not None:
+            self.tray.refresh()
+        if getattr(self, "overlay", None) is not None:
+            self.overlay.refresh_status()
 
     def refresh_workspace(self):
         workspace = self.runtime.workspace()
@@ -1396,6 +1563,9 @@ class CompanionWindow(QMainWindow):
             QMessageBox.warning(self, "目录不可用", str(error))
 
     def refresh_history(self):
+        self.render_history(self.stream_text)
+
+    def render_history(self, preview=""):
         pieces = []
         for message in self.runtime.history():
             if message["role"] not in ("user", "assistant"):
@@ -1409,6 +1579,13 @@ class CompanionWindow(QMainWindow):
                     html.escape(message["content"]).replace("\n", "<br>"),
                 )
             )
+        if preview:
+            pieces.append(
+                "<p><b style='color:#f2c28f'>分身</b><br>{}"
+                "<span style='color:#8da7ad'>▍</span></p>".format(
+                    html.escape(preview).replace("\n", "<br>")
+                )
+            )
         self.chat.setHtml("".join(pieces) or "<p>还没有对话。</p>")
         self.chat.verticalScrollBar().setValue(
             self.chat.verticalScrollBar().maximum()
@@ -1419,32 +1596,124 @@ class CompanionWindow(QMainWindow):
         if not text:
             return
         self.input.clear()
+        self.start_stream(text)
+
+    def start_stream(self, text):
+        self.generation_seq += 1
+        generation = str(self.generation_seq)
+        self.active_generation = generation
+        self.stream_text = ""
         self.send_button.setEnabled(False)
+        self.stop_button.show()
+        self.stop_button.setEnabled(True)
         self.avatar.set_state(status="思考中")
         self.status.setText("正在处理...")
+        self.refresh_history()
 
-        def done(result):
-            self.send_button.setEnabled(True)
-            self.avatar.set_state(status="陪伴中" if self.mode == AgentMode.CHAT else "工作中")
-            self.status.setText("")
-            self.refresh_history()
-            self.refresh_workspace()
-            if result.get("proposal"):
-                self.show_proposal(result["proposal"])
-            task = result.get("task")
-            if task is not None:
-                self.open_work()
-                if task.state == WORK_PLAN_REVIEW:
-                    self.avatar.set_state(status="等待审批")
-                    self.status.setText("任务卡已生成，请批准、修改或拒绝。")
-                elif task.state == WORK_PLAN_DISCUSSING:
-                    self.avatar.set_state(status="等待补充")
-            self.refresh_affect_avatar()
-
-        self.run_worker(
-            lambda: self.runtime.handle_message(text, self.mode),
-            done,
+        worker = StreamWorker(self.runtime, text, self.mode, generation)
+        self.stream_worker = worker
+        self.workers.append(worker)
+        worker.event.connect(self.on_stream_event)
+        worker.completed.connect(
+            lambda result, value=generation: self.on_stream_done(result, value)
         )
+        worker.failed.connect(
+            lambda message, value=generation: self.on_stream_failed(message, value)
+        )
+        worker.finished.connect(lambda: self.cleanup_stream_worker(worker))
+        worker.start()
+
+    def cleanup_stream_worker(self, worker):
+        if worker in self.workers:
+            self.workers.remove(worker)
+        if self.stream_worker is worker:
+            self.stream_worker = None
+
+    def on_stream_event(self, event):
+        if event.get("generation_id") != self.active_generation:
+            return
+        kind = event.get("kind")
+        if kind == "delta":
+            self.stream_text += event.get("text") or ""
+            self.render_history(self.stream_text)
+        elif kind == "reset":
+            self.stream_text = ""
+            self.render_history()
+        elif kind == "tool":
+            name = event.get("tool_name") or "工具"
+            if event.get("state") == "running":
+                self.avatar.set_state(status="执行中")
+                self.status.setText("正在调用：{}".format(name))
+            else:
+                summary = event.get("summary") or ""
+                self.status.setText(
+                    "{} 完成{}".format(
+                        name,
+                        "：{}".format(summary) if summary else "",
+                    )
+                )
+                if self.overlay is not None:
+                    self.overlay.refresh_status()
+        elif kind == "error":
+            self.status.setText(event.get("message") or "生成失败")
+
+    def finish_stream_ui(self):
+        self.active_generation = None
+        self.stream_text = ""
+        self.send_button.setEnabled(True)
+        self.stop_button.hide()
+        self.stop_button.setEnabled(True)
+        self.avatar.set_state(
+            status="陪伴中" if self.mode == AgentMode.CHAT else "工作中"
+        )
+
+    def on_stream_done(self, result, generation):
+        if generation != self.active_generation:
+            self.finish_stream_ui()
+            self.refresh_history()
+            if self.overlay is not None:
+                self.overlay.refresh_status()
+            if self.tray is not None:
+                self.tray.refresh()
+            return
+
+        self.stream_text = ""
+        self.finish_stream_ui()
+        self.status.setText("")
+        self.refresh_history()
+        self.refresh_workspace()
+        if result.get("proposal"):
+            self.show_proposal(result["proposal"])
+        task = result.get("task")
+        if task is not None:
+            self.open_work()
+            if task.state == WORK_PLAN_REVIEW:
+                self.avatar.set_state(status="等待审批")
+                self.status.setText("任务卡已生成，请批准、修改或拒绝。")
+            elif task.state == WORK_PLAN_DISCUSSING:
+                self.avatar.set_state(status="等待补充")
+        self.refresh_affect_avatar()
+        if self.overlay is not None:
+            self.overlay.refresh_status()
+        if self.tray is not None:
+            self.tray.refresh()
+
+    def on_stream_failed(self, message, generation):
+        if generation != self.active_generation:
+            self.finish_stream_ui()
+            self.refresh_history()
+            return
+        self.finish_stream_ui()
+        self.worker_failed(message)
+
+    def stop_stream(self):
+        worker = self.stream_worker
+        if worker is None:
+            return
+        self.status.setText("正在停止...")
+        self.stop_button.setEnabled(False)
+        self.active_generation = None
+        worker.cancel()
 
     def show_proposal(self, proposal):
         self.current_proposal = proposal
@@ -1452,6 +1721,8 @@ class CompanionWindow(QMainWindow):
         self.confirm_frame.show()
         self.undo_button.hide()
         self.avatar.set_state(status="等待确认")
+        if self.overlay is not None:
+            self.overlay.refresh_status()
 
     def refresh_pending(self):
         pending = self.runtime.pending_proposals()
@@ -1489,6 +1760,10 @@ class CompanionWindow(QMainWindow):
             self.avatar.set_state(
                 status="陪伴中" if self.mode == AgentMode.CHAT else "工作中"
             )
+            if self.overlay is not None:
+                self.overlay.refresh_status()
+            if self.tray is not None:
+                self.tray.refresh()
 
         self.run_worker(
             lambda: self.runtime.confirm_proposal(action_id, mode),
@@ -1505,6 +1780,8 @@ class CompanionWindow(QMainWindow):
         self.refresh_history()
         self.refresh_workspace()
         self.status.setText("已取消，没有写入文件。")
+        if self.overlay is not None:
+            self.overlay.refresh_status()
 
     def undo_last(self):
         receipts = [
@@ -1522,6 +1799,9 @@ class CompanionWindow(QMainWindow):
                 self.status.setText(message),
                 self.undo_button.hide(),
                 self.refresh_history(),
+                self.overlay.refresh_status()
+                if self.overlay is not None
+                else None,
             ),
         )
 
@@ -1577,6 +1857,8 @@ class CompanionWindow(QMainWindow):
                 )
             if self.proactive_dialog is not None:
                 self.proactive_dialog.refresh()
+            if self.overlay is not None:
+                self.overlay.refresh_status()
 
         self.run_worker(self.runtime.proactive_tick, done)
 
@@ -1679,21 +1961,55 @@ class CompanionWindow(QMainWindow):
         dialog.resize(width, height)
         dialog.move(x, y)
 
+    def toggle_window(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        if self.tray is not None:
+            self.tray.refresh()
+
+    def overlay_visible(self):
+        return bool(self.overlay is not None and self.overlay.isVisible())
+
+    def set_overlay_visible(self, visible):
+        if self.overlay is None:
+            return
+        self.overlay.setVisible(bool(visible))
+        self.ui_state.set_overlay_visible(bool(visible))
+        if visible:
+            self.overlay.refresh_status()
+        if self.tray is not None:
+            self.tray.refresh()
+
+    def toggle_overlay(self):
+        self.set_overlay_visible(not self.overlay_visible())
+
     def quit_application(self):
         self.close()
 
     def closeEvent(self, event):
         if self.proactive_timer.isActive():
             self.proactive_timer.stop()
+        if self.stream_worker is not None:
+            self.stream_worker.cancel()
+            self.stream_worker.wait(1500)
         for attribute in (
             "memory_dialog",
             "affect_dialog",
             "persona_dialog",
             "proactive_dialog",
+            "work_dialog",
         ):
             dialog = getattr(self, attribute)
             if dialog is not None:
                 dialog.close()
+        if self.overlay is not None:
+            self.overlay.close()
+        if self.tray is not None:
+            self.tray.close()
         event.accept()
         app = QApplication.instance()
         if app is not None:

@@ -67,6 +67,11 @@ python companion.py
 - 转发回执为 `awaiting_confirmation / forwarding / accepted / completed / unknown / unavailable`；`unknown` 是终态，不可改写也不会自动重发。
 - 意图路由有 12 秒硬上限，模型分类器超时或输出非法即降级为 `clarify`；提示注入先由守卫拦截，直接追问且不创建任务。
 - Qt“任务”面板与 Tk 任务窗口可查看任务卡、计划状态与回执，并执行批准/修改/拒绝/刷新。
+- 流式回复（M6）：模型按 `stream_chat` 逐段返回 `delta`，工具调用以 `tool` 事件显示 running/done，结束发 `done`，失败发 `error`；“停止”会取消生成并持久化“（已停止生成）”，generation id 丢弃停止后的迟到分片。
+- 行内控制标记 `[[mood:...]] / [[action:...]] / [[sticker:...]]` 在显示、入库和后续语音前剥离；标记被拆到多个分片时也能完整过滤。
+- Qt 桌面形象是透明无边框置顶浮窗（`FramelessWindowHint | Tool | WindowStaysOnTopHint` + `WA_TranslucentBackground`），默认鼠标穿透，指针移到头像上才可拖动；位置写入 `ui_state.json`，重启后恢复到原屏幕，显示器变化时自动修正边界。
+- 系统托盘提供显示/隐藏主窗口、显示桌面形象、切换陪伴/工作模式、暂停主动、立即检查与退出；系统托盘不可用时自动跳过，不影响主窗口。
+- 状态气泡只读已落库的提案、任务与回执：等待确认写入、等待批准计划、等待补充信息、正在转发、结果不确定、已写入、已撤销、写入失败；待机时自动隐藏。
 - 关闭后重开可恢复历史会话、模式与待确认动作。
 
 ## 人设包
