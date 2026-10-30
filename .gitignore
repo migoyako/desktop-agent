@@ -13,6 +13,15 @@ data/*
 !data/personas/
 !data/personas/**
 
+# Character art is user-supplied and licensed elsewhere: track the slot
+# documentation only, never the files dropped into it.
+!data/assets/
+data/assets/*
+!data/assets/README.md
+!data/assets/*/
+data/assets/*/*
+!data/assets/*/README.md
+
 # Tooling
 .pytest_cache/
 .mypy_cache/

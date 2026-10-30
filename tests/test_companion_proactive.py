@@ -22,6 +22,7 @@ from agent_framework.companion.proactive import (
     derive_unfinished_topics,
     evaluate_gate,
     parse_reminder_request,
+    resolve_when,
 )
 from agent_framework.companion.runtime import CompanionRuntime
 from agent_framework.companion.search import SearchService
@@ -115,6 +116,10 @@ class ReminderServiceTest(ProactiveBase):
             "2小时后提醒我开会": ("开会", 7200),
             "提醒我 三天后交材料。": ("交材料", 3 * 86400),
             "提醒我 十分钟后站起来": ("站起来", 600),
+            "30秒后提醒我喝水": ("喝水", 30),
+            "半小时后提醒我喝水": ("喝水", 1800),
+            "十五分钟后叫我起身": ("起身", 900),
+            "提醒我两小时后看烤箱": ("看烤箱", 7200),
         }
         for text, (content, seconds) in cases.items():
             draft = parse_reminder_request(text, now=NOW)
@@ -125,11 +130,48 @@ class ReminderServiceTest(ProactiveBase):
                 NOW + timedelta(seconds=seconds),
             )
 
+    def test_parse_clock_reminders_use_local_wall_clock(self):
+        local_now = datetime(2026, 10, 27, 12, 0).astimezone()
+        cases = {
+            "晚上9点提醒我写日记": ("写日记", local_now.replace(hour=21)),
+            "提醒我明天早上7点开周会": ("开周会", (local_now + timedelta(days=1)).replace(hour=7)),
+            "下午2点15分提醒我打电话": ("打电话", local_now.replace(hour=14, minute=15)),
+            "18:30叫我关火": ("关火", local_now.replace(hour=18, minute=30)),
+            "上午9点提醒我买菜": ("买菜", (local_now + timedelta(days=1)).replace(hour=9)),
+        }
+        for text, (content, expected) in cases.items():
+            draft = parse_reminder_request(text, now=local_now)
+            self.assertIsNotNone(draft, text)
+            self.assertEqual(draft.content, content)
+            self.assertEqual(draft.due_at, expected, text)
+            self.assertGreater(draft.delay_seconds, 0)
+
+    def test_resolve_when_accepts_durations_and_clock_times(self):
+        local_now = datetime(2026, 10, 27, 12, 0).astimezone()
+        self.assertEqual(
+            resolve_when("45秒后", now=local_now),
+            local_now + timedelta(seconds=45),
+        )
+        self.assertEqual(
+            resolve_when("10分钟", now=local_now),
+            local_now + timedelta(minutes=10),
+        )
+        self.assertEqual(
+            resolve_when("下午2点15分", now=local_now),
+            local_now.replace(hour=14, minute=15),
+        )
+        self.assertEqual(
+            resolve_when("2026-10-29T08:00", now=local_now),
+            datetime(2026, 10, 29, 8, 0).astimezone(),
+        )
+        self.assertIsNone(resolve_when("待会儿", now=local_now))
+        self.assertIsNone(resolve_when("", now=local_now))
+
     def test_parse_rejects_non_reminder_text(self):
         for text in (
             "提醒我开会",
-            "半小时后提醒我喝水",
             "明天提醒我交材料",
+            "30秒后提醒我",
             "",
         ):
             self.assertIsNone(parse_reminder_request(text, now=NOW), text)
@@ -459,7 +501,7 @@ class ProactiveMigrationTest(ProactiveBase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-        self.assertEqual(SCHEMA_VERSION, 8)
+        self.assertEqual(SCHEMA_VERSION, 9)
         self.assertEqual(version, SCHEMA_VERSION)
         self.assertIn("reminders", tables)
         self.assertIn("proactive_state", tables)

@@ -112,9 +112,13 @@ class TrayController(QObject):
     def refresh(self):
         if self.tray is None:
             return
-        self.window_action.setText(
-            "隐藏主窗口" if self.window.isVisible() else "显示主窗口"
-        )
+        if not self.window.isVisible():
+            label = "显示主窗口"
+        elif self.window.isMinimized():
+            label = "还原主窗口"
+        else:
+            label = "隐藏主窗口"
+        self.window_action.setText(label)
         self.overlay_action.setChecked(self.window.overlay_visible())
         current = self.window.mode
         for mode, action in self.mode_actions.items():

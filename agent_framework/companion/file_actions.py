@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import difflib
 import hashlib
 import os
 from pathlib import Path, PureWindowsPath
 import stat
 import tempfile
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .models import (
     ActionProposal,
@@ -26,6 +27,8 @@ from .models import (
 MAX_NOTE_BYTES = 512 * 1024
 ALLOWED_NOTE_SUFFIXES = {".md", ".txt"}
 PROPOSAL_TTL_HOURS = 24
+PREVIEW_DIFF_LINES = 80
+PREVIEW_LINE_CHARS = 180
 BLOCKED_NAMES = {
     ".git",
     ".codex",
@@ -86,6 +89,41 @@ def proposal_expired(expected_state: Dict, now=None) -> bool:
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     return current > expiry
+
+
+def diff_lines(before, after):
+    """Line diff for confirmation cards; long content is clipped, never hidden."""
+    rows: List[Tuple[str, str]] = []
+    added = removed = 0
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            rows.extend(("ctx", line) for line in before[i1:i2])
+        elif tag == "delete":
+            removed += i2 - i1
+            rows.extend(("del", line) for line in before[i1:i2])
+        elif tag == "insert":
+            added += j2 - j1
+            rows.extend(("add", line) for line in after[j1:j2])
+        else:
+            removed += i2 - i1
+            added += j2 - j1
+            rows.extend(("del", line) for line in before[i1:i2])
+            rows.extend(("add", line) for line in after[j1:j2])
+    omitted = max(0, len(rows) - PREVIEW_DIFF_LINES)
+    return (
+        [(tag, _clip_preview_line(line)) for tag, line in rows[:PREVIEW_DIFF_LINES]],
+        added,
+        removed,
+        omitted,
+    )
+
+
+def _clip_preview_line(line) -> str:
+    text = str(line).replace("\t", "    ")
+    if len(text) <= PREVIEW_LINE_CHARS:
+        return text
+    return text[: PREVIEW_LINE_CHARS - 1] + "…"
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -307,6 +345,62 @@ class NoteActionService:
             confirmation_digest=digest,
             idempotency_key=new_id("idem"),
         )
+
+    def preview(self, proposal: ActionProposal) -> Dict:
+        """Read-only description of what confirm would change; never writes."""
+        value = {
+            "change": "unavailable",
+            "workspace": "",
+            "relative_path": str(
+                (proposal.normalized_arguments or {}).get("relative_path") or ""
+            ),
+            "diff": [],
+            "added": 0,
+            "removed": 0,
+            "truncated": False,
+            "omitted_lines": 0,
+            "error": "",
+        }
+        if proposal.tool_name != "write_note":
+            value["error"] = "暂不支持预览这个动作。"
+            return value
+        snapshot = (proposal.expected_state or {}).get("workspace") or {}
+        root = str(snapshot.get("root") or "")
+        value["workspace"] = root
+        if not root:
+            value["error"] = "提案缺少工作区快照。"
+            return value
+        if not workspace_identity_valid(snapshot):
+            value["error"] = "工作目录身份已变化，原确认可能失效。"
+            return value
+        try:
+            guard = WorkspaceGuard(root)
+            target = guard.resolve(value["relative_path"])
+            before = ""
+            if target.exists():
+                fingerprint(target)
+                before = target.read_bytes().decode("utf-8", errors="replace")
+                value["change"] = "update"
+            else:
+                value["change"] = "create"
+        except (FileActionError, OSError) as error:
+            value["error"] = str(error)
+            return value
+        content = str((proposal.normalized_arguments or {}).get("content") or "")
+        rows, added, removed, omitted = diff_lines(
+            before.splitlines(),
+            content.splitlines(),
+        )
+        value.update(
+            {
+                "diff": rows,
+                "added": added,
+                "removed": removed,
+                "truncated": omitted > 0,
+                "omitted_lines": omitted,
+            }
+        )
+        return value
 
     def execute(self, proposal: ActionProposal) -> ActionResult:
         started = utc_now()

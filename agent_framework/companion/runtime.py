@@ -77,6 +77,7 @@ from .proactive import (
     describe_activity,
     format_due,
     parse_reminder_request,
+    resolve_when,
 )
 from .search import (
     SearchError,
@@ -116,6 +117,7 @@ MAX_TOOL_CALLS = 4
 CORE_TOOL_RISKS = {
     "current_time": RiskLevel.SAFE,
     "read_tool_result": RiskLevel.SAFE,
+    "set_reminder": RiskLevel.SAFE,
     "search_web": RiskLevel.NETWORK,
     "write_note": RiskLevel.FS_WRITE,
 }
@@ -155,6 +157,30 @@ def tool_calling_unsupported(error):
     )
 
 
+def _flat(text, limit):
+    flat = " ".join(str(text or "").split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1] + "…"
+
+
+def source_items(results):
+    items = []
+    for result in results or ():
+        title = str(getattr(result, "title", "") or "")
+        url = str(getattr(result, "url", "") or "")
+        if not (title or url):
+            continue
+        items.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": str(getattr(result, "snippet", "") or "")[:240],
+            }
+        )
+    return items
+
+
 class CompanionRuntime:
     def __init__(
         self,
@@ -187,6 +213,7 @@ class CompanionRuntime:
         self.persona_id = persona_id or DEFAULT_PERSONA_ID
         self.max_context_chars = max(4000, int(max_context_chars))
         self.last_context: Optional[PromptBuild] = None
+        self.last_tool_sources = []
         self._turn_recalls = []
         self.persona = None
         self.persona_error = ""
@@ -334,6 +361,60 @@ class CompanionRuntime:
     def history(self, limit=60):
         return self.store.list_messages(self.session_id, limit=limit)
 
+    def session_summaries(self):
+        return self.store.list_session_summaries()
+
+    def rename_session(self, session_id, title):
+        session_id = str(session_id or "").strip()
+        title = str(title or "").strip()
+        if not session_id or not title:
+            return False
+        return self.store.rename_session(session_id, title)
+
+    def set_session_pinned(self, session_id, pinned=True):
+        return self.store.set_session_pinned(str(session_id or ""), pinned)
+
+    def set_session_unread(self, session_id, unread=True):
+        return self.store.set_session_unread(str(session_id or ""), unread)
+
+    def delete_session(self, session_id):
+        """Delete a session and move to the newest remaining one."""
+        session_id = str(session_id or "").strip()
+        if not session_id or self.store.get_session_mode(session_id) is None:
+            return False
+        if not self.store.delete_session(session_id):
+            return False
+        if session_id == self.session_id:
+            remaining = self.store.list_sessions()
+            if remaining:
+                self.switch_session(remaining[0]["id"])
+            else:
+                replacement = new_id("chat")
+                self.store.ensure_session(replacement, AgentMode.CHAT)
+                self.switch_session(replacement)
+        return True
+
+    def draft(self, session_id=None):
+        return self.store.get_draft(str(session_id or self.session_id))
+
+    def save_draft(self, session_id, content):
+        return self.store.set_draft(str(session_id or ""), content)
+
+    def switch_session(self, session_id):
+        """Point every session-scoped service at another existing session."""
+        session_id = str(session_id or "").strip()
+        if not session_id or session_id == self.session_id:
+            return False
+        if self.store.get_session_mode(session_id) is None:
+            return False
+        self.session_id = session_id
+        self.last_context = None
+        self._turn_recalls = []
+        self.proactive_service.session_id = session_id
+        self.work.session_id = session_id
+        self.store.set_session_unread(session_id, False)
+        return True
+
     def handle_message(self, text: str, mode: AgentMode = AgentMode.CHAT):
         result = None
         for event in self._run_turn(text, mode):
@@ -376,6 +457,7 @@ class CompanionRuntime:
             }
             return
         self._turn_recalls = []
+        self.last_tool_sources = []
         message_id = self.store.add_message(
             self.session_id,
             "user",
@@ -768,6 +850,35 @@ class CompanionRuntime:
     def pending_proposals(self) -> List:
         return self.store.list_pending_proposals(self.session_id)
 
+    def preview_proposal(self, action_id) -> Optional[Dict]:
+        """Read-only approval data for one proposal owned by this session."""
+        proposal = self.store.get_proposal(str(action_id or ""))
+        if proposal is None or proposal.session_id != self.session_id:
+            return None
+        try:
+            preview = self.notes.preview(proposal)
+        except Exception as error:
+            preview = {
+                "change": "unavailable",
+                "workspace": "",
+                "relative_path": "",
+                "diff": [],
+                "added": 0,
+                "removed": 0,
+                "truncated": False,
+                "omitted_lines": 0,
+                "error": str(error),
+            }
+        workspace = ((proposal.expected_state or {}).get("workspace") or {}).get(
+            "root"
+        )
+        return {
+            "proposal": proposal,
+            "expired": proposal_expired(proposal.expected_state),
+            "workspace": str(workspace or ""),
+            "preview": preview,
+        }
+
     def create_work_task(self, text, force=True, source_message_id=None):
         result = self.work.submit(
             text,
@@ -1049,6 +1160,7 @@ class CompanionRuntime:
     def _search_flow(self, search_request, mode, message_id):
         query, wants_note = search_request
         results = self.search.search(query, limit=5)
+        self.last_tool_sources = source_items(results)
         answer = compose_search_answer(query, results)
         proposal = None
         if wants_note:
@@ -1121,6 +1233,39 @@ class CompanionRuntime:
                 risk=CORE_TOOL_RISKS["read_tool_result"],
                 timeout=5.0,
                 handler=self._tool_read_result,
+            )
+        )
+        registry.register(
+            CompanionTool(
+                name="set_reminder",
+                description=(
+                    "创建一条本地提醒，到点由陪伴引擎主动提示。"
+                    "when 支持“45秒后”“10分钟”“半小时后”“下午2点15分”"
+                    "“明天早上7点”这类时间说法。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "提醒事项，例如 喝水",
+                        },
+                        "when": {
+                            "type": "string",
+                            "description": (
+                                "提醒时间，相对时长或本地钟点，"
+                                "例如 10分钟后、晚上9点、2026-10-29T08:00"
+                            ),
+                        },
+                    },
+                    "required": ["content", "when"],
+                },
+                risk=CORE_TOOL_RISKS["set_reminder"],
+                timeout=5.0,
+                handler=lambda arguments: self._tool_set_reminder(
+                    arguments,
+                    message_id,
+                ),
             )
         )
         registry.register(
@@ -1412,6 +1557,36 @@ class CompanionRuntime:
             "references": list(skill.references),
         }
 
+    def _tool_set_reminder(self, arguments, message_id):
+        content = str(arguments.get("content") or "").strip()
+        when = str(arguments.get("when") or "").strip()
+        if not content:
+            return ToolResult.failure("提醒内容不能为空。", "invalid_arguments")
+        due_at = resolve_when(when) if when else None
+        if due_at is None:
+            return ToolResult.failure(
+                "没有听懂时间表达：{}。请向用户确认具体时间。".format(when or "（空）"),
+                "invalid_when",
+            )
+        if due_at <= datetime.now().astimezone():
+            return ToolResult.failure(
+                "提醒时间已经过去了：{}。".format(when),
+                "time_in_past",
+            )
+        reminder = self.reminder_service.create(
+            self.session_id,
+            content,
+            due_at,
+            source_message_id=message_id,
+        )
+        return ToolResult.success(
+            "已创建提醒：{}（{}）。".format(
+                reminder.content,
+                format_due(reminder.due_at),
+            ),
+            data={"reminder_id": reminder.reminder_id},
+        )
+
     def _tool_search(self, arguments):
         query = str(arguments.get("query") or "").strip()
         if not query:
@@ -1427,7 +1602,12 @@ class CompanionRuntime:
                 "搜索没有完成：{}".format(error),
                 "search_error",
             )
-        return ToolResult.success(compose_search_answer(query, results))
+        sources = source_items(results)
+        self.last_tool_sources = sources
+        return ToolResult.success(
+            compose_search_answer(query, results),
+            data={"query": query, "count": len(results), "sources": sources},
+        )
 
     def _tool_read_result(self, arguments):
         if self.tool_results is None:
@@ -1504,7 +1684,7 @@ class CompanionRuntime:
                     self.tool_results_error,
                 ),
                 code=result.code,
-                data=result.data,
+                data=dict(result.data or {}, result_truncated=True),
             )
         try:
             descriptor = self.tool_results.save(
@@ -1517,13 +1697,18 @@ class CompanionRuntime:
                 ok=result.ok,
                 content=compose_missing_store_notice(preview, str(error)),
                 code=result.code,
-                data=result.data,
+                data=dict(result.data or {}, result_truncated=True),
             )
         return ToolResult(
             ok=result.ok,
             content=compose_spill_notice(descriptor, preview),
             code=result.code,
-            data=result.data,
+            data=dict(
+                result.data or {},
+                result_id=descriptor.get("result_id", ""),
+                result_chars=descriptor.get("chars", 0),
+                result_truncated=bool(descriptor.get("stored_truncated")),
+            ),
         )
 
     def _tool_write_note(self, arguments, mode, message_id):
@@ -1638,6 +1823,39 @@ class CompanionRuntime:
         content = " ".join((getattr(result, "content", "") or "").split())
         return content[:120]
 
+    @staticmethod
+    def _tool_arguments(arguments):
+        rows = {}
+        for key, value in (arguments or {}).items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                text = "" if value is None else str(value)
+            else:
+                try:
+                    text = json.dumps(value, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):
+                    text = str(value)
+            rows[str(key)] = text[:240] + ("…" if len(text) > 240 else "")
+        return rows
+
+    @staticmethod
+    def _tool_event_detail(result):
+        data = result.data or {}
+        sources = [
+            item
+            for item in (data.get("sources") or ())
+            if isinstance(item, dict)
+        ][:10]
+        return {
+            "ok": bool(result.ok),
+            "code": str(result.code or ""),
+            "message": "" if result.ok else _flat(result.content, 300),
+            "preview": _flat(result.content, 600),
+            "sources": sources,
+            "result_id": str(data.get("result_id") or ""),
+            "result_chars": int(data.get("result_chars") or 0),
+            "result_truncated": bool(data.get("result_truncated")),
+        }
+
     def _tool_loop_stream(self, text, mode, message_id, cancel_event):
         registry = self._build_tool_registry(mode, message_id)
         tools = registry.as_openai_tools(mode)
@@ -1711,10 +1929,12 @@ class CompanionRuntime:
                         ensure_active()
                         yield {"kind": "delta", "text": chunk}
                     return answer, None
+                arguments_detail = self._tool_arguments(call.arguments)
                 yield {
                     "kind": "tool",
                     "tool_name": call.name,
                     "state": "running",
+                    "arguments": arguments_detail,
                 }
                 if (
                     allowed_tools is not None
@@ -1748,11 +1968,23 @@ class CompanionRuntime:
                     allowed_tools = set(
                         result.data.get("tools") or ()
                     ) | SKILL_META_TOOLS
+                detail = self._tool_event_detail(result)
+                if detail["sources"]:
+                    self.last_tool_sources = detail["sources"]
                 yield {
                     "kind": "tool",
                     "tool_name": call.name,
-                    "state": "done",
+                    "state": "done" if result.ok else "error",
                     "summary": self._tool_summary(result),
+                    "arguments": arguments_detail,
+                    "ok": detail["ok"],
+                    "code": detail["code"],
+                    "error": detail["message"],
+                    "preview": detail["preview"],
+                    "sources": detail["sources"],
+                    "result_id": detail["result_id"],
+                    "result_chars": detail["result_chars"],
+                    "result_truncated": detail["result_truncated"],
                 }
                 messages.append(
                     Message(

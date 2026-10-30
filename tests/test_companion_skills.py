@@ -567,7 +567,7 @@ class SkillRuntimeTest(SkillTestBase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-        self.assertEqual(SCHEMA_VERSION, 8)
+        self.assertEqual(SCHEMA_VERSION, 9)
         self.assertEqual(version, SCHEMA_VERSION)
         self.assertIn("skill_audit", tables)
         reopened.ensure_session("main", AgentMode.CHAT)

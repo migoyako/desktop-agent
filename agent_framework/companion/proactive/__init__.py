@@ -21,6 +21,7 @@ from .reminders import (
     ReminderService,
     format_due,
     parse_reminder_request,
+    resolve_when,
 )
 from .repeat import (
     DEDUPE_HALF_LIFE_HOURS,
@@ -73,6 +74,7 @@ __all__ = [
     "is_duplicate",
     "parse_reminder_request",
     "reason_label",
+    "resolve_when",
     "status_label",
     "url_hash",
 ]

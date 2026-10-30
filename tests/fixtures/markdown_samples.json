@@ -1,0 +1,26 @@
+{
+  "description": "Shared Markdown sample set for ui/markdown.py and web/assets/markdown.js (R22).",
+  "samples": [
+    "",
+    "今天想聊点什么？",
+    "## 今日整理\n\n结论在 **下面**，注意 `a<b` 与 ~~旧结论~~。",
+    "### 一级标题\n#### 这不是标题（四级）\n# 主标题",
+    "见 [文档](https://example.com/doc?a=1&b=2) 与 [危险](javascript:alert(1))，裸链接 https://example.com/x。",
+    "[带引号](https://example.com/\"onmouseover=alert(1))",
+    "| 项目 | 状态 | 备注 |\n|:---|---:|:---:|\n| 周报 | 草稿 | 等确认 |\n| 待办 | 完成 | |",
+    "| 只有表头 |\n| --- |\n| 一行 |",
+    "| 不是表格 | 两列 |\n| 缺少分隔行 |",
+    "- 一级\n  - 二级\n    1. 三级有序\n  - 回到二级\n- 再一级",
+    "1. 先\n2. 后\n   1. 后一\n   2. 后二",
+    "- 列表\n\n  缩进段落在列表外\n- 第二项",
+    "> 引用第一行\n> 引用第二行\n\n正文",
+    "```python\nprint('<b>')\n# 注释 & 符号\n```",
+    "```\n无语言围栏\n```",
+    "```js\nconsole.log(1)",
+    "<img src=x onerror=alert(1)>\n<script>alert(2)</script>",
+    "**粗体** 与 *星号不是斜体* 与 `**不粗**`",
+    "1. `code` & [链接](https://example.com) \n2. ~~删除~~ 与 **粗**",
+    "行一\n行二\n\n行三",
+    "# 工作总结\n\n以上三轮讨论的结论如下，写入前请确认：\n\n| 事项 | 负责人 | 截止 |\n|:---|:---:|--:|\n| 周报初稿 | 我 | 周五 |\n| 资料归档 | 你 | 下周一 |\n\n## 下一步\n\n1. 生成初稿\n2. 你确认要点\n   - 语气偏正式\n   - 保留数字\n\n```python\nrows = [(\"周报\", \"周五\")]\nfor name, day in rows:\n    print(f\"{name} -> {day}\")\n```\n\n> 待确认后再写入工作区。\n\n参考 [模板](https://example.com/template) 与 https://example.com/guide 。"
+  ]
+}

@@ -7,6 +7,7 @@ import importlib.util
 from pathlib import Path
 import sys
 
+from agent_framework.companion.app import create_application_service
 from agent_framework.companion.maintenance import InstanceLock
 from agent_framework.companion.models import AgentMode
 from agent_framework.companion.persona import DEFAULT_PERSONA_ID
@@ -17,9 +18,9 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="数字分身桌面原型")
     parser.add_argument(
         "--ui",
-        choices=("auto", "qt", "tk", "cli"),
-        default="auto",
-        help="选择界面后端",
+        choices=("auto", "web", "browser", "qt", "tk", "cli"),
+        default="web",
+        help="选择界面后端；web 是 Pixso 设计的默认界面，qt/tk 仅作兼容保留",
     )
     parser.add_argument("--data-dir", help="数据目录，默认是项目下的 data")
     parser.add_argument("--session-id", default="main")
@@ -151,19 +152,41 @@ def main(argv=None):
         lock = InstanceLock(data_dir)
         if not lock.acquire():
             info = lock.peek() or {}
-            print(
-                "另一个实例正在使用数据目录：{}（pid={}）".format(
-                    data_dir,
-                    info.get("pid", "未知"),
-                ),
-                file=sys.stderr,
-            )
+            if activate_running_instance(data_dir, pid=info.get("pid")):
+                print("已唤回正在运行的实例。")
+                return 0
+            notify_second_instance(data_dir, info)
             return 3
     try:
         return run_app(args, data_dir)
     finally:
         if lock is not None:
             lock.release()
+
+
+def activate_running_instance(data_dir, pid=None):
+    from agent_framework.companion.activation import activate
+
+    try:
+        return activate(data_dir, pid=pid)
+    except Exception:
+        return False
+
+
+def notify_second_instance(data_dir, info):
+    message = (
+        "另一个实例正在使用数据目录：{}（pid={}）。\n"
+        "请从系统托盘打开它，或先退出该实例再启动。"
+    ).format(data_dir, info.get("pid", "未知"))
+    if sys.stderr is not None:
+        try:
+            print(message, file=sys.stderr)
+        except (OSError, AttributeError):
+            pass
+    if sys.platform.startswith("win") and sys.stderr is None:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, message, "数字分身", 0x40)
 
 
 def run_app(args, data_dir):
@@ -182,11 +205,19 @@ def run_app(args, data_dir):
 
     if args.ui == "cli":
         return run_cli(runtime)
-    if args.ui in ("auto", "qt") and importlib.util.find_spec("PySide6"):
+    if args.ui in ("auto", "web", "browser"):
+        from agent_framework.companion.web import launch_web
+
+        return launch_web(
+            create_application_service(runtime),
+            data_dir=data_dir,
+            open_browser=args.ui == "browser",
+        )
+    if args.ui == "qt" and importlib.util.find_spec("PySide6"):
         try:
             from agent_framework.companion.ui.qt_app import launch_qt
 
-            return launch_qt(runtime)
+            return launch_qt(create_application_service(runtime))
         except ImportError:
             if args.ui == "qt":
                 print("PySide6 未安装。", file=sys.stderr)

@@ -101,7 +101,7 @@ class CompanionTkApp:
         self.root.geometry("500x760")
         self.root.minsize(430, 640)
         self.root.configure(bg=BG)
-        self.root.attributes("-topmost", True)
+        self.root.attributes("-topmost", False)
         try:
             self.root.attributes("-alpha", 0.98)
         except tk.TclError:

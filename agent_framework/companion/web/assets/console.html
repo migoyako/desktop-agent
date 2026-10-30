@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="charcoal-pink">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>管理台</title>
+<link rel="stylesheet" href="/assets/tokens.css">
+<link rel="stylesheet" href="/assets/console.css">
+</head>
+<body>
+<div class="win">
+  <header class="win-head" id="winHead">
+    <span class="title">管理台</span>
+    <span class="grow"></span>
+    <button class="ghost" id="closeTop">关闭</button>
+  </header>
+  <nav class="tabs" id="tabs" role="tablist" aria-label="管理台分类">
+    <button data-page="memory" class="on" role="tab" aria-selected="true">记忆</button>
+    <button data-page="recall" role="tab" aria-selected="false">召回</button>
+    <button data-page="candidates" role="tab" aria-selected="false">候选</button>
+    <button data-page="audit" role="tab" aria-selected="false">执行与审计</button>
+    <button data-page="affect" role="tab" aria-selected="false">情绪</button>
+    <button data-page="failures" role="tab" aria-selected="false">失败记录</button>
+    <button data-page="settings" role="tab" aria-selected="false">设置与数据</button>
+  </nav>
+  <div class="hint-row">
+    <span id="hint">来源证据、候选、召回与派生关系均可追溯；彻底删除不可撤销。</span>
+    <button class="ghost" id="refresh">刷新</button>
+  </div>
+  <section class="page" id="page" role="tabpanel"></section>
+  <footer class="foot">
+    <span class="note" id="note">数据变更后请重启应用，避免界面继续使用旧状态。</span>
+    <div class="foot-actions">
+      <button class="ghost" id="refreshAll">刷新全部</button>
+      <button class="ghost" id="closeBottom">关闭</button>
+    </div>
+  </footer>
+</div>
+<div class="toast" id="toast" role="status"></div>
+<script src="/assets/qwebchannel.js"></script>
+<script src="/assets/console.js"></script>
+</body>
+</html>

@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="charcoal-pink">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>数字分身</title>
+<link rel="stylesheet" href="/assets/tokens.css">
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div class="shell" id="shell">
+  <aside class="rail" id="rail" aria-label="会话">
+    <div class="rail-head">
+      <button class="new-task" id="newTask"><span class="plus" aria-hidden="true">＋</span>新的任务</button>
+      <label class="rail-search"><span aria-hidden="true">⌕</span><input id="sessionSearch" placeholder="搜索会话" aria-label="搜索会话" autocomplete="off"></label>
+    </div>
+    <div class="rail-scroll" id="railScroll">
+      <div class="ws-card" id="wsCard"></div>
+      <div id="sessionList"></div>
+    </div>
+    <div class="rail-foot">
+      <button class="ghost" id="openSettings">⚙　设置</button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+  <section class="main">
+    <header class="topbar" id="topbar">
+      <button class="menu-btn" id="menuBtn" title="会话列表" aria-label="打开或收起会话列表">☰</button>
+      <span id="avatarSlot"></span>
+      <div class="who">
+        <span class="name" id="personaName">数字分身</span>
+        <span class="pill accent state" id="personaState">待机</span>
+      </div>
+      <div class="top-center segmented" id="modeSwitch" role="group" aria-label="回复模式">
+        <button data-mode="chat" aria-pressed="false">陪伴</button>
+        <button data-mode="work" aria-pressed="false">工作</button>
+      </div>
+      <div class="win-actions">
+        <button class="ghost" id="toggleInspector" title="上下文面板" aria-label="打开或收起上下文面板"><span class="ico" aria-hidden="true">▤</span><span class="lbl">面板</span></button>
+        <button class="ghost" data-cmd="minimize" title="最小化" aria-label="最小化窗口"><span class="ico" aria-hidden="true">–</span><span class="lbl">最小化</span></button>
+        <button class="ghost" data-cmd="hide" title="关闭" aria-label="关闭窗口"><span class="ico" aria-hidden="true">×</span><span class="lbl">关闭</span></button>
+      </div>
+    </header>
+    <main class="chat" id="chat" role="log" aria-label="对话记录">
+      <div class="chat-inner" id="chatInner"></div>
+      <button class="jump" id="jump">回到最新消息</button>
+    </main>
+    <div class="composer-wrap">
+      <div class="composer" id="composer">
+        <div class="run-strip" id="runStrip">
+          <div class="runbar" id="runbar" role="status">
+            <span class="label" id="runLabel">思考中</span>
+            <span class="detail" id="runDetail"></span>
+            <span class="elapsed" id="runElapsed"></span>
+            <button class="steps-toggle" id="runStepsToggle" aria-expanded="false" aria-controls="runSteps" aria-label="展开本轮执行步骤">步骤</button>
+            <button class="stop" id="stopRun">停止</button>
+          </div>
+          <ol class="run-steps" id="runSteps" aria-label="本轮执行步骤" hidden></ol>
+        </div>
+        <div class="pills-row" id="pills"></div>
+        <textarea id="input" rows="1" placeholder="说点什么，或只是打个招呼…" aria-label="输入消息"></textarea>
+        <div class="composer-foot">
+          <span class="count" id="count">0 字</span>
+          <button class="send" id="send">发送</button>
+        </div>
+      </div>
+    </div>
+    <footer class="statusbar" role="status">
+      <span id="statusText">已就绪</span>
+      <span class="right" id="statusHint"></span>
+    </footer>
+  </section>
+  <aside class="inspector" id="inspector" aria-label="上下文面板">
+    <div class="inspector-resizer" id="inspectorResizer" aria-hidden="true"></div>
+    <div class="inspector-head">
+      <span class="title">上下文</span>
+      <button class="close" id="closeInspector" title="收起面板" aria-label="收起上下文面板">×</button>
+    </div>
+    <div class="inspector-tabs" id="inspectorTabs" role="tablist" aria-label="上下文分类">
+      <button data-tab="执行" role="tab" aria-selected="false">执行</button>
+      <button data-tab="文件" role="tab" aria-selected="false">文件</button>
+      <button data-tab="来源" role="tab" aria-selected="false">来源</button>
+      <button data-tab="上下文" role="tab" aria-selected="false">上下文</button>
+      <button data-tab="任务" role="tab" aria-selected="false">任务</button>
+    </div>
+    <div class="inspector-body" id="inspectorBody" role="tabpanel"></div>
+  </aside>
+</div>
+<div class="toast" id="toast" role="status"></div>
+<script src="/assets/qwebchannel.js"></script>
+<script src="/assets/markdown.js"></script>
+<script src="/assets/app.js"></script>
+</body>
+</html>

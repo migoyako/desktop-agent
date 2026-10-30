@@ -105,19 +105,86 @@ class CompanionToolTest(unittest.TestCase):
 
         self.assertEqual(
             runtime.tool_names(AgentMode.CHAT),
-            ["current_time", "read_tool_result"],
+            ["current_time", "read_tool_result", "set_reminder"],
         )
         self.assertEqual(
             runtime.tool_names(AgentMode.QUIET),
-            ["current_time", "read_tool_result"],
+            ["current_time", "read_tool_result", "set_reminder"],
         )
         self.assertEqual(
             runtime.tool_names(AgentMode.WORK),
-            ["current_time", "read_tool_result", "search_web", "write_note"],
+            [
+                "current_time",
+                "read_tool_result",
+                "search_web",
+                "set_reminder",
+                "write_note",
+            ],
         )
         self.assertEqual(
             runtime.tool_names(AgentMode.EXECUTE),
-            ["current_time", "read_tool_result", "search_web", "write_note"],
+            [
+                "current_time",
+                "read_tool_result",
+                "search_web",
+                "set_reminder",
+                "write_note",
+            ],
+        )
+
+    def test_model_creates_reminder_through_tool(self):
+        llm = ScriptedLLM(
+            [
+                LLMResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="set_reminder",
+                            arguments={
+                                "content": "站起来活动",
+                                "when": "45分钟后",
+                            },
+                        )
+                    ]
+                ),
+                LLMResponse(content="好，45 分钟后我会提醒你站起来活动。"),
+            ]
+        )
+        runtime = self.runtime(llm)
+
+        result = runtime.handle_message(
+            "等我忙完这阵提醒我活动一下",
+            AgentMode.CHAT,
+        )
+
+        self.assertIn("提醒你站起来活动", result["answer"])
+        pending = runtime.list_reminders("pending")
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].content, "站起来活动")
+        tool_text = self.tool_messages(llm.calls[1])[0].content
+        self.assertIn("已创建提醒", tool_text)
+
+    def test_reminder_tool_rejects_unparsable_time(self):
+        llm = ScriptedLLM(
+            [
+                LLMResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="set_reminder",
+                            arguments={"content": "喝水", "when": "待会儿"},
+                        )
+                    ]
+                ),
+                LLMResponse(content="你想让我什么时候提醒你？"),
+            ]
+        )
+        runtime = self.runtime(llm)
+
+        runtime.handle_message("待会儿提醒我喝水", AgentMode.CHAT)
+
+        self.assertEqual(runtime.list_reminders("pending"), [])
+        self.assertIn(
+            "没有听懂时间表达",
+            self.tool_messages(llm.calls[1])[0].content,
         )
 
     def test_model_can_search_and_answer(self):
@@ -153,6 +220,63 @@ class CompanionToolTest(unittest.TestCase):
         self.assertTrue(messages)
         self.assertIn("Example result", messages[0].content)
         self.assertEqual(list(self.workspace.rglob("*.md")), [])
+        self.assertEqual(runtime.last_tool_sources[0]["title"], "Example result")
+
+    def test_tool_events_carry_arguments_sources_and_result_handles(self):
+        llm = ScriptedLLM(
+            [
+                LLMResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="search_web",
+                            arguments={"query": "Python Agent"},
+                        )
+                    ]
+                ),
+                LLMResponse(content="搜索完成。"),
+            ]
+        )
+        runtime = self.runtime(llm)
+
+        events = list(runtime.stream_message("了解一下 Python Agent", AgentMode.WORK))
+
+        tool_events = [event for event in events if event.get("kind") == "tool"]
+        self.assertEqual(
+            [event["state"] for event in tool_events],
+            ["running", "done"],
+        )
+        running, done = tool_events
+        self.assertEqual(running["arguments"]["query"], "Python Agent")
+        self.assertEqual(done["arguments"]["query"], "Python Agent")
+        self.assertEqual(done["sources"][0]["title"], "Example result")
+        self.assertEqual(done["sources"][0]["url"], "https://example.com/result")
+        self.assertTrue(done["ok"])
+        self.assertEqual(done["error"], "")
+        self.assertEqual(runtime.last_tool_sources[0]["title"], "Example result")
+
+    def test_failed_tool_events_report_the_error(self):
+        llm = ScriptedLLM(
+            [
+                LLMResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="search_web",
+                            arguments={"query": "network"},
+                        )
+                    ]
+                ),
+                LLMResponse(content="搜索暂时不可用。"),
+            ]
+        )
+        runtime = self.runtime(llm, backend=FailingSearch())
+
+        events = list(runtime.stream_message("了解一下最新动态", AgentMode.WORK))
+
+        tool_events = [event for event in events if event.get("kind") == "tool"]
+        self.assertEqual(tool_events[-1]["state"], "error")
+        self.assertFalse(tool_events[-1]["ok"])
+        self.assertIn("network unavailable", tool_events[-1]["error"])
+        self.assertTrue(tool_events[-1]["code"])
 
     def test_model_write_tool_creates_proposal_without_writing(self):
         content = "# 会议摘要\n\n- 讨论了工具循环"

@@ -1,0 +1,53 @@
+"""Application layer shared by desktop, CLI, and future transports."""
+
+from .contracts import (
+    ApplicationError,
+    ApplicationEvent,
+    ApprovalPreview,
+    ApprovalUnavailableError,
+    ApprovalView,
+    ContextView,
+    InvalidTurnError,
+    ProjectionSection,
+    RunAlreadyActiveError,
+    RunContext,
+    RunNotFoundError,
+    RunStage,
+    RunStatus,
+    RunStep,
+    RunView,
+    SessionBusyError,
+    StartTurnCommand,
+    TranscriptMessage,
+    TurnPersistenceError,
+    UiProjection,
+    WorkspaceSnapshot,
+)
+from .bootstrap import create_application_service
+from .service import CompanionApplicationService
+
+__all__ = [
+    "ApplicationError",
+    "ApplicationEvent",
+    "ApprovalPreview",
+    "ApprovalUnavailableError",
+    "ApprovalView",
+    "CompanionApplicationService",
+    "ContextView",
+    "create_application_service",
+    "InvalidTurnError",
+    "ProjectionSection",
+    "RunAlreadyActiveError",
+    "RunContext",
+    "RunNotFoundError",
+    "RunStage",
+    "RunStatus",
+    "RunStep",
+    "RunView",
+    "SessionBusyError",
+    "StartTurnCommand",
+    "TranscriptMessage",
+    "TurnPersistenceError",
+    "UiProjection",
+    "WorkspaceSnapshot",
+]

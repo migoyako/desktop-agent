@@ -1,8 +1,6 @@
-"""Qt worker that consumes runtime streaming events with cancellation support."""
+"""Qt worker that consumes application events with cancellation support."""
 
 from __future__ import annotations
-
-import threading
 
 from PySide6.QtCore import QThread, Signal
 
@@ -12,61 +10,34 @@ class StreamWorker(QThread):
     completed = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, runtime, text, mode, generation_id, parent=None):
+    def __init__(self, application, run, parent=None):
         super().__init__(parent)
-        self.runtime = runtime
-        self.text = text
-        self.mode = mode
-        self.generation_id = generation_id
-        self.cancel_event = threading.Event()
+        self.application = application
+        self.run_context = run
+        self.generation_id = run.run_id
 
     def cancel(self):
-        self.cancel_event.set()
+        self.application.request_cancel(self.run_context.run_id)
         self.requestInterruption()
 
     def run(self):
         result = None
-        cancelled = False
         try:
-            for item in self.runtime.stream_message(
-                self.text,
-                self.mode,
-                generation_id=self.generation_id,
-                cancel_event=self.cancel_event,
-            ):
-                if self.cancel_event.is_set():
-                    cancelled = True
+            for event in self.application.stream_turn(self.run_context):
+                item = event.as_dict()
+                if self.run_context.cancel_event.is_set():
                     if item.get("kind") == "done":
-                        result = item.get("result")
+                        result = (item.get("result") or {})
                         break
                     continue
                 self.event.emit(item)
                 if item.get("kind") == "done":
-                    result = item.get("result")
+                    result = item.get("result") or {}
             if result is None:
-                result = {
-                    "answer": "已停止生成。",
-                    "proposal": None,
-                    "receipt": None,
-                    "task": None,
-                    "task_receipt": None,
-                    "cancelled": True,
-                }
-            if cancelled:
+                raise RuntimeError("回复流在完成事件前结束。")
+            if self.run_context.cancel_event.is_set():
                 result = dict(result)
                 result["cancelled"] = True
             self.completed.emit(result)
         except Exception as error:
-            if self.cancel_event.is_set():
-                self.completed.emit(
-                    {
-                        "answer": "已停止生成。",
-                        "proposal": None,
-                        "receipt": None,
-                        "task": None,
-                        "task_receipt": None,
-                        "cancelled": True,
-                    }
-                )
-                return
             self.failed.emit(str(error) or error.__class__.__name__)

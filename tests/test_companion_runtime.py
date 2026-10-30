@@ -45,6 +45,65 @@ class RuntimeWorkflowTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_switch_session_moves_history_and_services(self):
+        self.store.add_message("main", "user", "主会话的问题", AgentMode.CHAT)
+        self.store.add_message("other", "user", "另一个会话", AgentMode.WORK)
+        self.assertTrue(self.runtime.switch_session("other"))
+        self.assertEqual(self.runtime.session_id, "other")
+        self.assertEqual(self.runtime.proactive_service.session_id, "other")
+        self.assertEqual(self.runtime.work.session_id, "other")
+        self.assertEqual(
+            self.runtime.history()[-1]["content"],
+            "另一个会话",
+        )
+        self.assertEqual(self.runtime.current_mode(), AgentMode.WORK)
+        self.assertFalse(self.runtime.switch_session("missing"))
+        self.assertEqual(self.runtime.session_id, "other")
+        self.assertFalse(self.runtime.switch_session("other"))
+
+    def test_switching_clears_the_target_unread_flag(self):
+        self.store.add_message("other", "user", "另一个会话", AgentMode.CHAT)
+        self.store.set_session_unread("other", True)
+
+        self.assertTrue(self.runtime.switch_session("other"))
+
+        rows = {
+            row["id"]: row for row in self.store.list_session_summaries()
+        }
+        self.assertEqual(rows["other"]["unread"], 0)
+
+    def test_rename_pin_and_draft_are_session_scoped(self):
+        self.store.add_message("other", "user", "另一个会话", AgentMode.CHAT)
+        self.assertTrue(self.runtime.rename_session("other", "新标题"))
+        self.assertTrue(self.runtime.set_session_pinned("other", True))
+        self.assertTrue(self.runtime.save_draft("other", "会话草稿"))
+
+        rows = {
+            row["id"]: row for row in self.runtime.session_summaries()
+        }
+        self.assertEqual(rows["other"]["title"], "新标题")
+        self.assertTrue(rows["other"]["pinned_at"])
+        self.assertEqual(self.runtime.draft("other"), "会话草稿")
+        self.assertEqual(self.runtime.draft("main"), "")
+        self.assertFalse(self.runtime.rename_session("other", "   "))
+
+    def test_deleting_the_active_session_switches_to_the_newest_remaining(self):
+        self.store.add_message("other", "user", "保留这个会话", AgentMode.WORK)
+        self.assertTrue(self.runtime.delete_session("main"))
+
+        self.assertEqual(self.runtime.session_id, "other")
+        self.assertEqual(self.runtime.work.session_id, "other")
+        self.assertIsNone(self.store.get_session_mode("main"))
+        self.assertFalse(self.runtime.delete_session("main"))
+
+    def test_deleting_the_last_session_creates_a_replacement(self):
+        self.assertTrue(self.runtime.delete_session("main"))
+
+        self.assertNotEqual(self.runtime.session_id, "main")
+        self.assertIsNotNone(
+            self.store.get_session_mode(self.runtime.session_id)
+        )
+
     def test_chat_refuses_execution_tools(self):
         result = self.runtime.handle_message("搜索 Python Agent 并保存为笔记", AgentMode.CHAT)
         self.assertIsNone(result["proposal"])

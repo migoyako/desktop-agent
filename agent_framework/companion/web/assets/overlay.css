@@ -1,0 +1,159 @@
+html,
+body {
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+}
+
+body {
+  user-select: none;
+}
+
+.overlay {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  /* The avatar artwork stays a fixed size; only the text around it scales.
+     Bubble offsets are derived from it so the speech bubble never overlaps it. */
+  --pet-size: 132px;
+  --pet-right: 14px;
+  --pet-bottom: 26px;
+  --tail: 10px;
+}
+
+.pet {
+  position: absolute;
+  right: var(--pet-right);
+  bottom: var(--pet-bottom);
+  display: flex;
+  align-items: flex-end;
+  width: var(--pet-size);
+  height: var(--pet-size);
+  cursor: grab;
+  filter: drop-shadow(0 8px 16px rgba(0, 0, 0, 0.35));
+}
+
+.pet svg {
+  display: block;
+  width: var(--pet-size);
+  height: var(--pet-size);
+}
+
+.pet:active {
+  cursor: grabbing;
+}
+
+.bubble {
+  position: absolute;
+  right: var(--pet-right);
+  bottom: calc(var(--pet-bottom) + var(--pet-size) + var(--sp-xs));
+  max-width: min(240px, calc(100% - var(--sp-lg)));
+  max-height: calc(100% - var(--pet-bottom) - var(--pet-size) - var(--sp-lg));
+  display: none;
+  flex-direction: column;
+  gap: var(--sp-xs);
+  padding: var(--sp-md) var(--sp-lg);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: var(--workspace);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+}
+
+.bubble.show {
+  display: flex;
+}
+
+.bubble::after {
+  content: "";
+  position: absolute;
+  right: calc(var(--pet-size) * 0.3);
+  bottom: calc(var(--tail) / -1.7);
+  width: var(--tail);
+  height: var(--tail);
+  border-right: 1px solid var(--accent);
+  border-bottom: 1px solid var(--accent);
+  background: var(--workspace);
+  transform: rotate(45deg);
+}
+
+.bubble .chip {
+  color: var(--accent-soft);
+  font-size: var(--fs-meta);
+  flex: none;
+}
+
+.bubble .text {
+  color: var(--text);
+  font-size: var(--fs-ui);
+  line-height: var(--lh-body);
+  word-break: break-word;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.status {
+  position: absolute;
+  right: var(--pet-right);
+  bottom: var(--sp-xs);
+  width: var(--pet-size);
+  text-align: center;
+  color: var(--muted);
+  font-size: var(--fs-caption);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.close {
+  position: absolute;
+  right: var(--sp-sm);
+  top: var(--sp-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: calc(var(--fs-ui) * 1.6);
+  min-height: calc(var(--fs-ui) * 1.6);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--workspace);
+  color: var(--muted);
+  font-size: var(--fs-ui);
+  line-height: var(--lh-control);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.overlay:hover .close {
+  opacity: 1;
+}
+
+.close:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+body.reduce-motion * {
+  transition: none !important;
+  animation: none !important;
+}
+
+body.browser {
+  display: grid;
+  place-items: center;
+  background: var(--page);
+}
+
+body.browser .overlay {
+  width: 300px;
+  height: 250px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--workspace);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+body.browser .close {
+  display: none;
+}

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="charcoal-pink">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>设置</title>
+<link rel="stylesheet" href="/assets/tokens.css">
+<link rel="stylesheet" href="/assets/settings.css">
+</head>
+<body>
+<div class="win">
+  <header class="win-head" id="winHead">
+    <span class="title">设置</span>
+    <button class="ghost" id="closeBtn">关闭</button>
+  </header>
+  <label class="search"><span aria-hidden="true">⌕</span><input id="search" placeholder="搜索设置（Esc 返回）" aria-label="搜索设置" autocomplete="off"></label>
+  <div class="body">
+    <nav class="nav" id="nav" aria-label="设置分类"></nav>
+    <section class="content" id="content"></section>
+  </div>
+  <footer class="foot">
+    <span class="note">对话与记忆只保存在本机。</span>
+    <div class="foot-actions">
+      <button class="ghost" id="themeBtn">主题</button>
+      <button class="ghost" id="overlayBtn">桌面浮窗</button>
+    </div>
+  </footer>
+</div>
+<div class="toast" id="toast" role="status"></div>
+<script src="/assets/qwebchannel.js"></script>
+<script src="/assets/settings.js"></script>
+</body>
+</html>

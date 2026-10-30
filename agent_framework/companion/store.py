@@ -173,7 +173,7 @@ CREATE TABLE IF NOT EXISTS workspace_grants (
 """
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 MEMORY_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
@@ -442,6 +442,16 @@ CREATE INDEX IF NOT EXISTS idx_skill_audit_session
 """
 
 
+SESSION_DRAFT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS session_drafts (
+    session_id TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
+"""
+
+
 def _add_column_if_missing(connection, table, column, definition):
     existing = {
         row[1]
@@ -579,6 +589,29 @@ def _migrate_v8(connection):
     connection.executescript(SKILL_AUDIT_SCHEMA)
 
 
+def _migrate_v9(connection):
+    """会话管理：自定义标题、置顶、未读标记与每会话草稿。"""
+    _add_column_if_missing(
+        connection,
+        "sessions",
+        "title",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column_if_missing(
+        connection,
+        "sessions",
+        "pinned_at",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column_if_missing(
+        connection,
+        "sessions",
+        "unread",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    connection.executescript(SESSION_DRAFT_SCHEMA)
+
+
 def _reindex_memory_fts(connection):
     """从 memories 全量重建 memory_fts 索引（幂等）。"""
     connection.execute("DELETE FROM memory_fts")
@@ -671,6 +704,9 @@ class CompanionStore:
                 if version < 8:
                     _migrate_v8(connection)
                     version = 8
+                if version < 9:
+                    _migrate_v9(connection)
+                    version = 9
             connection.execute(
                 "PRAGMA user_version = {}".format(int(version))
             )
@@ -728,6 +764,154 @@ class CompanionStore:
                 "SELECT * FROM sessions ORDER BY updated_at DESC"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_session_summaries(self) -> List[Dict]:
+        """One row per session with the first user topic and last message."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT s.id, s.mode, s.created_at, s.updated_at,
+                       s.title, s.pinned_at, s.unread,
+                       (SELECT COUNT(*) FROM messages m
+                        WHERE m.session_id = s.id) AS message_count,
+                       (SELECT m.content FROM messages m
+                        WHERE m.session_id = s.id AND m.role = 'user'
+                        ORDER BY m.id ASC LIMIT 1) AS topic,
+                       (SELECT m.role FROM messages m
+                        WHERE m.session_id = s.id
+                        ORDER BY m.id DESC LIMIT 1) AS last_role,
+                       (SELECT m.content FROM messages m
+                        WHERE m.session_id = s.id
+                        ORDER BY m.id DESC LIMIT 1) AS last_content,
+                       (SELECT m.created_at FROM messages m
+                        WHERE m.session_id = s.id
+                        ORDER BY m.id DESC LIMIT 1) AS last_at
+                FROM sessions s
+                ORDER BY (s.pinned_at <> '') DESC,
+                         s.pinned_at DESC,
+                         s.updated_at DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def rename_session(self, session_id: str, title: str) -> bool:
+        title = str(title or "").strip()[:60]
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?",
+                (title, session_id),
+            )
+            return cursor.rowcount > 0
+
+    def set_session_pinned(self, session_id: str, pinned: bool = True) -> bool:
+        value = utc_now() if pinned else ""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE sessions SET pinned_at = ? WHERE id = ?",
+                (value, session_id),
+            )
+            return cursor.rowcount > 0
+
+    def set_session_unread(self, session_id: str, unread: bool = True) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE sessions SET unread = ? WHERE id = ?",
+                (1 if unread else 0, session_id),
+            )
+            return cursor.rowcount > 0
+
+    def get_draft(self, session_id: str) -> str:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT content FROM session_drafts WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return str(row["content"]) if row else ""
+
+    def set_draft(self, session_id: str, content: str) -> bool:
+        content = str(content or "")
+        with self._connection() as connection:
+            if not content.strip():
+                connection.execute(
+                    "DELETE FROM session_drafts WHERE session_id = ?",
+                    (session_id,),
+                )
+                return True
+            cursor = connection.execute(
+                """
+                INSERT INTO session_drafts(session_id, content, updated_at)
+                SELECT ?, ?, ? WHERE EXISTS (
+                    SELECT 1 FROM sessions WHERE id = ?
+                )
+                ON CONFLICT(session_id) DO UPDATE SET
+                    content = excluded.content,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, content, utc_now(), session_id),
+            )
+            return cursor.rowcount > 0
+
+    def delete_session(self, session_id: str) -> bool:
+        """Remove one session and every row scoped to it, including drafts."""
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return False
+        # Child tables first so foreign keys never block the session delete.
+        tables = (
+            "memory_evidence",
+            "memory_relations",
+            "memory_candidates",
+            "memory_events",
+            "action_receipts",
+            "execution_ledger",
+            "work_receipts",
+            "messages",
+            "action_proposals",
+            "work_tasks",
+            "memories",
+            "experiences",
+            "affect_states",
+            "skill_audit",
+            "recall_log",
+            "memory_tombstones",
+            "context_checkpoints",
+            "reminders",
+            "proactive_state",
+            "proactive_events",
+            "session_drafts",
+        )
+        with self._connection() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if not exists:
+                return False
+            memory_ids = [
+                row["memory_id"]
+                for row in connection.execute(
+                    "SELECT memory_id FROM memories WHERE session_id = ?",
+                    (session_id,),
+                ).fetchall()
+            ]
+            for table in tables:
+                connection.execute(
+                    "DELETE FROM {} WHERE session_id = ?".format(table),
+                    (session_id,),
+                )
+            connection.execute(
+                "DELETE FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            if memory_ids:
+                try:
+                    connection.executemany(
+                        "DELETE FROM memory_fts WHERE memory_id = ?",
+                        [(memory_id,) for memory_id in memory_ids],
+                    )
+                except sqlite3.Error:
+                    pass
+        return True
 
     def add_message(
         self,
