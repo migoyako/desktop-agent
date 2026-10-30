@@ -973,6 +973,20 @@ class CompanionStore:
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def delete_message(
+        self,
+        message_id: int,
+        session_id: Optional[str] = None,
+    ) -> bool:
+        query = "DELETE FROM messages WHERE id = ?"
+        parameters = [int(message_id)]
+        if session_id:
+            query += " AND session_id = ?"
+            parameters.append(session_id)
+        with self._connection() as connection:
+            cursor = connection.execute(query, tuple(parameters))
+            return cursor.rowcount == 1
+
     def clear_messages(self, session_id: str):
         with self._connection() as connection:
             connection.execute(
@@ -2157,6 +2171,52 @@ class CompanionStore:
                 (message_id,),
             ).fetchone()
         return dict(row) if row else None
+
+    def message_side_effect(self, session_id: str, message_id: int) -> str:
+        """Label the first durable record produced by one user turn.
+
+        Regeneration replays the turn, so any reminder, work task, or file
+        proposal linked to that user row would be created twice.
+        """
+        message_id = int(message_id or 0)
+        with self._connection() as connection:
+            if connection.execute(
+                """
+                SELECT 1 FROM reminders
+                WHERE session_id = ? AND source_message_id = ?
+                LIMIT 1
+                """,
+                (session_id, message_id),
+            ).fetchone():
+                return "提醒"
+            if connection.execute(
+                """
+                SELECT 1 FROM work_tasks
+                WHERE session_id = ? AND source_message_id = ?
+                LIMIT 1
+                """,
+                (session_id, message_id),
+            ).fetchone():
+                return "工作任务"
+            rows = connection.execute(
+                """
+                SELECT normalized_arguments FROM action_proposals
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchall()
+        for row in rows:
+            try:
+                arguments = json.loads(row["normalized_arguments"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            try:
+                linked = int(arguments.get("source_message_id") or 0)
+            except (TypeError, ValueError):
+                linked = 0
+            if linked == message_id:
+                return "待确认写入"
+        return ""
 
     def find_memory_by_key(
         self,

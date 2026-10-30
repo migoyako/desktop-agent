@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from agent_framework.companion.app import create_application_service
 from agent_framework.companion.context import PromptBuild
+from agent_framework.companion.models import TaskCard, WorkTask, new_id
 from agent_framework.companion.runtime import CompanionRuntime
 from agent_framework.companion.search import SearchService
 from agent_framework.companion.store import CompanionStore
@@ -184,6 +185,90 @@ class WebAdapterTests(unittest.TestCase):
         self.assertIsNone(bootstrap["run"])
         self.assertEqual("user", bootstrap["messages"][-2]["role"])
         self.assertEqual("assistant", bootstrap["messages"][-1]["role"])
+
+    def run_turn(self, text="你好"):
+        status, payload = self.request("/api/turn", {"text": text, "mode": "chat"})
+        self.assertEqual(202, status)
+        self.assertTrue(payload["run_id"])
+        return self.wait_for(
+            lambda data: data["run"] is None
+            and len(data["messages"]) >= 2
+        )
+
+    def test_bootstrap_exposes_trailing_message_actions(self):
+        bootstrap = self.run_turn()
+        actions = bootstrap["message_actions"]
+        self.assertEqual(bootstrap["messages"][-1]["id"], actions["regenerate_id"])
+        self.assertEqual(0, actions["source_id"])
+
+    def test_regenerate_endpoint_replaces_the_latest_reply(self):
+        first = self.run_turn()
+        replaced = first["messages"][-1]
+        status, payload = self.request(
+            "/api/messages/regenerate", {"message_id": replaced["id"]}
+        )
+        self.assertEqual(202, status)
+        self.assertTrue(payload["run_id"])
+        after = self.wait_for(
+            lambda data: data["run"] is None
+            and len(data["messages"]) == 2
+            and data["messages"][-1]["id"] != replaced["id"]
+        )
+        self.assertEqual("user", after["messages"][-2]["role"])
+        self.assertEqual("assistant", after["messages"][-1]["role"])
+
+    def test_regenerate_refuses_a_user_message(self):
+        bootstrap = self.run_turn()
+        status, payload = self.request(
+            "/api/messages/regenerate", {"message_id": bootstrap["messages"][0]["id"]}
+        )
+        self.assertEqual(409, status)
+        self.assertIn("回复", payload["error"])
+
+    def test_side_effect_turn_is_refused_over_http(self):
+        bootstrap = self.run_turn()
+        user = bootstrap["messages"][0]
+        assistant = bootstrap["messages"][-1]
+        self.service.runtime.store.create_work_task(
+            WorkTask(
+                task_id=new_id("task"),
+                session_id="main",
+                state="PLAN_REVIEW",
+                card=TaskCard(
+                    title="整理周报",
+                    reason="用户要求",
+                    spoken_summary="整理周报",
+                    goal="整理周报",
+                    executor="local",
+                    project="",
+                ),
+                source_message_id=user["id"],
+            )
+        )
+        status, payload = self.request(
+            "/api/messages/regenerate", {"message_id": assistant["id"]}
+        )
+        self.assertEqual(409, status)
+        self.assertIn("工作任务", payload["error"])
+        _, after = self.request("/api/bootstrap")
+        self.assertEqual(0, after["message_actions"]["regenerate_id"])
+
+    def test_remember_action_saves_the_reply_once(self):
+        bootstrap = self.run_turn()
+        message_id = bootstrap["messages"][-1]["id"]
+        status, payload = self.request(
+            "/api/console/memory", {"action": "remember", "message_id": message_id}
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["created"])
+        self.assertIn(payload["memory_id"], [row["memory_id"] for row in payload["rows"]])
+        status, again = self.request(
+            "/api/console/memory", {"action": "remember", "message_id": message_id}
+        )
+        self.assertEqual(200, status)
+        self.assertFalse(again["created"])
+        self.assertEqual(payload["memory_id"], again["memory_id"])
 
     def test_event_stream_frames_every_sse_write(self):
         """Chromium drops an event stream whose first write is not a chunk, so the

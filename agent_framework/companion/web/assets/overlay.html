@@ -9,15 +9,28 @@
 </head>
 <body>
 <div class="overlay" id="overlay">
-  <div class="bubble" id="bubble">
+  <div class="bubble" id="bubble" role="status">
     <span class="chip" id="chip">待机</span>
     <span class="text" id="bubbleText"></span>
   </div>
+  <div class="quick" id="quick" role="group" aria-label="浮窗快捷操作">
+    <button type="button" data-quick="chat" title="打开聊天" aria-label="打开聊天">聊天</button>
+    <button type="button" data-quick="dnd" id="quickDnd" title="勿扰" aria-label="勿扰" aria-pressed="false">勿扰</button>
+    <button type="button" data-quick="collapse" id="quickCollapse" title="折叠成小球" aria-label="折叠成小球">折叠</button>
+  </div>
   <div class="pet" id="pet"></div>
+  <button type="button" class="ball" id="ball" hidden title="打开聊天，双击展开" aria-label="打开聊天，双击展开"><span class="mark" aria-hidden="true"></span></button>
   <div class="status" id="status">待机</div>
-  <button class="close" id="close" title="收起浮窗" aria-label="收起浮窗">×</button>
+  <button type="button" class="close" id="close" title="收起浮窗" aria-label="收起浮窗">×</button>
+  <div class="menu" id="menu" role="menu" aria-label="浮窗菜单" hidden>
+    <button type="button" role="menuitem" data-menu="chat">打开聊天</button>
+    <button type="button" role="menuitem" data-menu="toggle-main">显示或隐藏主窗</button>
+    <button type="button" role="menuitem" data-menu="dnd" id="menuDnd">勿扰：关</button>
+    <button type="button" role="menuitem" data-menu="hide">收起浮窗</button>
+  </div>
 </div>
 <script src="/assets/qwebchannel.js"></script>
+<script src="/assets/avatar.js"></script>
 <script src="/assets/overlay.js"></script>
 </body>
 </html>

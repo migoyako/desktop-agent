@@ -748,6 +748,54 @@ class MemoryService:
             ],
         }
 
+    def remember_message(self, session_id: str, row) -> dict:
+        """Save one transcript row on user request, idempotently.
+
+        Evidence is only legal for user rows (the store rejects an assistant
+        quote), so an assistant reply is linked by source id alone.
+        """
+        content = str(row.get("content") or "").strip()
+        if not content:
+            raise ValueError("这条消息没有可保存的内容。")
+        role = str(row.get("role") or "")
+        message_id = int(row.get("id") or 0)
+        if role == "user":
+            kind = "fact"
+            canonical_key = _canonical_key(kind, content)
+        else:
+            kind = "fact"
+            canonical_key = "manual:assistant:" + _normalize(content)
+        existing = self.store.find_memory_by_key(
+            session_id,
+            canonical_key,
+            statuses=["candidate", "confirmed", "archived"],
+        )
+        if existing is not None:
+            self.store.update_memory(
+                existing.memory_id,
+                content=content,
+                status="confirmed",
+            )
+            return {"memory_id": existing.memory_id, "created": False}
+        evidence = (
+            {"message_id": message_id, "quote": content}
+            if role == "user"
+            else None
+        )
+        memory_id = self.store.add_memory(
+            session_id=session_id,
+            kind=kind,
+            content=content,
+            source_message_id=message_id,
+            confidence=1.0,
+            importance=0.8,
+            status="confirmed",
+            canonical_key=canonical_key,
+            evidence=evidence,
+            candidate_reason="用户手动保存的消息",
+        )
+        return {"memory_id": memory_id, "created": True}
+
     def remember_experience(
         self,
         session_id: str,

@@ -12,6 +12,9 @@ from .contracts import (
     ApprovalView,
     EventKind,
     InvalidTurnError,
+    MessageActions,
+    MessageUnavailableError,
+    RegenerateMessageCommand,
     RunAlreadyActiveError,
     RunContext,
     RunNotFoundError,
@@ -101,6 +104,7 @@ class CompanionApplicationService:
                 pending if pending is not None else None,
             ),
             context=build_context_view(self.runtime),
+            message_actions=self.message_actions(),
         )
 
     def run_view(self, session_id=None) -> Optional[RunView]:
@@ -156,6 +160,83 @@ class CompanionApplicationService:
             self._session_runs[session_id] = run.run_id
             return run
 
+    def regenerate(self, command) -> RunContext:
+        """Replace the latest assistant reply without resending the user row."""
+        if not isinstance(command, RegenerateMessageCommand):
+            try:
+                message_id = int(command or 0)
+            except (TypeError, ValueError):
+                message_id = 0
+            command = RegenerateMessageCommand(message_id)
+        with self._lock:
+            self._assert_idle("重新生成")
+            assistant, user, reason = self._regeneration_rows(command.message_id)
+            if assistant is None:
+                raise MessageUnavailableError(reason)
+            session_id = self.runtime.session_id
+            selected_mode = AgentMode(
+                user.get("mode")
+                or assistant.get("mode")
+                or self.runtime.current_mode()
+            )
+            workspace = None
+            try:
+                workspace = WorkspaceSnapshot.capture(self.runtime.workspace())
+            except OSError:
+                workspace = None
+            run = RunContext(
+                run_id=self._run_id_factory(),
+                session_id=session_id,
+                mode=selected_mode,
+                text=str(user.get("content") or ""),
+                previous_message_id=int(assistant["id"]),
+                workspace=workspace,
+                regenerate_of=int(assistant["id"]),
+                source_message_id=int(user["id"]),
+            )
+            self._runs[run.run_id] = run
+            self._session_runs[session_id] = run.run_id
+            return run
+
+    def remember_message(self, message_id) -> Dict:
+        with self._lock:
+            self._assert_idle("保存记忆")
+            return self.runtime.remember_message(message_id)
+
+    def message_actions(self) -> MessageActions:
+        """Adapters render actions only for the rows this contract names."""
+        try:
+            rows = self.runtime.store.list_messages(
+                self.runtime.session_id,
+                limit=4,
+            )
+        except Exception:
+            rows = []
+        rows = [
+            row
+            for row in rows or []
+            if row.get("role") in ("user", "assistant")
+        ]
+        if not rows:
+            return MessageActions()
+        regenerate_id = 0
+        last = rows[-1]
+        if last.get("role") == "assistant":
+            assistant, _, _ = self._regeneration_rows(int(last.get("id") or 0))
+            if assistant is not None:
+                regenerate_id = int(assistant["id"])
+        source_id = 0
+        sources = getattr(self.runtime, "last_tool_sources", None) or []
+        if sources:
+            for row in reversed(rows):
+                if row.get("role") == "assistant":
+                    source_id = int(row.get("id") or 0)
+                    break
+        return MessageActions(
+            regenerate_id=regenerate_id,
+            source_id=source_id,
+        )
+
     def stream_turn(self, run: RunContext) -> Iterator[ApplicationEvent]:
         with self._lock:
             current = self._runs.get(run.run_id)
@@ -165,6 +246,8 @@ class CompanionApplicationService:
         sequence = 0
         terminal = False
         saw_error = False
+        replaced = None
+        deleted = False
         try:
             stage = stage_for_event(EventKind.STARTED.value)
             self._advance_run(run, sequence, stage, "", "")
@@ -182,12 +265,32 @@ class CompanionApplicationService:
                 },
                 stage=stage,
             )
-            for raw in self.runtime.stream_message(
-                run.text,
-                run.mode,
-                generation_id=run.run_id,
-                cancel_event=run.cancel_event,
-            ):
+            if run.regenerate_of:
+                replaced = self.runtime.store.get_message(run.regenerate_of)
+                if (
+                    replaced is None
+                    or replaced.get("session_id") != run.session_id
+                    or not self.runtime.store.delete_message(
+                        run.regenerate_of,
+                        run.session_id,
+                    )
+                ):
+                    raise MessageUnavailableError("找不到要替换的回复。")
+                deleted = True
+                stream = self.runtime.stream_regenerate(
+                    run.source_message_id,
+                    run.mode,
+                    generation_id=run.run_id,
+                    cancel_event=run.cancel_event,
+                )
+            else:
+                stream = self.runtime.stream_message(
+                    run.text,
+                    run.mode,
+                    generation_id=run.run_id,
+                    cancel_event=run.cancel_event,
+                )
+            for raw in stream:
                 sequence += 1
                 if not isinstance(raw, dict):
                     raise TurnPersistenceError("运行时返回了无法识别的事件。")
@@ -232,6 +335,8 @@ class CompanionApplicationService:
             if not terminal:
                 raise TurnPersistenceError("回复流在完成事件前结束。")
         except Exception as error:
+            if deleted and not self._has_assistant_after(run):
+                self._restore_message(run, replaced)
             if not run.finished:
                 run.complete(RunStatus.FAILED, error=str(error))
                 run.stage = RunStage.FAILED.value
@@ -453,6 +558,67 @@ class CompanionApplicationService:
         if kind == EventKind.ERROR.value:
             return str(payload.get("message") or ""), ""
         return "", ""
+
+    def _regeneration_rows(self, message_id):
+        """The only regenerable pair: trailing assistant plus its user message."""
+        session_id = self.runtime.session_id
+        try:
+            rows = self.runtime.store.list_messages(session_id, limit=2)
+        except Exception:
+            return None, None, "暂时读不到这条会话的消息。"
+        if len(rows) < 2:
+            return None, None, "当前会话还没有可重新生成的回复。"
+        assistant, user = rows[-1], rows[-2]
+        if (
+            int(assistant.get("id") or 0) != int(message_id or 0)
+            or assistant.get("role") != "assistant"
+        ):
+            return None, None, "只能重新生成最新一条回复。"
+        if user.get("role") != "user" or not str(user.get("content") or "").strip():
+            return None, None, "这条回复没有对应的用户消息。"
+        effect = self._message_side_effect(session_id, int(user["id"]))
+        if effect:
+            return (
+                None,
+                None,
+                "这条消息已经产生{}，重新生成可能重复执行，暂不支持。".format(
+                    effect
+                ),
+            )
+        return assistant, user, ""
+
+    def _message_side_effect(self, session_id, message_id) -> str:
+        finder = getattr(self.runtime.store, "message_side_effect", None)
+        if finder is None:
+            return ""
+        try:
+            return str(finder(session_id, int(message_id)) or "")
+        except Exception:
+            return ""
+
+    def _has_assistant_after(self, run: RunContext) -> bool:
+        try:
+            rows = self.runtime.store.list_messages_after(
+                run.session_id,
+                run.previous_message_id,
+                limit=20,
+            )
+        except Exception:
+            return False
+        return any(row.get("role") == "assistant" for row in rows or ())
+
+    def _restore_message(self, run: RunContext, replaced):
+        if not replaced:
+            return
+        try:
+            self.runtime.store.add_message(
+                run.session_id,
+                "assistant",
+                str(replaced.get("content") or ""),
+                AgentMode(replaced.get("mode") or run.mode),
+            )
+        except Exception:
+            pass
 
     def _persisted_message_id(
         self,

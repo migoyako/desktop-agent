@@ -26,6 +26,13 @@
      line, so a line does not get wider just because the type got bigger. */
   --read-measure: calc(var(--fs-body) * 42);
   --col-measure: calc(var(--read-measure) / 0.74);
+  /* One content column for bubbles, tool cards and approval cards; the reading
+     measure is the cap, 100% is the narrow-window escape. */
+  --content-measure: var(--read-measure);
+  /* The rail has two honest widths: labels, or glyphs only. Narrow windows do
+     not shrink it further, they turn it into a drawer. */
+  --rail-w: min(calc(208px * var(--sp-scale)), 42vw);
+  --rail-w-collapsed: min(calc(72px * var(--sp-scale)), 30vw);
   /* Control boxes are min-heights measured from the font, never fixed pixels. */
   --ctl-pill: calc(var(--fs-caption) + var(--sp-md));
   --ctl-segment: calc(var(--fs-meta) * 1.25 + var(--sp-md));
@@ -43,7 +50,11 @@
   --radius-md: 10px;
   --radius-lg: 12px;
   --radius-pill: 999px;
-  --shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+  --shadow: var(--shadow-2);
+  --bubble-tail: calc(6px * var(--sp-scale));
+  /* The M13.2 seam. No background image exists yet, so the wash is invisible;
+     that slice assigns this one value and leaves the depth tokens alone. */
+  --bg-scrim: rgba(0, 0, 0, 0);
 }
 
 :root,
@@ -74,6 +85,24 @@
   --avatar-ink: #24151b;
   --avatar-outline: #4a4a4a;
   --scrim: rgba(0, 0, 0, 0.55);
+  /* Depth: near, raised and floating. Dark ink on a dark page needs stronger
+     alpha than the same tiers get on pearl-white, so each theme owns its ink. */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.32), 0 2px 6px rgba(0, 0, 0, 0.22);
+  --shadow-2: 0 6px 18px rgba(0, 0, 0, 0.34), 0 16px 40px rgba(0, 0, 0, 0.28);
+  --shadow-3: 0 12px 30px rgba(0, 0, 0, 0.42), 0 28px 64px rgba(0, 0, 0, 0.34);
+  --glow: 0 0 0 1px rgba(255, 91, 138, 0.4), 0 6px 22px rgba(255, 91, 138, 0.3);
+  /* Glass surfaces bake the alpha into the colour: a fully opaque surface has
+     nothing for backdrop-filter to blur. */
+  --surface-glass: rgba(37, 37, 37, 0.72);
+  --blur: 14px;
+  --rail-a: rgba(33, 28, 31, 0.94);
+  --rail-b: rgba(21, 21, 21, 0.9);
+  --ambience: radial-gradient(
+    circle at 50% 6%,
+    rgba(255, 91, 138, 0.16),
+    rgba(255, 91, 138, 0) 62%
+  );
+  --pet-shadow: drop-shadow(0 8px 16px rgba(0, 0, 0, 0.35));
   color-scheme: dark;
 }
 
@@ -104,6 +133,22 @@
   --avatar-ink: #1d1d1f;
   --avatar-outline: #d2d2d7;
   --scrim: rgba(20, 20, 22, 0.32);
+  /* A light page takes soft neutral ink, not the dark theme's 0.28 black: that
+     was the grey halo that made pearl-white look dirty. */
+  --shadow-1: 0 1px 2px rgba(28, 28, 34, 0.06), 0 2px 6px rgba(28, 28, 34, 0.05);
+  --shadow-2: 0 6px 16px rgba(28, 28, 34, 0.08), 0 16px 36px rgba(28, 28, 34, 0.07);
+  --shadow-3: 0 12px 28px rgba(28, 28, 34, 0.12), 0 28px 60px rgba(28, 28, 34, 0.1);
+  --glow: 0 0 0 1px rgba(255, 91, 138, 0.32), 0 6px 20px rgba(255, 91, 138, 0.2);
+  --surface-glass: rgba(255, 255, 255, 0.74);
+  --blur: 18px;
+  --rail-a: rgba(255, 255, 255, 0.96);
+  --rail-b: rgba(255, 244, 249, 0.92);
+  --ambience: radial-gradient(
+    circle at 50% 6%,
+    rgba(255, 91, 138, 0.12),
+    rgba(255, 91, 138, 0) 64%
+  );
+  --pet-shadow: drop-shadow(0 8px 16px rgba(28, 28, 34, 0.18));
   color-scheme: light;
 }
 
@@ -111,6 +156,22 @@
   box-sizing: border-box;
   margin: 0;
   padding: 0;
+}
+
+/* Author display rules out-rank the UA rule, so [hidden] needs to win here. */
+[hidden] {
+  display: none !important;
+}
+
+/* Without blur support the glass becomes an ordinary surface: the tint alone
+   would look like a faded panel instead of depth. The theme selectors must be
+   repeated here, otherwise they out-rank this fallback. */
+@supports not (backdrop-filter: blur(1px)) {
+  :root,
+  :root[data-theme="charcoal-pink"],
+  :root[data-theme="pearl-white"] {
+    --surface-glass: var(--surface);
+  }
 }
 
 html,
@@ -126,6 +187,12 @@ body {
   color: var(--text);
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
+}
+
+/* The same background wash the main shell carries (app.css). It is a no-op
+   layer until M13.2 assigns --bg-scrim. */
+.win {
+  background-image: linear-gradient(var(--bg-scrim), var(--bg-scrim));
 }
 
 button,

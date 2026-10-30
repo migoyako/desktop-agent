@@ -155,6 +155,17 @@ def _wait_reply(adapter, before, limit=20.0):
     raise RuntimeError("离线回合未在 %.0f 秒内落库" % limit)
 
 
+def _settle(page, expected, timeout=5.0):
+    """Pages paint the scale only after their first bootstrap fetch, so give the
+    root style a bounded chance to land before probing."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if page.evaluate("getComputedStyle(document.documentElement)"
+                         ".getPropertyValue('--scale').trim()") == expected:
+            return
+        page.wait_for_timeout(50)
+
+
 def _seed(adapter):
     count = len(adapter.bootstrap()["messages"])
     for mode, text in SEEDS:
@@ -207,13 +218,16 @@ def run_audit(out_dir=None, scales=SCALES):
                             page.set_viewport_size({"width": width, "height": height})
                             page.goto(_url(adapter, path), wait_until="load")
                             page.wait_for_selector(ready, timeout=10000)
+                            expected = "{:g}".format(scale / 100)
+                            _settle(page, expected)
                             page.wait_for_timeout(120)
                             result = page.evaluate(PROBE, CONTROLS[name])
-                            expected = "{:g}".format(scale / 100)
                             if result["scale"] != expected:
                                 problems.append(
                                     {
                                         "page": name,
+                                        "scale": scale,
+                                        "size": [width, height],
                                         "axis": "scale",
                                         "node": ":root",
                                         "delta": "{}!={}".format(result["scale"], expected),
@@ -244,7 +258,14 @@ def run_audit(out_dir=None, scales=SCALES):
     unreachable = [item for item in controls if not item["hit"]]
     for item in unreachable:
         problems.append(
-            {"page": item["page"], "axis": "control", "node": item["name"], "delta": item["height"]}
+            {
+                "page": item["page"],
+                "scale": item["scale"],
+                "size": item["size"],
+                "axis": "control",
+                "node": item["name"],
+                "delta": item["height"],
+            }
         )
     return {"problems": problems, "controls": controls, "measures": measures, "chrome": chrome,
             "shots": shots}
@@ -260,7 +281,8 @@ def main(argv=None):
     print("页面 × 档位：{} 档，问题 {} 项，控件 {} 个，截图 {} 张".format(
         len(scales), len(report["problems"]), len(report["controls"]), len(report["shots"])))
     for problem in report["problems"]:
-        print("[FAIL] {page} {size} {scale}% {axis} {node} +{delta}".format(**problem))
+        merged = {"size": "-", "scale": "?", **problem}
+        print("[FAIL] {page} {size} {scale}% {axis} {node} +{delta}".format(**merged))
     for scale in scales:
         for bar in [item for item in report["chrome"]
                     if item["page"] == "main" and item["scale"] == scale]:

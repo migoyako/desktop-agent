@@ -194,6 +194,8 @@ class WebAdapter:
             state.set_inspector_width(body.get("inspector_width"))
         if "overlay_visible" in body:
             state.set_overlay_visible(body.get("overlay_visible"))
+        if "overlay_collapsed" in body:
+            state.set_overlay_collapsed(body.get("overlay_collapsed"))
         result = {
             "theme": state.theme(),
             "font_scale": state.font_scale(),
@@ -201,6 +203,7 @@ class WebAdapter:
             "inspector_visible": state.inspector_visible(),
             "inspector_width": state.inspector_width(),
             "overlay_visible": state.overlay_visible(),
+            "overlay_collapsed": state.overlay_collapsed(),
         }
         self.broadcast({"type": "ui", "ui": result})
         return result
@@ -245,6 +248,7 @@ class WebAdapter:
             ],
             "run": plain(projection.run) if projection.run else None,
             "context": plain(projection.context) if projection.context else None,
+            "message_actions": plain(projection.message_actions),
             "approvals": [item.as_dict() for item in projection.approvals],
             "tasks": [
                 self._task_row(task)
@@ -328,7 +332,30 @@ class WebAdapter:
             or "数字分身",
             "theme": self.ui_state.theme(),
             "font_scale": self.ui_state.font_scale(),
+            "collapsed": self.ui_state.overlay_collapsed(),
             "pending": len(self._safe(lambda: self.runtime.pending_proposals(), []) or []),
+            "proactive": self._overlay_proactive(),
+        }
+
+    def _overlay_proactive(self):
+        """Unread messages the overlay may speak; newest first, the page reverses."""
+        status = self._safe(lambda: self.runtime.proactive_status(), {}) or {}
+        enabled = bool(status.get("enabled"))
+        events = (
+            self._safe(lambda: self.runtime.unread_proactive_events(3), []) or []
+            if enabled
+            else []
+        )
+        return {
+            "enabled": enabled,
+            "unread": [
+                {
+                    "id": event.event_id,
+                    "text": clip(event.content, 160),
+                    "at": event.created_at,
+                }
+                for event in events
+            ],
         }
 
     def console_page(self, page):
@@ -426,8 +453,12 @@ class WebAdapter:
     # -- commands ------------------------------------------------------
 
     def run_turn(self, text, mode=None):
-        run = self.service.begin_turn(text, mode)
+        return self._start_run(self.service.begin_turn(text, mode))
 
+    def regenerate(self, message_id):
+        return self._start_run(self.service.regenerate(message_id))
+
+    def _start_run(self, run):
         def worker():
             try:
                 for event in self.service.stream_turn(run):
@@ -532,6 +563,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"shown": False, "url": adapter.url})
             if path == "/api/turn":
                 run = adapter.run_turn(body.get("text"), body.get("mode"))
+                return self._json(202, {"run_id": run.run_id})
+            if path == "/api/messages/regenerate":
+                run = adapter.regenerate(body.get("message_id"))
                 return self._json(202, {"run_id": run.run_id})
             if path == "/api/runs/cancel":
                 return self._json(200, {"cancelled": service.request_cancel(body.get("run_id"))})
@@ -638,6 +672,20 @@ class _Handler(BaseHTTPRequestHandler):
         runtime = self.adapter.runtime
         action = str(body.get("action") or "")
         memory_id = str(body.get("memory_id") or "")
+        if action == "remember":
+            result = self.adapter.service.remember_message(body.get("message_id"))
+            self.adapter.broadcast({"type": "refresh"})
+            return self._json(
+                200,
+                {
+                    "ok": True,
+                    "memory_id": result.get("memory_id", ""),
+                    "created": bool(result.get("created")),
+                    "rows": [
+                        plain(item) for item in self.adapter._memories()
+                    ],
+                },
+            )
         if action == "correct":
             runtime.correct_memory(memory_id, str(body.get("replacement") or ""))
         elif action == "forget":

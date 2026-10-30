@@ -409,6 +409,7 @@ class CompanionRuntime:
             return False
         self.session_id = session_id
         self.last_context = None
+        self.last_tool_sources = []
         self._turn_recalls = []
         self.proactive_service.session_id = session_id
         self.work.session_id = session_id
@@ -440,7 +441,49 @@ class CompanionRuntime:
             payload["generation_id"] = generation_id
             yield payload
 
-    def _run_turn(self, text, mode, cancel_event=None):
+    def stream_regenerate(
+        self,
+        message_id: int,
+        mode: AgentMode = None,
+        generation_id: str = "",
+        cancel_event=None,
+    ):
+        """Replay one stored user turn without re-persisting or re-observing it."""
+        row = self.store.get_message(message_id)
+        if (
+            row is None
+            or row.get("session_id") != self.session_id
+            or row.get("role") != "user"
+            or not str(row.get("content") or "").strip()
+        ):
+            raise ValueError("找不到要重新生成的用户消息。")
+        selected = AgentMode(mode or row.get("mode") or self.current_mode())
+        for event in self._run_turn(
+            str(row.get("content") or ""),
+            selected,
+            cancel_event=cancel_event,
+            persist_user=False,
+            message_id=int(row["id"]),
+        ):
+            payload = dict(event)
+            payload["generation_id"] = generation_id
+            yield payload
+
+    def remember_message(self, message_id: int):
+        row = self.store.get_message(message_id)
+        if row is None or row.get("session_id") != self.session_id:
+            raise ValueError("找不到这条消息。")
+        return self.memory.remember_message(self.session_id, row)
+
+    def _run_turn(
+        self,
+        text,
+        mode,
+        cancel_event=None,
+        *,
+        persist_user=True,
+        message_id=None,
+    ):
         text = (text or "").strip()
         mode = AgentMode(mode)
         self.set_mode(mode)
@@ -458,15 +501,18 @@ class CompanionRuntime:
             return
         self._turn_recalls = []
         self.last_tool_sources = []
-        message_id = self.store.add_message(
-            self.session_id,
-            "user",
-            text,
-            mode,
-        )
-        self.affect.observe(self.session_id, message_id, text)
-        self.memory.observe_user_message(self.session_id, message_id, text)
-        self.proactive_service.on_user_message()
+        if persist_user:
+            message_id = self.store.add_message(
+                self.session_id,
+                "user",
+                text,
+                mode,
+            )
+            self.affect.observe(self.session_id, message_id, text)
+            self.memory.observe_user_message(self.session_id, message_id, text)
+            self.proactive_service.on_user_message()
+        elif message_id is None:
+            message_id = self.store.last_user_message_id(self.session_id)
 
         proposal = None
         receipt = None

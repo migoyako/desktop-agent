@@ -10,12 +10,7 @@ from pathlib import Path
 from .theme import normalize_font_scale, normalize_theme
 
 
-def clamp_position(x, y, width, height, screens):
-    """Keep a window inside the nearest available screen rectangle."""
-    screens = [tuple(int(value) for value in screen) for screen in screens]
-    if not screens:
-        return int(x), int(y)
-
+def _nearest_screen(x, y, width, height, screens):
     def overlap(screen):
         sx, sy, sw, sh = screen
         left = max(sx, x)
@@ -34,11 +29,41 @@ def clamp_position(x, y, width, height, screens):
             return abs(sx + sw / 2 - center_x) + abs(sy + sh / 2 - center_y)
 
         best = min(screens, key=distance)
+    return best
 
-    sx, sy, sw, sh = best
+
+def clamp_position(x, y, width, height, screens):
+    """Keep a window inside the nearest available screen rectangle."""
+    screens = [tuple(int(value) for value in screen) for screen in screens]
+    if not screens:
+        return int(x), int(y)
+
+    sx, sy, sw, sh = _nearest_screen(x, y, width, height, screens)
     max_x = sx + max(0, sw - width)
     max_y = sy + max(0, sh - height)
     return max(sx, min(int(x), max_x)), max(sy, min(int(y), max_y))
+
+
+def snap_to_edges(x, y, width, height, screens, threshold=24):
+    """Pull a dropped window flush to a screen edge; leaves other axes alone."""
+    x, y = int(x), int(y)
+    screens = [tuple(int(value) for value in screen) for screen in screens]
+    if not screens:
+        return x, y
+    sx, sy, sw, sh = _nearest_screen(x, y, width, height, screens)
+    left = sx
+    right = sx + max(0, sw - width)
+    top = sy
+    bottom = sy + max(0, sh - height)
+    if abs(x - left) <= threshold:
+        x = left
+    elif abs(x - right) <= threshold:
+        x = right
+    if abs(y - top) <= threshold:
+        y = top
+    elif abs(y - bottom) <= threshold:
+        y = bottom
+    return x, y
 
 
 class UiStateStore:
@@ -94,6 +119,12 @@ class UiStateStore:
 
     def set_overlay_visible(self, visible):
         return self.set(overlay_visible=bool(visible))
+
+    def overlay_collapsed(self):
+        return bool(self.load().get("overlay_collapsed", False))
+
+    def set_overlay_collapsed(self, collapsed):
+        return self.set(overlay_collapsed=bool(collapsed))
 
     def active_session(self):
         value = self.load().get("active_session")

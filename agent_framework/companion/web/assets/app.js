@@ -14,6 +14,7 @@
     wsCard: $("#wsCard"),
     newTask: $("#newTask"),
     openSettings: $("#openSettings"),
+    railToggle: $("#railToggle"),
     topbar: $("#topbar"),
     menuBtn: $("#menuBtn"),
     avatarSlot: $("#avatarSlot"),
@@ -32,6 +33,9 @@
     runSteps: $("#runSteps"),
     runStepsToggle: $("#runStepsToggle"),
     stopRun: $("#stopRun"),
+    queueDock: $("#queueDock"),
+    queueCount: $("#queueCount"),
+    queueList: $("#queueList"),
     pills: $("#pills"),
     input: $("#input"),
     count: $("#count"),
@@ -56,18 +60,28 @@
     stream: null,
     streamText: "",
     streamTools: [],
+    queue: [],
+    queueSeq: 0,
+    queueEpoch: 0,
+    queueSession: "",
+    flushing: false,
     tab: "执行",
     stick: true,
     draftTimer: 0,
     elapsedTimer: 0,
     inspectorOpen: true,
     railDrawer: false,
+    railCollapsed: false,
     inspectorDrawer: false,
     filter: "",
     host: null,
   };
 
   const COMMANDS = ["minimize", "hide"];
+
+  // A run owns the session until it ends, so extra input waits here instead of
+  // being rejected; five is enough to cover "I thought of three more things".
+  const QUEUE_LIMIT = 5;
 
   const EMPTY = {
     chat: {
@@ -177,30 +191,8 @@
 
   // ---------- avatar ----------
 
-  function avatarSvg(size, mood) {
-    const warm = ["warm", "positive", "happy"].includes(mood);
-    const low = ["low", "tired", "concerned"].includes(mood);
-    const eyeY = low ? 55 : 51;
-    const mouth = warm
-      ? '<path d="M64 64 q11 12 22 0" fill="none" stroke="var(--avatar-ink)" stroke-width="3" stroke-linecap="round"/>'
-      : low
-      ? '<path d="M66 69 h18" stroke="var(--avatar-ink)" stroke-width="3" stroke-linecap="round"/>'
-      : '<path d="M65 64 q10 8 20 0" fill="none" stroke="var(--avatar-ink)" stroke-width="3" stroke-linecap="round"/>';
-    return `<svg class="avatar" width="${size}" height="${size}" viewBox="0 0 150 150" aria-hidden="true">
-      <ellipse cx="75" cy="126" rx="44" ry="10" fill="rgba(0,0,0,.22)"/>
-      <line x1="75" y1="20" x2="75" y2="10" stroke="var(--accent)" stroke-width="4" stroke-linecap="round"/>
-      <circle cx="75" cy="7" r="6" fill="var(--accent)"/>
-      <rect x="39" y="58" width="72" height="62" rx="25" fill="var(--avatar-body)" stroke="var(--avatar-outline)" stroke-width="2"/>
-      <ellipse cx="75" cy="52" rx="38" ry="34" fill="var(--avatar-body)" stroke="var(--avatar-outline)" stroke-width="2"/>
-      <circle cx="61" cy="${eyeY}" r="4.5" fill="var(--avatar-ink)"/>
-      <circle cx="89" cy="${eyeY}" r="4.5" fill="var(--avatar-ink)"/>
-      ${mouth}
-      <line x1="42" y1="76" x2="30" y2="96" stroke="var(--accent)" stroke-width="4" stroke-linecap="round"/>
-      <line x1="108" y1="76" x2="120" y2="96" stroke="var(--accent)" stroke-width="4" stroke-linecap="round"/>
-      <line x1="58" y1="118" x2="54" y2="130" stroke="var(--accent)" stroke-width="4" stroke-linecap="round"/>
-      <line x1="92" y1="118" x2="96" y2="130" stroke="var(--accent)" stroke-width="4" stroke-linecap="round"/>
-    </svg>`;
-  }
+  // Artwork lives in avatar.js so the header slot and the desktop overlay draw
+  // the same figure; this page only chooses the size and the CSS class.
 
   // ---------- markdown ----------
 
@@ -283,7 +275,12 @@
     if (!state.data) return;
     const data = state.data;
     el.personaName.textContent = data.persona.name || "数字分身";
-    el.avatarSlot.innerHTML = avatarSvg(34, (data.affect.agent || {}).mood_label || "calm");
+    CompanionAvatar.mount(
+      el.avatarSlot,
+      34,
+      (data.affect.agent || {}).mood_label || "calm",
+      "avatar"
+    );
     const status = data.status || {};
     el.personaState.textContent = shortState(status);
     el.personaState.className = "pill state " + (status.state === "awaiting_confirmation" ? "accent" : "");
@@ -317,8 +314,10 @@
     const data = state.data;
     const workspace = data.workspace || "";
     el.wsCard.innerHTML = workspace
-      ? `<span aria-hidden="true">◫</span><span class="path" title="${escapeHtml(workspace)}">${escapeHtml(workspace)}</span><button data-act="clear-ws" title="取消工作区" aria-label="取消工作区">×</button>`
-      : `<span aria-hidden="true">◫</span><span class="path">未授权工作区</span><button data-act="pick-ws" title="选择目录" aria-label="选择工作区目录">＋</button>`;
+      ? `<span aria-hidden="true">◫</span><span class="path" title="${escapeHtml(workspace)}">${escapeHtml(workspace)}</span>` +
+        `<span class="acts"><button data-act="clear-ws" title="取消工作区" aria-label="取消工作区">×</button></span>`
+      : `<span aria-hidden="true">◫</span><span class="path">未授权工作区</span>` +
+        `<span class="acts"><button data-act="pick-ws" title="选择目录" aria-label="选择工作区目录">＋</button></span>`;
 
     const filter = state.filter.trim().toLowerCase();
     const sessions = (data.sessions || []).filter(
@@ -338,7 +337,9 @@
       parts.push(`<div class="group-title"><span>${label}</span><span>${items.length}</span></div>`);
       for (const item of items) {
         const active = item.id === data.session_id;
+        const glyph = Array.from((item.title || "").trim())[0] || "·";
         parts.push(`<button class="session ${active ? "on" : ""}" data-session="${escapeHtml(item.id)}" title="${escapeHtml(item.title)}"${active ? ' aria-current="true"' : ""}>
+          <span class="glyph" aria-hidden="true">${escapeHtml(glyph)}</span>
           ${item.pinned ? '<span class="pin" role="img" aria-label="已置顶">★</span>' : ""}
           <span class="title">${escapeHtml(item.title)}</span>
           <span class="meta">${clock(item.last_at) || ""}${item.message_count ? " · " + item.message_count + " 条" : ""}${item.unread && !active ? '<span class="dot" role="img" aria-label="有未读消息"></span>' : ""}</span>
@@ -348,48 +349,211 @@
     el.sessionList.innerHTML = parts.join("") || '<div class="empty-note">还没有会话</div>';
   }
 
+  function messageActionIds(block) {
+    const actions = (state.data && state.data.message_actions) || {};
+    return {
+      regenerate: Number(actions.regenerate_id) === block.id,
+      source: Number(actions.source_id) === block.id,
+    };
+  }
+
+  function messageActionsHtml(block) {
+    const ids = messageActionIds(block);
+    return (
+      `<button class="copy" data-copy="${escapeHtml(block.text)}">复制</button>` +
+      (ids.regenerate
+        ? `<button class="msg-act" type="button" data-msg-act="regenerate" data-act-mid="${block.id}" title="用同一条消息重新生成回复">重新生成</button>`
+        : "") +
+      `<button class="msg-act" type="button" data-msg-act="remember" data-act-mid="${block.id}" title="把这条内容保存为长期记忆">存为记忆</button>` +
+      (ids.source
+        ? `<button class="msg-act" type="button" data-msg-act="source" data-act-mid="${block.id}" title="查看这轮回复引用的来源">跳转来源</button>`
+        : "")
+    );
+  }
+
+  function messageActionsSignature(block) {
+    const ids = messageActionIds(block);
+    return (ids.regenerate ? "r" : "") + (ids.source ? "s" : "");
+  }
+
   function messageRow(block) {
     const mine = block.role === "user";
     const name = mine ? "你" : state.data.persona.name;
-    return `<div class="msg ${mine ? "me" : "ag"}">
+    return `<div class="msg ${mine ? "me" : "ag"}" data-mid="${block.id}">
       <div class="bubble">
-        <div class="meta"><span>${escapeHtml(name)} ${clock(block.created_at)}</span><button class="copy" data-copy="${escapeHtml(block.text)}">复制</button></div>
+        <div class="meta"><span>${escapeHtml(name)} ${clock(block.created_at)}</span><span class="msg-actions">${messageActionsHtml(block)}</span></div>
         <div class="body">${markdown(block.text)}</div>
       </div>
+      <span class="tail" aria-hidden="true"></span>
     </div>`;
+  }
+
+  function elementFrom(html) {
+    const template = document.createElement("template");
+    template.innerHTML = html.trim();
+    return template.content.firstElementChild;
+  }
+
+  function messageNode(block) {
+    const node = elementFrom(messageRow(block));
+    node.dataset.key = "m:" + block.id;
+    node.dataset.text = block.text;
+    node.dataset.actions = messageActionsSignature(block);
+    decorateCode(node);
+    return node;
+  }
+
+  function updateMessageActions(node, block) {
+    const slot = $(".meta .msg-actions", node);
+    if (!slot) return;
+    slot.innerHTML = messageActionsHtml(block);
+    node.dataset.actions = messageActionsSignature(block);
+  }
+
+  function updateMessageText(node, text) {
+    const body = $(".body", node);
+    if (!body) return;
+    body.innerHTML = markdown(text);
+    decorateCode(body);
+    node.dataset.text = text;
+    const copy = $("[data-copy]", node);
+    if (copy) copy.dataset.copy = text;
+  }
+
+  function keyedNodes(container) {
+    const nodes = new Map();
+    for (const child of Array.from(container.children)) {
+      if (child.dataset.key) nodes.set(child.dataset.key, child);
+    }
+    return nodes;
+  }
+
+  function removeStale(container, nodes, desired) {
+    const keep = new Set(desired);
+    for (const [key, node] of nodes) {
+      if (!keep.has(key) && node.parentNode === container) node.remove();
+    }
+  }
+
+  function orderNodes(container, nodes, desired) {
+    desired.forEach((key, index) => {
+      const node = nodes.get(key);
+      const at = container.children[index];
+      if (node && at !== node) container.insertBefore(node, at || null);
+    });
+  }
+
+  // The transcript is reconciled by message id: history nodes are reused as-is,
+  // so a refresh only appends what is new instead of rebuilding every bubble.
+  function syncMessages(container, messages) {
+    const nodes = keyedNodes(container);
+    const desired = [];
+    let lastDay = "";
+    for (const block of messages) {
+      const day = dayLabel(block.created_at);
+      if (day !== lastDay) {
+        const key = "day:" + block.id;
+        if (!nodes.has(key)) {
+          const divider = document.createElement("div");
+          divider.className = "day";
+          divider.dataset.key = key;
+          divider.textContent = day;
+          nodes.set(key, divider);
+        }
+        desired.push(key);
+        lastDay = day;
+      }
+      const key = "m:" + block.id;
+      let node = nodes.get(key);
+      if (!node) {
+        node = messageNode(block);
+        nodes.set(key, node);
+      } else if (node.dataset.text !== block.text) {
+        updateMessageText(node, block.text);
+      }
+      if (node.dataset.actions !== messageActionsSignature(block)) {
+        updateMessageActions(node, block);
+      }
+      desired.push(key);
+    }
+    removeStale(container, nodes, desired);
+    orderNodes(container, nodes, desired);
+  }
+
+  function approvalNode(view) {
+    const node = elementFrom(approvalHtml(view));
+    node.dataset.key = "a:" + view.action_id;
+    node.dataset.signature = view.status + "|" + (view.expired ? "1" : "0");
+    return node;
+  }
+
+  function syncApprovals(container, approvals) {
+    const nodes = keyedNodes(container);
+    const desired = [];
+    for (const view of approvals) {
+      const key = "a:" + view.action_id;
+      const signature = view.status + "|" + (view.expired ? "1" : "0");
+      let node = nodes.get(key);
+      if (!node || node.dataset.signature !== signature) {
+        const fresh = approvalNode(view);
+        if (node && node.parentNode === container) node.replaceWith(fresh);
+        nodes.set(key, fresh);
+        node = fresh;
+      }
+      desired.push(key);
+    }
+    removeStale(container, nodes, desired);
+    orderNodes(container, nodes, desired);
+  }
+
+  function chatSlots() {
+    let list = $("#msgList", el.chatInner);
+    if (!list) {
+      el.chatInner.innerHTML =
+        '<div id="chatEmpty" class="empty" hidden></div>' +
+        '<div id="msgList"></div>' +
+        '<div id="approvalList"></div>' +
+        '<div id="toolStack"></div>' +
+        '<div id="streamSlot" aria-live="polite"></div>';
+      list = $("#msgList", el.chatInner);
+    }
+    return {
+      empty: $("#chatEmpty", el.chatInner),
+      list,
+      approvals: $("#approvalList", el.chatInner),
+      tools: $("#toolStack", el.chatInner),
+      stream: $("#streamSlot", el.chatInner),
+    };
+  }
+
+  function renderEmpty(container, data) {
+    const show = !data.messages.length && !data.approvals.length && !state.stream;
+    container.hidden = !show;
+    if (!show) return;
+    const mode = data.mode === "work" ? EMPTY.work : EMPTY.chat;
+    const signature = data.mode + "\u0000" + (data.persona.name || "");
+    if (container.dataset.signature === signature) return;
+    container.dataset.signature = signature;
+    container.innerHTML = `
+      <h2>${mode.title}</h2>
+      <p>${escapeHtml(mode.body(data.persona.name))}</p>
+      <div class="prompts">${mode.prompts.map((text) => `<button data-prompt="${escapeHtml(text)}">${escapeHtml(text)}</button>`).join("")}</div>`;
   }
 
   function renderChat() {
     const data = state.data;
+    if (!data) return;
     const stick = state.stick;
-    const parts = [];
-    let lastDay = "";
-    if (!data.messages.length && !data.approvals.length && !state.stream) {
-      const mode = data.mode === "work" ? EMPTY.work : EMPTY.chat;
-      parts.push(`<div class="empty">
-        <h2>${mode.title}</h2>
-        <p>${escapeHtml(mode.body(data.persona.name))}</p>
-        <div class="prompts">${mode.prompts.map((text) => `<button data-prompt="${escapeHtml(text)}">${escapeHtml(text)}</button>`).join("")}</div>
-      </div>`);
-    }
-    for (const block of data.messages) {
-      const day = dayLabel(block.created_at);
-      if (day !== lastDay) {
-        parts.push(`<div class="day">${escapeHtml(day)}</div>`);
-        lastDay = day;
-      }
-      parts.push(messageRow(block));
-    }
-    for (const approval of data.approvals) {
-      parts.push(approvalHtml(approval));
-    }
-    parts.push('<div id="toolStack"></div>');
-    parts.push('<div id="streamSlot" aria-live="polite"></div>');
-    el.chatInner.innerHTML = parts.join("");
-    decorateCode(el.chatInner);
+    const slots = chatSlots();
+    renderEmpty(slots.empty, data);
+    syncMessages(slots.list, data.messages);
+    syncApprovals(slots.approvals, data.approvals);
     if (state.stream) {
       ensureStream();
       renderTools();
+    } else {
+      if (slots.stream.firstChild) slots.stream.replaceChildren();
+      if (slots.tools.firstChild) slots.tools.replaceChildren();
     }
     if (stick) requestAnimationFrame(() => scrollBottom());
   }
@@ -503,11 +667,10 @@
 
   function renderPills() {
     const data = state.data;
-    const workspace = data.workspace ? shortPath(data.workspace) : "选择工作区";
     const context = contextView();
+    // Mode and workspace live in exactly one place each: the top segmented
+    // control and the rail's workspace row. The composer only adds read-outs.
     const pills = [
-      `<button data-pill="mode" title="切换模式">${data.mode === "work" ? "工作" : "陪伴"}</button>`,
-      `<button data-pill="workspace" title="${escapeHtml(data.workspace || "选择工作区")}">${escapeHtml(workspace)}</button>`,
       context
         ? `<button data-pill="context" class="gauge ${context.level}" style="--percent: ${context.percent}"` +
           ` title="上下文 ${context.used} / ${context.limit} 字符${context.compressed ? "（历史已压缩）" : ""}">` +
@@ -517,6 +680,7 @@
       data.approvals.length ? `<button data-pill="approval" class="danger-text">待确认 ${data.approvals.length}</button>` : "",
     ];
     el.pills.innerHTML = pills.join("");
+    el.pills.hidden = !pills.some(Boolean);
     if (context) {
       const button = el.pills.querySelector("[data-pill=context]");
       if (button) button.setAttribute("aria-label", `上下文用量 ${context.percent}%，点击查看组成`);
@@ -537,12 +701,6 @@
       compressed: Boolean(context.compressed),
       level: percent >= 90 ? "danger" : percent >= 70 ? "warning" : "ok",
     };
-  }
-
-  function shortPath(path) {
-    const parts = String(path).split(/[\\/]/).filter(Boolean);
-    if (parts.length <= 2) return parts.join(" / ") || path;
-    return parts.slice(-2).join(" / ");
   }
 
   function renderStatus() {
@@ -575,6 +733,14 @@
     document.body.classList.toggle("compact", width < 780);
     el.menuBtn.classList.toggle("show", railAuto);
     el.rail.classList.toggle("hidden", railAuto ? !state.railDrawer : false);
+    // The drawer always shows full labels; the icon state only exists inline.
+    const collapsed = !railAuto && state.railCollapsed;
+    el.rail.classList.toggle("collapsed", collapsed);
+    el.railToggle.hidden = railAuto;
+    el.railToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    el.railToggle.title = collapsed ? "展开会话栏" : "收起会话栏";
+    $(".ico", el.railToggle).textContent = collapsed ? "»" : "«";
+    $(".rail-label", el.railToggle).textContent = collapsed ? "展开" : "收起";
     el.shell.classList.toggle("drawer", railAuto && state.railDrawer);
     el.scrim.classList.toggle("show", railAuto && state.railDrawer);
 
@@ -590,15 +756,16 @@
   // ---------- streaming ----------
 
   function ensureStream() {
-    const slot = $("#streamSlot");
+    const slot = chatSlots().stream;
     if (!slot) return null;
-    let row = $("#streamRow");
+    let row = $("#streamRow", slot);
     if (!row) {
       slot.innerHTML = `<div class="msg ag" id="streamRow">
         <div class="bubble streaming">
           <div class="meta"><span>${escapeHtml(state.data.persona.name)}</span><span></span></div>
           <div class="body"></div>
         </div>
+        <span class="tail" aria-hidden="true"></span>
       </div>`;
       row = $("#streamRow");
     }
@@ -611,7 +778,7 @@
   }
 
   function renderTools() {
-    const stack = $("#toolStack");
+    const stack = $("#toolStack", el.chatInner);
     if (!stack) return;
     stack.innerHTML = state.streamTools
       .map((tool) => {
@@ -776,6 +943,9 @@
     if (!data) return;
     state.data = data;
     applyUi(data.ui);
+    if (state.queue.length && state.queueSession !== data.session_id) {
+      resetQueue("已切换会话，待发队列已清空。");
+    }
     if (data.run) {
       if (data.run.run_id !== state.run) {
         state.run = data.run.run_id;
@@ -794,6 +964,7 @@
       finishRun();
     }
     render();
+    if (!state.run && state.queue.length) flushQueue();
   }
 
   let refreshTimer = 0;
@@ -832,8 +1003,8 @@
   async function sendTurn() {
     const text = el.input.value.trim();
     if (!text) return;
-    if (state.run) {
-      toast("正在生成回复，请先停止或等待完成。");
+    if (state.run || state.queue.length) {
+      enqueue(text);
       return;
     }
     el.input.value = "";
@@ -842,9 +1013,126 @@
     await guard(post("/api/turn", { text: text, mode: state.data.mode }));
   }
 
+  function enqueue(text) {
+    if (state.queue.length >= QUEUE_LIMIT) {
+      toast(`待发队列最多 ${QUEUE_LIMIT} 条，先撤回一条或等本轮结束。`);
+      return false;
+    }
+    state.queueSession = state.data.session_id;
+    state.queue.push({ id: ++state.queueSeq, text: text, session: state.queueSession });
+    el.input.value = "";
+    resizeInput();
+    updateCount();
+    saveDraft();
+    renderQueue();
+    toast(
+      state.queue.length === 1
+        ? "已加入待发队列，本轮结束后自动发送"
+        : `已加入待发队列（共 ${state.queue.length} 条）`
+    );
+    return true;
+  }
+
+  function renderQueue() {
+    const items = state.queue;
+    el.queueDock.hidden = !items.length;
+    el.queueCount.textContent = `待发 ${items.length} 条`;
+    el.queueList.innerHTML = items
+      .map(
+        (item) => `<li class="queue-item" data-queue="${item.id}">
+          <span class="text" title="${escapeHtml(item.text)}">${escapeHtml(item.text)}</span>
+          <button type="button" data-queue-edit="${item.id}" aria-label="编辑这条待发消息">编辑</button>
+          <button type="button" data-queue-drop="${item.id}" aria-label="撤回这条待发消息">撤回</button>
+        </li>`
+      )
+      .join("");
+  }
+
+  function editQueueItem(id) {
+    const index = state.queue.findIndex((item) => item.id === id);
+    if (index < 0) return;
+    const [item] = state.queue.splice(index, 1);
+    const rest = el.input.value;
+    el.input.value = item.text + (rest.trim() ? "\n" + rest : "");
+    resizeInput();
+    updateCount();
+    saveDraft();
+    renderQueue();
+    el.input.focus();
+    el.input.selectionStart = el.input.selectionEnd = el.input.value.length;
+  }
+
+  function dropQueueItem(id) {
+    const before = state.queue.length;
+    state.queue = state.queue.filter((item) => item.id !== id);
+    if (state.queue.length === before) return;
+    renderQueue();
+    toast("已撤回待发消息");
+  }
+
+  function resetQueue(notice) {
+    // The epoch invalidates a flush that is still in flight: its failure must not
+    // put the item back into a queue the session switch already emptied.
+    state.queueEpoch += 1;
+    state.queueSession = state.data ? state.data.session_id : "";
+    if (!state.queue.length) return;
+    state.queue = [];
+    renderQueue();
+    if (notice) toast(notice);
+  }
+
+  async function flushQueue() {
+    if (state.flushing || state.run || !state.queue.length) return;
+    const item = state.queue.shift();
+    const epoch = state.queueEpoch;
+    state.flushing = true;
+    renderQueue();
+    try {
+      const payload = await post("/api/turn", { text: item.text, mode: state.data.mode });
+      // The server registers the run before it answers 202, so claiming the run
+      // here keeps a bootstrap that raced the POST from flushing a second item.
+      if (payload && payload.run_id) beginRun(payload.run_id, "pending");
+    } catch (error) {
+      if (epoch === state.queueEpoch && item.session === state.data.session_id) {
+        state.queue.unshift(item);
+        renderQueue();
+        toast("待发消息没有发出去：" + (error.message || "请重试"));
+      }
+    } finally {
+      state.flushing = false;
+    }
+  }
+
   async function stopRun() {
     if (!state.run) return;
     await guard(post("/api/runs/cancel", { run_id: state.run }));
+  }
+
+  async function regenerateMessage(messageId) {
+    if (state.run) {
+      toast("当前回复结束后才能重新生成");
+      return;
+    }
+    const payload = await guard(
+      post("/api/messages/regenerate", { message_id: messageId })
+    );
+    if (payload && payload.run_id) beginRun(payload.run_id, "pending");
+  }
+
+  async function rememberMessage(messageId) {
+    const payload = await guard(
+      post("/api/console/memory", { action: "remember", message_id: messageId })
+    );
+    if (!payload) return;
+    toast(payload.created ? "已保存为长期记忆" : "这条内容已经在记忆里");
+  }
+
+  function openSources() {
+    state.tab = "来源";
+    state.inspectorOpen = true;
+    if (responsiveWidth() < 940) state.inspectorDrawer = true;
+    layout();
+    renderInspector();
   }
 
   async function switchMode(mode) {
@@ -862,14 +1150,18 @@
       layout();
       return;
     }
-    await guard(post("/api/sessions/switch", { session_id: sessionId }));
+    const data = await guard(post("/api/sessions/switch", { session_id: sessionId }));
+    if (!data) return;
+    resetQueue("已切换会话，待发队列已清空。");
     state.railDrawer = false;
     state.stick = true;
     await refresh();
   }
 
   async function newSession() {
-    await guard(post("/api/sessions/create", { mode: state.data.mode }));
+    const data = await guard(post("/api/sessions/create", { mode: state.data.mode }));
+    if (!data) return;
+    resetQueue("已新建会话，待发队列已清空。");
     state.railDrawer = false;
     state.stick = true;
     await refresh();
@@ -1002,6 +1294,10 @@
   function bind() {
     el.newTask.onclick = newSession;
     el.openSettings.onclick = openSettings;
+    el.railToggle.onclick = () => {
+      state.railCollapsed = !state.railCollapsed;
+      layout();
+    };
     el.menuBtn.onclick = () => {
       state.railDrawer = !state.railDrawer;
       layout();
@@ -1044,6 +1340,15 @@
       state.stepsOpen = !state.stepsOpen;
       renderRunSteps(state.steps);
     };
+    el.queueList.onclick = (event) => {
+      const edit = event.target.closest("[data-queue-edit]");
+      if (edit) {
+        editQueueItem(Number(edit.dataset.queueEdit));
+        return;
+      }
+      const drop = event.target.closest("[data-queue-drop]");
+      if (drop) dropQueueItem(Number(drop.dataset.queueDrop));
+    };
     el.input.addEventListener("input", () => {
       resizeInput();
       updateCount();
@@ -1074,12 +1379,27 @@
       renderRail();
     };
     el.wsCard.onclick = (event) => {
+      // The icon-only rail cannot fit the pick/clear buttons, so a click on the
+      // workspace glyph brings the labels back instead of acting blind.
+      if (el.rail.classList.contains("collapsed")) {
+        state.railCollapsed = false;
+        layout();
+        return;
+      }
       const action = event.target.closest("[data-act]");
       if (!action) return;
       if (action.dataset.act === "pick-ws") chooseWorkspace();
       else clearWorkspace();
     };
     el.chatInner.addEventListener("click", (event) => {
+      const action = event.target.closest("[data-msg-act]");
+      if (action) {
+        const messageId = Number(action.dataset.actMid);
+        if (action.dataset.msgAct === "regenerate") regenerateMessage(messageId);
+        else if (action.dataset.msgAct === "remember") rememberMessage(messageId);
+        else if (action.dataset.msgAct === "source") openSources();
+        return;
+      }
       const copy = event.target.closest("[data-copy]");
       if (copy) {
         navigator.clipboard.writeText(copy.dataset.copy).then(
@@ -1112,9 +1432,7 @@
     el.pills.onclick = (event) => {
       const pill = event.target.closest("[data-pill]");
       if (!pill) return;
-      if (pill.dataset.pill === "mode") switchMode(state.data.mode === "work" ? "chat" : "work");
-      else if (pill.dataset.pill === "workspace") chooseWorkspace();
-      else if (pill.dataset.pill === "approval") {
+      if (pill.dataset.pill === "approval") {
         const approval = $("[data-approval]");
         if (approval) approval.scrollIntoView({ block: "center", behavior: "smooth" });
       } else if (pill.dataset.pill === "context") {
@@ -1145,6 +1463,11 @@
       }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
+        // The search box is hidden in the icon-only rail; bring it back first.
+        if (el.rail.classList.contains("collapsed")) {
+          state.railCollapsed = false;
+          layout();
+        }
         el.sessionSearch.focus();
         el.sessionSearch.select();
       }

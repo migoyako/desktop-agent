@@ -176,7 +176,7 @@ class ContextGaugeTests(unittest.TestCase):
     def pill_source(self):
         script = asset("app.js")
         start = script.index("function renderPills()")
-        end = script.index("function shortPath(")
+        end = script.index("function renderStatus(")
         return script[start:end]
 
     def test_the_pills_stop_mining_display_text(self):
@@ -254,6 +254,9 @@ class RunTimelineTests(unittest.TestCase):
 
     def test_the_timeline_sizes_from_tokens(self):
         css = asset("app.css")
+        # The list is toggled through the hidden attribute, which the flex rule
+        # would otherwise override and leave the collapsed steps on screen.
+        self.assertIn("display: none", rule_block(css, ".run-steps[hidden]"))
         steps = rule_block(css, ".run-steps")
         self.assertIn("var(--ctl-bar)", steps)
         self.assertIn("var(--fs-meta)", steps)
@@ -330,8 +333,13 @@ class TypographyTests(unittest.TestCase):
 
     def test_geometric_widths_follow_spacing_not_type(self):
         # The rail and the scrollbar are furniture: at 200% they may not double
-        # and leave nothing to read with.
-        self.assertIn("var(--sp-scale)", rule_block(asset("app.css"), ".rail"))
+        # and leave nothing to read with. Both rail widths live in the token
+        # layer so the icon state cannot drift from the labelled one.
+        tokens = asset("tokens.css")
+        self.assertIn("var(--rail-w)", rule_block(asset("app.css"), ".rail"))
+        self.assertIn("var(--rail-w-collapsed)", rule_block(asset("app.css"), ".rail.collapsed"))
+        for name in ("--rail-w", "--rail-w-collapsed"):
+            self.assertIn("var(--sp-scale)", re.search(re.escape(name) + r":\s*([^;]+);", tokens).group(1))
         self.assertIn("var(--sp-scale)", rule_block(asset("tokens.css"), "::-webkit-scrollbar"))
 
     def test_control_boxes_never_measure_from_the_display_rung(self):
@@ -377,7 +385,7 @@ class MarkdownSubsetTests(unittest.TestCase):
         script = asset("app.js")
         self.assertIn('pre.md-code', script)
         self.assertIn("button.dataset.copy = pre.textContent", script)
-        self.assertIn("decorateCode(el.chatInner)", script)
+        self.assertIn("decorateCode(node)", script)
 
     def test_tables_quotes_and_nested_lists_are_styled_from_tokens(self):
         css = asset("app.css")
@@ -390,6 +398,267 @@ class MarkdownSubsetTests(unittest.TestCase):
             "var(--sp-",
             rule_block(css, ".bubble .body li > ul,\n.bubble .body li > ol"),
         )
+
+
+class KeyedTranscriptTests(unittest.TestCase):
+    """M12.3 C8: the transcript is reconciled by message id, never rebuilt wholesale."""
+
+    def test_the_transcript_is_no_longer_one_innerhtml_assignment(self):
+        script = asset("app.js")
+        self.assertNotIn("el.chatInner.innerHTML = parts.join", script)
+        self.assertIn("function syncMessages(container, messages)", script)
+        self.assertIn('node.dataset.key = "m:" + block.id', script)
+        self.assertIn('data-mid="${block.id}"', script)
+
+    def test_persistent_slots_are_created_once_and_styled_from_tokens(self):
+        script = asset("app.js")
+        self.assertIn("function chatSlots()", script)
+        self.assertIn("if (!list) {", script)
+        self.assertIn("syncMessages(slots.list, data.messages)", script)
+        self.assertIn("syncApprovals(slots.approvals, data.approvals)", script)
+        css = asset("app.css")
+        slots = rule_block(
+            css, "#msgList,\n#approvalList,\n#toolStack,\n#streamSlot"
+        )
+        self.assertIn("display: flex", slots)
+        self.assertIn("flex-direction: column", slots)
+        self.assertIn("gap: var(--sp-md)", slots)
+        self.assertIn("display: none", rule_block(css, ".empty[hidden]"))
+
+    def test_only_the_stream_row_is_cleared_when_a_run_ends(self):
+        script = asset("app.js")
+        self.assertIn("slots.stream.replaceChildren()", script)
+        self.assertIn("slots.tools.replaceChildren()", script)
+        render = script[script.index("function renderChat()"):script.index("  function approvalHtml(")]
+        self.assertNotIn("chatInner.innerHTML", render)
+
+    def test_changed_text_updates_the_bubble_in_place(self):
+        script = asset("app.js")
+        update = script[script.index("function updateMessageText("):script.index("function keyedNodes(")]
+        self.assertIn("body.innerHTML = markdown(text)", update)
+        self.assertIn("decorateCode(body)", update)
+        self.assertIn("node.dataset.text = text", update)
+
+
+class PendingQueueTests(unittest.TestCase):
+    """M12.3 C5: input typed during a run waits in a dock, FIFO, instead of being refused."""
+
+    def test_the_dock_sits_between_the_run_strip_and_the_pills(self):
+        index = asset("index.html")
+        self.assertGreater(index.index('id="queueDock"'), index.index('id="runStrip"'))
+        self.assertLess(index.index('id="queueDock"'), index.index('id="pills"'))
+        self.assertIn('id="queueDock" aria-label="待发消息队列" hidden', index)
+        self.assertIn('id="queueCount"', index)
+        self.assertIn('id="queueList"', index)
+
+    def test_a_busy_composer_queues_instead_of_refusing(self):
+        script = asset("app.js")
+        send = script[script.index("async function sendTurn("):script.index("function enqueue(")]
+        self.assertIn("if (state.run || state.queue.length)", send)
+        self.assertIn("enqueue(text)", send)
+        self.assertNotIn("请先停止或等待完成", script)
+        self.assertIn("const QUEUE_LIMIT = 5", script)
+        self.assertIn("state.queue.length >= QUEUE_LIMIT", script)
+
+    def test_the_queue_drains_one_turn_per_run_and_keeps_failed_items(self):
+        script = asset("app.js")
+        flush = script[script.index("async function flushQueue("):script.index("async function stopRun(")]
+        self.assertIn("state.queue.shift()", flush)
+        self.assertIn('post("/api/turn"', flush)
+        self.assertIn("beginRun(payload.run_id", flush)
+        self.assertIn("state.queue.unshift(item)", flush)
+        self.assertIn("state.flushing = false", flush)
+        refresh = script[script.index("async function refresh()"):script.index("let refreshTimer")]
+        self.assertIn("if (!state.run && state.queue.length) flushQueue();", refresh)
+
+    def test_items_can_be_withdrawn_and_edited(self):
+        script = asset("app.js")
+        edit = script[script.index("function editQueueItem("):script.index("function dropQueueItem(")]
+        self.assertIn("state.queue.splice(index, 1)", edit)
+        self.assertIn("el.input.value = item.text", edit)
+        self.assertIn("el.input.focus()", edit)
+        drop = script[script.index("function dropQueueItem("):script.index("function resetQueue(")]
+        self.assertIn("state.queue.filter((item) => item.id !== id)", drop)
+        self.assertIn('data-queue-edit="${item.id}"', script)
+        self.assertIn('data-queue-drop="${item.id}"', script)
+
+    def test_switching_sessions_clears_the_queue_with_a_notice(self):
+        script = asset("app.js")
+        switch = script[script.index("async function switchSession("):script.index("async function newSession(")]
+        self.assertIn('resetQueue("已切换会话，待发队列已清空。")', switch)
+        self.assertIn("if (!data) return;", switch)
+        create = script[script.index("async function newSession("):script.index("function openSettings(")]
+        self.assertIn('resetQueue("已新建会话，待发队列已清空。")', create)
+        reset = script[script.index("function resetQueue("):script.index("async function flushQueue(")]
+        self.assertIn("state.queue = []", reset)
+        self.assertIn("renderQueue()", reset)
+        self.assertIn("state.queueEpoch += 1", reset)
+        refresh = script[script.index("async function refresh()"):script.index("let refreshTimer")]
+        self.assertIn("state.queueSession !== data.session_id", refresh)
+
+    def test_the_dock_sizes_from_tokens(self):
+        css = asset("app.css")
+        self.assertIn("var(--sp-", rule_block(css, ".queue-dock"))
+        self.assertIn("display: none", rule_block(css, ".queue-dock[hidden]"))
+        queue_list = rule_block(css, ".queue-list")
+        for token in ("var(--ctl-ghost)", "var(--sp-xs)", "overflow-y: auto", "list-style: none"):
+            self.assertIn(token, queue_list)
+        short = css[css.index("@media (max-height: 640px)") :]
+        self.assertIn(".queue-list {\n    max-height: var(--ctl-ghost);", short)
+        self.assertIn(".statusbar {\n    display: none;", short)
+        item = rule_block(css, ".queue-item button")
+        for token in ("var(--ctl-ghost)", "var(--fs-caption)", "var(--radius-pill)"):
+            self.assertIn(token, item)
+
+
+class MessageActionTests(unittest.TestCase):
+    """M12.3 C3: bubble actions stay scoped to the rows the service allows."""
+
+    def test_actions_follow_the_projection_ids(self):
+        script = asset("app.js")
+        ids = script[
+            script.index("function messageActionIds("):script.index("function messageActionsHtml(")
+        ]
+        self.assertIn("state.data.message_actions", ids)
+        self.assertIn("regenerate_id", ids)
+        self.assertIn("source_id", ids)
+        actions = script[
+            script.index("function messageActionsHtml("):script.index("function messageRow(")
+        ]
+        self.assertIn('data-msg-act="regenerate"', actions)
+        self.assertIn("(ids.regenerate", actions)
+        self.assertIn('data-msg-act="remember"', actions)
+        self.assertIn("(ids.source", actions)
+        self.assertIn('data-msg-act="source"', actions)
+
+    def test_regenerate_posts_then_joins_the_started_run(self):
+        script = asset("app.js")
+        body = script[
+            script.index("async function regenerateMessage("):script.index("async function rememberMessage(")
+        ]
+        self.assertIn('post("/api/messages/regenerate", { message_id: messageId })', body)
+        self.assertIn('beginRun(payload.run_id, "pending")', body)
+        self.assertIn("if (state.run)", body)
+
+    def test_remember_reuses_the_memory_console_endpoint(self):
+        script = asset("app.js")
+        body = script[
+            script.index("async function rememberMessage("):script.index("function openSources(")
+        ]
+        self.assertIn('post("/api/console/memory", { action: "remember", message_id: messageId })', body)
+        self.assertIn("已保存为长期记忆", body)
+
+    def test_source_jumps_to_the_evidence_tab(self):
+        script = asset("app.js")
+        body = script[
+            script.index("function openSources("):script.index("async function switchMode(")
+        ]
+        self.assertIn('state.tab = "来源"', body)
+        self.assertIn("state.inspectorOpen = true", body)
+        self.assertIn("layout()", body)
+        self.assertIn("renderInspector()", body)
+
+    def test_actions_rebuild_when_the_projection_changes(self):
+        script = asset("app.js")
+        node = script[
+            script.index("function messageNode("):script.index("function updateMessageText(")
+        ]
+        self.assertIn("node.dataset.actions = messageActionsSignature(block)", node)
+        sync = script[
+            script.index("function syncMessages("):script.index("function approvalNode(")
+        ]
+        self.assertIn("updateMessageActions(node, block)", sync)
+
+    def test_actions_hide_until_the_bubble_is_reached(self):
+        css = asset("app.css")
+        actions = rule_block(css, ".bubble .meta .msg-actions")
+        self.assertIn("display: flex", actions)
+        self.assertIn("flex-wrap: wrap", actions)
+        self.assertIn(".bubble .meta .msg-act {\n  opacity: 0;", css)
+        reveal = css[css.index(".msg:focus-within .bubble .meta .msg-act") :]
+        self.assertIn("opacity: 1", reveal[:80])
+        self.assertIn("@media (hover: none)", css)
+        self.assertIn(".bubble .meta .msg-act {\n    opacity: 1;", css)
+
+
+class OverlayCapabilityTests(unittest.TestCase):
+    """M12.4: one avatar mount point, a real menu, and pushed updates."""
+
+    def test_avatar_art_lives_in_one_module(self):
+        script = asset("avatar.js")
+        self.assertIn("global.CompanionAvatar", script)
+        for name in ("group: group", "mount: mount", "svg: svg"):
+            self.assertIn(name, script)
+        for name in ("app.js", "overlay.js"):
+            with self.subTest(script=name):
+                page = asset(name)
+                self.assertNotIn("function avatarSvg", page)
+                self.assertIn("CompanionAvatar.mount", page)
+        for name in ("index.html", "overlay.html"):
+            markup = asset(name)
+            scripts = re.findall(r'<script src="([^"]+)"', markup)
+            self.assertIn("/assets/avatar.js", scripts)
+            page_script = "/assets/app.js" if name == "index.html" else "/assets/overlay.js"
+            self.assertLess(scripts.index("/assets/avatar.js"), scripts.index(page_script))
+
+    def test_avatar_moods_match_the_affect_labels(self):
+        script = asset("avatar.js")
+        warm = re.search(r"const WARM = \[([^\]]+)\]", script).group(1)
+        low = re.search(r"const LOW = \[([^\]]+)\]", script).group(1)
+        self.assertIn('"warm"', warm)
+        self.assertIn('"positive"', warm)
+        for label in ("low", "tired", "concerned"):
+            self.assertIn('"' + label + '"', low)
+        self.assertNotIn("happy", script)
+        affect = (ASSETS.parent.parent.parent / "companion" / "affect.py").read_text(encoding="utf-8")
+        for label in ("warm", "positive", "low", "tired", "concerned"):
+            self.assertIn('"' + label + '"', affect)
+
+    def test_context_menu_offers_the_four_actions(self):
+        markup = asset("overlay.html")
+        self.assertIn('role="menu"', markup)
+        for action in ("chat", "toggle-main", "dnd", "hide"):
+            self.assertIn('data-menu="{}"'.format(action), markup)
+        script = asset("overlay.js")
+        self.assertIn("openMenu(event.clientX, event.clientY)", script)
+        self.assertIn('state.host.toggleMain()', script)
+        self.assertIn('{ action: "settings", enabled: !enabled }', script)
+        self.assertIn('action: "read", event_id: item.id', script)
+
+    def test_hidden_attributes_win_over_author_display(self):
+        css = asset("overlay.css")
+        self.assertIn("[hidden] {\n  display: none !important;", css)
+        quick = rule_block(css, ".quick")
+        self.assertIn("pointer-events: none", quick)
+        reveal = css[css.index(".overlay:focus-within .quick") :]
+        self.assertIn("pointer-events: auto", reveal[:120])
+
+    def test_collapsed_state_is_visual_and_persisted(self):
+        css = asset("overlay.css")
+        self.assertIn("body.collapsed .overlay", css)
+        self.assertIn("--pet-size: 56px", rule_block(css, "body.collapsed .overlay"))
+        script = asset("overlay.js")
+        body = script[
+            script.index("function applyCollapsed("):script.index("function apply(")
+        ]
+        self.assertIn('document.body.classList.toggle("collapsed"', body)
+        self.assertIn("overlay_collapsed: state.collapsed", body)
+        self.assertIn('api("/api/ui"', body)
+
+    def test_overlay_subscribes_to_events_and_polls_only_as_fallback(self):
+        script = asset("overlay.js")
+        self.assertIn('new EventSource("/api/events?t="', script)
+        self.assertIn('payload.type === "refresh" || payload.type === "ui"', script)
+        self.assertIn("if (!state.live) refresh();", script)
+        self.assertNotIn("setInterval(refresh, 8000)", script)
+
+    def test_proactive_bubbles_are_queued_one_at_a_time(self):
+        script = asset("overlay.js")
+        self.assertIn("const BUBBLE_MS = 9000;", script)
+        self.assertIn("const QUEUE_LIMIT = 3;", script)
+        self.assertIn("state.timer = setTimeout(acknowledge, BUBBLE_MS);", script)
+        self.assertIn("if (state.kind === \"proactive\") acknowledge();", script)
+        self.assertIn('state.seen.add(event.id)', script)
 
 
 if __name__ == "__main__":

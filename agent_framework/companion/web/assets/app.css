@@ -2,23 +2,107 @@
   display: flex;
   height: 100vh;
   width: 100vw;
-  background: var(--page);
+  /* The first layer is the M13.2 wash seam; it stays transparent until then. */
+  background:
+    linear-gradient(var(--bg-scrim), var(--bg-scrim)),
+    var(--page);
 }
 
 /* ---------- rail ---------- */
 
 .rail {
-  width: min(calc(208px * var(--sp-scale)), 42vw);
+  width: var(--rail-w);
   flex: none;
   display: flex;
   flex-direction: column;
-  background: var(--workspace);
+  background: linear-gradient(170deg, var(--rail-a), var(--rail-b));
   border-right: 1px solid var(--border);
   min-height: 0;
+  transition: width 0.26s ease;
 }
 
 .rail.hidden {
   display: none;
+}
+
+.rail.collapsed {
+  width: var(--rail-w-collapsed);
+}
+
+.rail.collapsed .rail-head {
+  padding-inline: var(--sp-sm);
+}
+
+.rail.collapsed .new-task,
+.rail.collapsed .ws-card,
+.rail.collapsed .rail-foot .ghost {
+  justify-content: center;
+  padding-inline: 0;
+}
+
+.rail.collapsed .rail-label,
+.rail.collapsed .rail-search,
+.rail.collapsed .ws-card .path,
+.rail.collapsed .ws-card .acts,
+.rail.collapsed .session .title,
+.rail.collapsed .session .meta,
+.rail.collapsed .session .pin,
+.rail.collapsed .group-title span {
+  display: none;
+}
+
+.rail-label {
+  transition: opacity 0.18s ease;
+}
+
+.rail.collapsed .group-title {
+  justify-content: center;
+  padding-inline: 0;
+}
+
+.rail.collapsed .ws-card {
+  cursor: pointer;
+}
+
+.rail.collapsed .session,
+.rail.collapsed .session.on {
+  width: var(--ctl-row);
+  margin-inline: auto;
+  padding: var(--sp-sm) var(--sp-xs);
+  align-items: center;
+  /* The glyph carries the selected state; a second tinted card would muddy it. */
+  background: transparent;
+}
+
+.session .glyph {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--ctl-row);
+  height: var(--ctl-row);
+  border-radius: 50%;
+  background: var(--hover);
+  color: var(--muted);
+  font-size: var(--fs-caption);
+  flex: none;
+}
+
+.rail.collapsed .session .glyph {
+  display: flex;
+}
+
+.rail.collapsed .session:hover .glyph {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.rail.collapsed .session.on .glyph {
+  background: var(--accent-tint);
+  color: var(--accent-soft);
+}
+
+.rail.collapsed ::-webkit-scrollbar {
+  width: 0;
 }
 
 .rail-head {
@@ -193,12 +277,16 @@
 }
 
 .rail-foot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-xs);
   padding: var(--sp-md) var(--sp-md) var(--sp-lg);
   border-top: 1px solid var(--border);
 }
 
 .rail-foot .ghost {
   width: 100%;
+  gap: var(--sp-sm);
   justify-content: flex-start;
   text-align: left;
   border-color: transparent;
@@ -209,6 +297,11 @@
   background: var(--hover);
 }
 
+.rail-foot .ico {
+  flex: none;
+  line-height: var(--lh-meta);
+}
+
 /* ---------- main column ---------- */
 
 .main {
@@ -216,7 +309,8 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  background: var(--page);
+  /* No colour of its own: the shell paints the page and the M13.2 image. */
+  background: none;
   position: relative;
 }
 
@@ -228,6 +322,8 @@
   gap: var(--sp-md);
   padding: 0 var(--sp-xl);
   border-bottom: 1px solid var(--border);
+  background: var(--surface-glass);
+  backdrop-filter: blur(var(--blur)) saturate(1.15);
 }
 
 .menu-btn {
@@ -347,6 +443,22 @@ body.compact .who .state {
   gap: var(--sp-md);
 }
 
+/* Persistent transcript slots: rows are keyed inside these, never rebuilt wholesale. */
+#msgList,
+#approvalList,
+#toolStack,
+#streamSlot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-md);
+}
+
+/* Each bubble row carries the tail inside its own padding; the gap is trimmed
+   so the visible distance between bubbles stays --sp-md. */
+#msgList {
+  gap: calc(var(--sp-md) - var(--bubble-tail));
+}
+
 .day {
   align-self: center;
   margin: var(--sp-md) 0 var(--sp-xs);
@@ -355,25 +467,57 @@ body.compact .who .state {
 }
 
 .msg {
+  /* The tail is a sibling of the bubble, not a pseudo-element: an absolutely
+     positioned bubble child would count as bubble overflow in the audit and in
+     the browser's scroll metrics. Padding here gives the diamond its room; the
+     list gap is trimmed by the same amount so the rhythm does not change. */
+  --bubble-fill: var(--bubble-agent);
+  --bubble-line: var(--bubble-agent-border);
   display: flex;
+  position: relative;
+  padding-bottom: var(--bubble-tail);
 }
 
 .msg.me {
+  --bubble-fill: var(--bubble-user);
+  --bubble-line: var(--bubble-user-border);
   justify-content: flex-end;
 }
 
+.msg .tail {
+  position: absolute;
+  bottom: calc(var(--bubble-tail) * 0.25);
+  left: var(--sp-md);
+  width: var(--bubble-tail);
+  height: var(--bubble-tail);
+  border-right: 1px solid var(--bubble-line);
+  border-bottom: 1px solid var(--bubble-line);
+  background: var(--bubble-fill);
+  transform: rotate(45deg);
+}
+
+.msg.me .tail {
+  left: auto;
+  right: var(--sp-md);
+  border-right: 0;
+  border-left: 1px solid var(--bubble-line);
+  transform: rotate(-45deg);
+}
+
 .bubble {
-  max-width: 74%;
+  /* Asymmetric corners: the square corner and the tail sit on the side the
+     bubble grows from, mirrored for the user. */
+  position: relative;
+  max-width: min(100%, var(--content-measure));
   min-width: 0;
   padding: var(--sp-md) var(--sp-lg);
-  border-radius: var(--radius-md);
-  border: 1px solid var(--bubble-agent-border);
-  background: var(--bubble-agent);
+  border: 1px solid var(--bubble-line);
+  border-radius: var(--radius-lg) var(--radius-lg) var(--radius-lg) var(--radius-sm);
+  background: var(--bubble-fill);
 }
 
 .msg.me .bubble {
-  border-color: var(--bubble-user-border);
-  background: var(--bubble-user);
+  border-radius: var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg);
 }
 
 .bubble .meta {
@@ -385,12 +529,43 @@ body.compact .who .state {
   font-size: var(--fs-caption);
 }
 
-.bubble .meta .copy {
+.bubble .meta .msg-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--sp-sm);
+}
+
+.bubble .meta .copy,
+.bubble .meta .msg-act {
   color: var(--disabled);
 }
 
-.bubble .meta .copy:hover {
+.bubble .meta .copy:hover,
+.bubble .meta .msg-act:hover {
   color: var(--accent-soft);
+}
+
+/* The same reveal rule serves mouse and keyboard: focus lands on a hidden
+   button via Tab, and :focus-within keeps it visible while it is active. */
+.bubble .meta .msg-act {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.bubble .meta .copy {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.msg:hover .bubble .meta .msg-act,
+.msg:focus-within .bubble .meta .msg-act {
+  opacity: 1;
+}
+
+.msg:hover .bubble .meta .copy,
+.msg:focus-within .bubble .meta .copy {
+  opacity: 1;
 }
 
 .bubble .body {
@@ -525,7 +700,7 @@ body.compact .who .state {
 
 .tool-card {
   align-self: flex-start;
-  max-width: 74%;
+  max-width: min(100%, var(--content-measure));
   min-width: 0;
   padding: var(--sp-md) var(--sp-lg);
   border: 1px solid var(--border);
@@ -590,12 +765,29 @@ body.compact .who .state {
 /* ---------- empty ---------- */
 
 .empty {
+  position: relative;
+  isolation: isolate;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: var(--sp-md);
   padding: calc(var(--sp-xl) * 2 + var(--sp-lg)) var(--sp-lg) var(--sp-lg);
   text-align: center;
+}
+
+/* A low-opacity wash behind the welcome copy; it is decoration, never a hit
+   target, and it paints inside the empty block's own stacking context. */
+.empty::before {
+  content: "";
+  position: absolute;
+  inset: 0 calc(var(--sp-xl) * -1);
+  z-index: -1;
+  background: var(--ambience);
+  pointer-events: none;
+}
+
+.empty[hidden] {
+  display: none;
 }
 
 .empty h2 {
@@ -636,7 +828,7 @@ body.compact .who .state {
 
 .approval {
   align-self: flex-start;
-  width: min(100%, var(--read-measure));
+  width: min(100%, var(--content-measure));
   padding: var(--sp-lg);
   border: 1px solid var(--accent);
   border-radius: var(--radius-md);
@@ -748,18 +940,21 @@ body.compact .who .state {
 .composer {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  background: var(--workspace);
+  background: var(--surface-glass);
+  backdrop-filter: blur(var(--blur)) saturate(1.15);
   padding: var(--sp-md) var(--sp-lg);
+  box-shadow: var(--shadow-1);
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .composer:focus-within {
   border-color: var(--accent-soft);
+  box-shadow: var(--shadow-1);
 }
 
 .composer.awaiting {
   border-color: var(--accent);
-  box-shadow: 0 0 0 var(--sp-sm) var(--accent-tint);
+  box-shadow: var(--glow);
 }
 
 .run-strip {
@@ -818,6 +1013,12 @@ body.compact .who .state {
   content: "▾ ";
 }
 
+/* The list is toggled through the hidden attribute; its own display rule would
+   otherwise keep the collapsed steps on screen and contradict aria-expanded. */
+.run-steps[hidden] {
+  display: none;
+}
+
 .run-steps {
   display: flex;
   flex-direction: column;
@@ -863,6 +1064,76 @@ body.compact .who .state {
   color: var(--danger);
   font-size: var(--fs-ui);
   flex: none;
+}
+
+.queue-dock {
+  margin-bottom: var(--sp-sm);
+  padding-bottom: var(--sp-sm);
+  border-bottom: 1px solid var(--border);
+}
+
+.queue-dock[hidden] {
+  display: none;
+}
+
+.queue-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-sm);
+  margin-bottom: var(--sp-xs);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  color: var(--accent-soft);
+}
+
+.queue-head .hint {
+  color: var(--disabled);
+}
+
+.queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-xs);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: calc(var(--ctl-ghost) * 2 + var(--sp-xs));
+  overflow-y: auto;
+}
+
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-sm);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  color: var(--muted);
+}
+
+.queue-item .text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-item button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--ctl-ghost);
+  padding: 0 var(--sp-sm);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: var(--fs-caption);
+}
+
+.queue-item button:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 
 .pills-row {
@@ -979,6 +1250,7 @@ body.compact .who .state {
 
 .send:hover {
   background: var(--accent-hover);
+  box-shadow: var(--glow);
 }
 
 .send.stop {
@@ -1033,7 +1305,7 @@ body.compact .who .state {
   right: 0;
   bottom: 0;
   z-index: 26;
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-3);
 }
 
 body.reduce-motion *,
@@ -1202,7 +1474,7 @@ body.reduce-motion *::after {
   left: 0;
   top: 0;
   bottom: 0;
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-3);
 }
 
 /* ---------- compact ---------- */
@@ -1225,4 +1497,28 @@ body.compact .statusbar {
 
 body.browser [data-cmd] {
   display: none;
+}
+
+/* A short window has no room for two queued rows next to the run bar; one row
+   keeps the composer inside the window and the rest stays scrollable. The status
+   line gives way too: it repeats facts that live in the panels. */
+@media (max-height: 640px) {
+  .queue-list {
+    max-height: var(--ctl-ghost);
+  }
+
+  .statusbar {
+    display: none;
+  }
+}
+
+/* Touch screens cannot hover, so the message actions must not stay invisible. */
+@media (hover: none) {
+  .bubble .meta .msg-act {
+    opacity: 1;
+  }
+
+  .bubble .meta .copy {
+    opacity: 1;
+  }
 }

@@ -35,6 +35,10 @@ class ApprovalUnavailableError(ApplicationError):
     pass
 
 
+class MessageUnavailableError(ApplicationError):
+    pass
+
+
 class TurnPersistenceError(ApplicationError):
     pass
 
@@ -98,6 +102,11 @@ class StartTurnCommand:
     mode: Optional[AgentMode] = None
 
 
+@dataclass(frozen=True)
+class RegenerateMessageCommand:
+    message_id: int
+
+
 @dataclass
 class RunContext:
     run_id: str
@@ -106,6 +115,8 @@ class RunContext:
     text: str
     previous_message_id: int
     workspace: Optional[WorkspaceSnapshot] = None
+    regenerate_of: int = 0
+    source_message_id: int = 0
     started_at: str = field(default_factory=utc_now)
     status: RunStatus = RunStatus.PENDING
     error: str = ""
@@ -351,6 +362,14 @@ class RunView:
 
 
 @dataclass(frozen=True)
+class MessageActions:
+    """Which transcript rows may offer the message-level commands."""
+
+    regenerate_id: int = 0
+    source_id: int = 0
+
+
+@dataclass(frozen=True)
 class ProjectionSection:
     title: str
     lines: Tuple[str, ...] = ()
@@ -381,6 +400,7 @@ class UiProjection:
     approvals: Tuple[ApprovalView, ...] = ()
     inspector: Tuple[ProjectionSection, ...] = ()
     context: Optional[ContextView] = None
+    message_actions: MessageActions = field(default_factory=MessageActions)
 
 
 def start_command(text, mode=None) -> StartTurnCommand:

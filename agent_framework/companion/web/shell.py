@@ -19,7 +19,7 @@ from PySide6.QtWidgets import QApplication, QSizeGrip, QWidget
 
 from ..models import AgentMode
 from ..policy import mode_label
-from ..ui.state import UiStateStore, clamp_position
+from ..ui.state import UiStateStore, clamp_position, snap_to_edges
 from ..ui.theme import THEMES
 from ..ui.tray import TrayController, build_avatar_icon
 
@@ -30,6 +30,7 @@ MIN_HEIGHT = 560
 SETTINGS_SIZE = (680, 560)
 CONSOLE_SIZE = (1040, 720)
 OVERLAY_SIZE = (300, 250)
+FULLSCREEN_POLL_MS = 3000
 
 
 def _screens():
@@ -38,6 +39,80 @@ def _screens():
          screen.availableGeometry().width(), screen.availableGeometry().height())
         for screen in QGuiApplication.screens()
     ]
+
+
+def _rect_matches(rect, monitor, tolerance=2):
+    """True when a window rectangle covers a monitor rectangle."""
+    return all(abs(int(a) - int(b)) <= tolerance for a, b in zip(rect, monitor))
+
+
+def foreground_is_fullscreen():
+    """True when another process owns a borderless full-screen window.
+
+    Comparing against the monitor's own rectangle (not Qt's logical geometry)
+    keeps the check correct across DPI scaling; maximized windows cover the
+    work area instead, so they are explicitly excluded.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    # Without explicit signatures the 64-bit handles are truncated to c_int.
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsZoomed.argtypes = [wintypes.HWND]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.MonitorFromWindow.restype = wintypes.HMONITOR
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.c_void_p]
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return False
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if int(pid.value) == os.getpid():
+        return False
+    if not user32.IsWindowVisible(hwnd) or user32.IsZoomed(hwnd):
+        return False
+    name = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, name, 64)
+    if name.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+        return False
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", wintypes.RECT),
+            ("rcWork", wintypes.RECT),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    monitor = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+    if not monitor:
+        return False
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return False
+    return _rect_matches(
+        (rect.left, rect.top, rect.right, rect.bottom),
+        (
+            info.rcMonitor.left,
+            info.rcMonitor.top,
+            info.rcMonitor.right,
+            info.rcMonitor.bottom,
+        ),
+    )
 
 
 class ShellHost(QObject):
@@ -83,9 +158,17 @@ class ShellHost(QObject):
     def openMain(self):
         self.window.owner.show_main()
 
+    @Slot()
+    def toggleMain(self):
+        self.window.owner.toggle_window()
+
     @Slot(int, int)
     def moveOverlay(self, x, y):
         self.window.owner.move_overlay(int(x), int(y))
+
+    @Slot()
+    def snapOverlay(self):
+        self.window.owner.snap_overlay()
 
     @Slot()
     def hideOverlay(self):
@@ -272,6 +355,11 @@ class OverlayWindow(BaseWindow):
     def _save_position(self):
         self.adapter.ui_state.set_overlay_position(self.x(), self.y())
 
+    def snap_overlay(self):
+        x, y = snap_to_edges(self.x(), self.y(), self.width(), self.height(), _screens())
+        self.move(x, y)
+        self._save_position()
+
     def moveEvent(self, event):
         super().moveEvent(event)
         if hasattr(self, "_save_timer"):
@@ -300,6 +388,7 @@ class Shell(QObject):
         )
         self.mode = self.runtime.current_mode()
         self._overlay_visible = adapter.ui_state.overlay_visible()
+        self._auto_hidden = False
         self.tray = TrayController(self, self.runtime)
 
         self._activate = _ActivateBridge(self)
@@ -314,6 +403,11 @@ class Shell(QObject):
         self.proactive_timer.setInterval(30000)
         self.proactive_timer.timeout.connect(self.poll_proactive)
         self.proactive_timer.start()
+
+        self.fullscreen_timer = QTimer(self)
+        self.fullscreen_timer.setInterval(FULLSCREEN_POLL_MS)
+        self.fullscreen_timer.timeout.connect(self.watch_fullscreen)
+        self.fullscreen_timer.start()
 
     # -- tray contract -------------------------------------------------
 
@@ -336,6 +430,7 @@ class Shell(QObject):
 
     def set_overlay_visible(self, visible):
         self._overlay_visible = bool(visible)
+        self._auto_hidden = False
         self.adapter.ui_state.set_overlay_visible(self._overlay_visible)
         if self._overlay_visible:
             self.overlay.show()
@@ -345,6 +440,21 @@ class Shell(QObject):
             self.tray.refresh()
         except Exception:
             pass
+
+    def watch_fullscreen(self):
+        """Hide the pet while another app owns the screen, then bring it back."""
+        if not self._overlay_visible:
+            return
+        try:
+            covered = foreground_is_fullscreen()
+        except Exception:
+            return
+        if covered and self.overlay.isVisible():
+            self.overlay.hide()
+            self._auto_hidden = True
+        elif not covered and self._auto_hidden:
+            self._auto_hidden = False
+            self.overlay.show()
 
     def set_mode(self, mode):
         try:
@@ -379,6 +489,7 @@ class Shell(QObject):
 
     def quit_application(self):
         self.proactive_timer.stop()
+        self.fullscreen_timer.stop()
         try:
             self.tray.close()
         except Exception:
@@ -430,6 +541,9 @@ class Shell(QObject):
     def move_overlay(self, x, y):
         x, y = clamp_position(x, y, *OVERLAY_SIZE, _screens())
         self.overlay.move(x, y)
+
+    def snap_overlay(self):
+        self.overlay.snap_overlay()
 
     @property
     def persona_name(self):

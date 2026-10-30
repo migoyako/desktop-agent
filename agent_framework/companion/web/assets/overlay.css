@@ -9,6 +9,11 @@ body {
   user-select: none;
 }
 
+/* Author display rules below would otherwise out-rank the UA [hidden] rule. */
+[hidden] {
+  display: none !important;
+}
+
 .overlay {
   position: relative;
   width: 100vw;
@@ -30,7 +35,7 @@ body {
   width: var(--pet-size);
   height: var(--pet-size);
   cursor: grab;
-  filter: drop-shadow(0 8px 16px rgba(0, 0, 0, 0.35));
+  filter: var(--pet-shadow);
 }
 
 .pet svg {
@@ -41,6 +46,118 @@ body {
 
 .pet:active {
   cursor: grabbing;
+}
+
+.ball {
+  position: absolute;
+  right: var(--pet-right);
+  bottom: var(--pet-bottom);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--pet-size);
+  height: var(--pet-size);
+  padding: 0;
+  border: 1px solid var(--accent);
+  border-radius: 50%;
+  background: var(--workspace);
+  box-shadow: var(--shadow-2);
+  cursor: pointer;
+  filter: var(--pet-shadow);
+}
+
+.ball:active {
+  cursor: grabbing;
+}
+
+.ball .mark {
+  width: 56%;
+  height: 56%;
+  border-radius: 50%;
+  border: 2px solid var(--avatar-outline);
+  background: var(--avatar-body);
+  box-shadow: inset 0 calc(var(--sp-xs) * -1) 0 rgba(0, 0, 0, 0.08);
+}
+
+body.collapsed .overlay {
+  --pet-size: 56px;
+  --pet-bottom: 18px;
+}
+
+.quick {
+  position: absolute;
+  right: calc(var(--pet-right) + var(--pet-size) + var(--sp-sm));
+  bottom: var(--pet-bottom);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-xs);
+  opacity: 0;
+  /* Invisible buttons must not swallow clicks meant for the pet. */
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.overlay:hover .quick,
+.overlay:focus-within .quick {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.quick button {
+  min-height: calc(var(--fs-meta) * 2);
+  padding: 0 var(--sp-sm);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--workspace);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  cursor: pointer;
+}
+
+.quick button:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.quick button.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.menu {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  min-width: calc(var(--fs-ui) * 11);
+  padding: var(--sp-xs);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--workspace);
+  box-shadow: var(--shadow-3);
+}
+
+.menu button {
+  min-height: calc(var(--fs-ui) * 2);
+  padding: 0 var(--sp-sm);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--fs-ui);
+  line-height: var(--lh-meta);
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.menu button:hover,
+.menu button:focus-visible {
+  background: var(--accent-soft);
+  color: var(--text);
 }
 
 .bubble {
@@ -55,8 +172,9 @@ body {
   padding: var(--sp-md) var(--sp-lg);
   border: 1px solid var(--accent);
   border-radius: var(--radius-md);
-  background: var(--workspace);
-  box-shadow: var(--shadow);
+  background: var(--surface-glass);
+  backdrop-filter: blur(var(--blur)) saturate(1.15);
+  box-shadow: var(--shadow-2);
   cursor: pointer;
 }
 
@@ -73,7 +191,7 @@ body {
   height: var(--tail);
   border-right: 1px solid var(--accent);
   border-bottom: 1px solid var(--accent);
-  background: var(--workspace);
+  background: inherit;
   transform: rotate(45deg);
 }
 
