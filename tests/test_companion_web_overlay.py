@@ -1,11 +1,13 @@
 """Desktop overlay: proactive queue payload, geometry helpers and browser flows."""
 
+import base64
 import contextlib
 import json
 import tempfile
 import time
 import unittest
 import urllib.request
+import zipfile
 from pathlib import Path
 
 from agent_framework.companion.app import create_application_service
@@ -26,6 +28,57 @@ try:
     from playwright.sync_api import sync_playwright
 except ImportError:
     sync_playwright = None
+
+
+PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+HOST_STUB = """
+window.__hostCalls = [];
+window.__host = {
+  moveOverlay: function (x, y) { window.__hostCalls.push("overlay:" + x + "," + y); },
+  snapOverlay: function () { window.__hostCalls.push("snap"); },
+};
+window.qt = { webChannelTransport: {} };
+"""
+
+QWEBCHANNEL_STUB = """
+window.QWebChannel = function (transport, callback) {
+  callback({ objects: { host: window.__host } });
+};
+"""
+
+
+def write_mesh_archive(root):
+    """A structurally valid archive whose sparse rig the runtime will reject."""
+    folder = root / "assets" / "remielle"
+    folder.mkdir(parents=True)
+    curve = lambda x0, x1: {
+        "x0": x0,
+        "x1": x1,
+        "top": [0.0] * 24,
+        "bot": [1.0] * 24,
+    }
+    files = {
+        "avatar.json": json.dumps(
+            {"format": "mesh-avatar", "version": 1, "name": "overlay-mesh"}
+        ),
+        "rig.json": json.dumps({"version": 1}),
+        "built/layers.json": json.dumps(
+            {
+                "size": [16, 16],
+                "layers": {"eye0_ball": [0, 0, 2, 2]},
+                "eyes": [curve(2, 4), curve(8, 10)],
+            }
+        ),
+        "built/base.png": PNG_1PX,
+        "built/hairmask.png": PNG_1PX,
+        "built/eye0_ball.png": PNG_1PX,
+    }
+    with zipfile.ZipFile(folder / "avatar.mavatar", "w", zipfile.ZIP_STORED) as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
 
 
 class StubSearch:
@@ -167,8 +220,8 @@ class OverlayBrowserTests(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        root = Path(self.temp.name)
-        self.service, self.adapter = make_adapter(root)
+        self.root = Path(self.temp.name)
+        self.service, self.adapter = make_adapter(self.root)
         self.adapter.start()
         self.store = self.service.runtime.store
         self.context = self.browser.new_context(viewport={"width": 300, "height": 250})
@@ -183,6 +236,25 @@ class OverlayBrowserTests(unittest.TestCase):
         page = self.context.new_page()
         # The page opens chat pages with window.open; keep the test single-tab.
         page.add_init_script("window.open = () => null;")
+        self.page = page
+        page.goto(
+            "http://{}/overlay?t={}".format(self.adapter.address, self.adapter.token),
+            wait_until="load",
+        )
+        return page
+
+    def open_overlay_with_host(self):
+        page = self.context.new_page()
+        page.add_init_script("window.open = () => null;")
+        page.add_init_script(HOST_STUB)
+        page.route(
+            "**/qwebchannel.js",
+            lambda route: route.fulfill(
+                status=200,
+                content_type="application/javascript",
+                body=QWEBCHANNEL_STUB,
+            ),
+        )
         self.page = page
         page.goto(
             "http://{}/overlay?t={}".format(self.adapter.address, self.adapter.token),
@@ -258,6 +330,25 @@ class OverlayBrowserTests(unittest.TestCase):
             timeout=5,
         )
 
+    def test_mesh_archive_is_selected_and_failures_disable_the_pet(self):
+        write_mesh_archive(self.root)
+        self.open_overlay()
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if not self.adapter.overlay_runtime()["ok"]:
+                break
+            time.sleep(0.15)
+        runtime = self.adapter.overlay_runtime()
+        self.assertFalse(runtime["ok"])
+        self.assertIn("mesh", runtime["reason"].lower())
+        self.wait_for(
+            "document.querySelector('#pet').hidden === true",
+            "加载失败后不显示替代形象",
+        )
+        self.assertEqual(
+            0, self.page.eval_on_selector("#pet", "el => el.querySelectorAll('img').length")
+        )
+
     def test_context_menu_toggles_do_not_disturb(self):
         page = self.open_overlay()
         self.wait_for(
@@ -285,12 +376,44 @@ class OverlayBrowserTests(unittest.TestCase):
             "菜单反映勿扰状态",
         )
 
+    def test_drag_keeps_the_grab_offset_and_snaps(self):
+        page = self.open_overlay_with_host()
+        self.wait_for(
+            "document.querySelector('#status').textContent.length > 0",
+            "浮窗完成首轮加载",
+        )
+        # The fixture ships no model; the drag handlers are bound regardless.
+        page.evaluate("document.querySelector('#pet').hidden = false")
+        page.evaluate(
+            """() => {
+              const fire = (target, type, x, y, sx, sy) => target.dispatchEvent(
+                new MouseEvent(type, {
+                  bubbles: true, button: 0,
+                  clientX: x, clientY: y, screenX: sx, screenY: sy,
+                })
+              );
+              fire(document.querySelector('#pet'), 'mousedown', 150, 100, 1000, 800);
+              fire(window, 'mousemove', 230, 130, 1080, 830);
+              fire(window, 'mouseup', 230, 130, 1080, 830);
+            }"""
+        )
+        # Window origin at mousedown is 1000-150/800-100; the move keeps that
+        # origin and follows the 80/30 delta. The old screenX-clientX grab
+        # would have moved the window to 230,30 instead.
+        self.assertEqual(
+            ["overlay:930,730", "snap"],
+            page.evaluate("window.__hostCalls"),
+        )
+
     def test_collapse_hides_the_pet_and_persists(self):
         page = self.open_overlay()
         self.wait_for(
             "document.querySelector('#status').textContent.length > 0",
             "浮窗完成首轮加载",
         )
+        # The fixture ships no Live2D model, so the figure is hidden by
+        # design; this test only exercises the collapse mechanics.
+        page.evaluate("document.querySelector('#pet').hidden = false")
         page.hover("#pet")
         page.click("#quickCollapse")
         self.wait_for(

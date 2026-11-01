@@ -13,6 +13,12 @@ from ..config import AgentConfig
 from ..llm import LLMClient, OfflineLLMClient, create_llm_client
 from ..messages import Message
 from .affect import AffectService
+from .assets import (
+    asset_root,
+    live2d_file,
+    public_view,
+    scan_assets,
+)
 from .file_actions import (
     FileActionError,
     NoteActionService,
@@ -322,6 +328,27 @@ class CompanionRuntime:
             field: self.memory.persona_setting(self.session_id, field)
             for field in PERSONA_SETTING_KEYS
         }
+
+    def character_assets(self):
+        return public_view(scan_assets(self.data_dir, self.persona_id))
+
+    def avatar_asset(self):
+        return scan_assets(self.data_dir, self.persona_id).avatar
+
+    def background_asset(self):
+        return scan_assets(self.data_dir, self.persona_id).background
+
+    def live2d_entry(self):
+        return scan_assets(self.data_dir, self.persona_id).live2d
+
+    def live2d_file(self, relative):
+        root = asset_root(self.data_dir, self.persona_id)
+        if root is None:
+            return None
+        return live2d_file(root / "live2d", relative)
+
+    def mesh_asset(self):
+        return scan_assets(self.data_dir, self.persona_id).mesh
 
     def set_persona_preference(self, field, content):
         if field not in PERSONA_SETTING_KEYS:

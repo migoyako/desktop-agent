@@ -145,6 +145,22 @@ body {
   word-break: break-word;
 }
 
+.persona-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-md);
+}
+
+.persona-avatar {
+  flex: none;
+  width: calc(var(--fs-display) * 2);
+  height: calc(var(--fs-display) * 2);
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  background: var(--page);
+}
+
 .detail .group-title {
   color: var(--accent-soft);
   font-size: var(--fs-meta);

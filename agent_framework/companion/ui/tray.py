@@ -3,43 +3,37 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, Qt
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+from PySide6.QtGui import QAction, QIcon, QPixmap
+from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
 
 from ..models import AgentMode
 from ..policy import mode_label
 
 
-def build_avatar_icon(size=32):
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.Antialiasing)
-    scale = size / 32.0
-    painter.setPen(QPen(QColor("#59c3c3"), max(1, int(2 * scale))))
-    painter.setBrush(QColor("#edf7f7"))
-    painter.drawEllipse(
-        int(5 * scale),
-        int(4 * scale),
-        int(22 * scale),
-        int(20 * scale),
-    )
-    painter.setBrush(QColor("#14272d"))
-    painter.setPen(Qt.NoPen)
-    painter.drawEllipse(
-        int(10 * scale),
-        int(11 * scale),
-        int(3 * scale),
-        int(4 * scale),
-    )
-    painter.drawEllipse(
-        int(19 * scale),
-        int(11 * scale),
-        int(3 * scale),
-        int(4 * scale),
-    )
-    painter.end()
-    return QIcon(pixmap)
+def app_icon(runtime=None, size=32):
+    """The user's avatar when it exists, otherwise the stock application icon."""
+    asset = None
+    if runtime is not None:
+        try:
+            asset = runtime.character_assets().avatar
+        except Exception:
+            asset = None
+    if asset is not None:
+        pixmap = QPixmap(str(asset.path))
+        if not pixmap.isNull():
+            return QIcon(
+                pixmap.scaled(
+                    size,
+                    size,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            )
+    app = QApplication.instance()
+    style = app.style() if app is not None else None
+    if style is not None:
+        return style.standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+    return QIcon()
 
 
 class TrayController(QObject):
@@ -51,7 +45,7 @@ class TrayController(QObject):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
 
-        self.tray = QSystemTrayIcon(build_avatar_icon(), self)
+        self.tray = QSystemTrayIcon(app_icon(runtime), self)
         menu = QMenu()
         self.window_action = QAction("隐藏主窗口", menu)
         self.window_action.triggered.connect(window.toggle_window)
@@ -74,6 +68,11 @@ class TrayController(QObject):
             self.mode_actions[mode] = action
 
         menu.addSeparator()
+        self.unread_action = QAction("未读主动 0 条", menu)
+        self.unread_action.setToolTip("打开主窗口查看主动消息")
+        self.unread_action.triggered.connect(self.show_main)
+        menu.addAction(self.unread_action)
+
         self.pause_action = QAction("暂停主动", menu)
         self.pause_action.setCheckable(True)
         self.pause_action.triggered.connect(self.toggle_proactive)
@@ -102,6 +101,15 @@ class TrayController(QObject):
         if reason == QSystemTrayIcon.DoubleClick:
             self.window.toggle_window()
 
+    def show_main(self):
+        opener = getattr(self.window, "show_main", None)
+        if opener is not None:
+            opener()
+            return
+        self.window.showNormal()
+        self.window.raise_()
+        self.window.activateWindow()
+
     def toggle_proactive(self, checked):
         try:
             self.runtime.set_proactive_enabled(not checked)
@@ -119,7 +127,21 @@ class TrayController(QObject):
         else:
             label = "隐藏主窗口"
         self.window_action.setText(label)
-        self.overlay_action.setChecked(self.window.overlay_visible())
+        supported = bool(getattr(self.window, "overlay_supported", False))
+        available = supported and getattr(
+            self.window, "pet_available", lambda: True
+        )()
+        self.overlay_action.setChecked(
+            supported and self.window.overlay_visible()
+        )
+        self.overlay_action.setEnabled(available)
+        if not supported:
+            tooltip = "桌面浮窗需要 Web 界面（--ui web）"
+        elif available:
+            tooltip = ""
+        else:
+            tooltip = "缺少可用的 Live2D 模型或 .mavatar，桌面形象不会显示"
+        self.overlay_action.setToolTip(tooltip)
         current = self.window.mode
         for mode, action in self.mode_actions.items():
             action.setChecked(mode == current)
@@ -128,6 +150,12 @@ class TrayController(QObject):
         except Exception:
             enabled = False
         self.pause_action.setChecked(not enabled)
+        try:
+            unread = len(self.runtime.unread_proactive_events(99))
+        except Exception:
+            unread = 0
+        self.unread_action.setText("未读主动 {} 条".format(unread))
+        self.unread_action.setEnabled(unread > 0)
         self.tray.setToolTip("{} · {}".format(
             self.window.persona_name,
             mode_label(current),

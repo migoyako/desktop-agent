@@ -20,7 +20,6 @@ from PySide6.QtGui import (
     QColor,
     QCursor,
     QDesktopServices,
-    QFont,
     QIcon,
     QKeySequence,
     QPainter,
@@ -81,14 +80,13 @@ from .state import UiStateStore, clamp_position
 from .stream import StreamWorker
 from .timefmt import clock as _clock
 from .theme import (
-    avatar_palette,
     font_px,
     normalize_font_scale,
     normalize_theme,
     stylesheet,
     theme,
 )
-from .tray import TrayController, build_avatar_icon
+from .tray import TrayController, app_icon
 from .console import ManagementConsoleDialog
 
 
@@ -432,251 +430,6 @@ def side_dialog_geometry(preferred, parent, available, margin=16):
     x = max(screen_left, min(x, screen_right - width))
     y = max(screen_top, min(y, screen_bottom - height))
     return x, y, width, height
-
-
-class AvatarWidget(QWidget):
-    def __init__(self, parent=None, compact=False, size=None):
-        super().__init__(parent)
-        self.compact = compact
-        self.tokens = theme()
-        self.setObjectName("avatar")
-        if size:
-            width = height = int(size)
-        else:
-            width, height = (96, 96) if compact else (150, 145)
-        self.setFixedSize(width, height)
-        self.status = "待机"
-        self.mood = "calm"
-
-    def set_theme(self, tokens):
-        self.tokens = tokens
-        self.update()
-
-    def set_state(self, status=None, mood=None):
-        if status:
-            self.status = status
-        if mood:
-            self.mood = mood
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        paints = avatar_palette(self.tokens, self.mood)
-        accent = QColor(paints["accent"])
-        body = QColor(paints["body"])
-        ink = QColor(paints["ink"])
-        outline = QColor(paints["outline"])
-        shadow = QColor(paints["shadow"])
-        shadow.setAlpha(70 if self.tokens.get("scheme") == "dark" else 120)
-        scale = self.width() / 150 if self.compact else 1.0
-
-        def scaled(value):
-            return int(round(value * scale))
-
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(shadow)
-        painter.drawEllipse(scaled(18), scaled(114), scaled(114), scaled(22))
-
-        painter.setBrush(body)
-        painter.setPen(QPen(outline, max(1, scaled(2))))
-        painter.drawRoundedRect(
-            scaled(39), scaled(58), scaled(72), scaled(62), scaled(25), scaled(25)
-        )
-        painter.drawEllipse(scaled(37), scaled(20), scaled(76), scaled(68))
-
-        painter.setPen(QPen(accent, max(1, scaled(4)), Qt.SolidLine, Qt.RoundCap))
-        painter.drawLine(scaled(75), scaled(20), scaled(75), scaled(8))
-        painter.setBrush(accent)
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(scaled(69), scaled(3), scaled(12), scaled(12))
-
-        painter.setBrush(ink)
-        eye_y = 48 if self.mood not in ("tired", "low") else 52
-        painter.drawEllipse(scaled(57), scaled(eye_y), scaled(8), scaled(10))
-        painter.drawEllipse(scaled(86), scaled(eye_y), scaled(8), scaled(10))
-        painter.setBrush(QColor(paints["body"]))
-        painter.drawEllipse(scaled(59), scaled(eye_y + 1), scaled(2), scaled(3))
-        painter.drawEllipse(scaled(88), scaled(eye_y + 1), scaled(2), scaled(3))
-
-        painter.setPen(QPen(ink, max(1, scaled(2)), Qt.SolidLine, Qt.RoundCap))
-        if self.mood in ("warm", "positive"):
-            painter.drawArc(scaled(65), scaled(56), scaled(21), scaled(16), 0, 180 * 16)
-        elif self.mood in ("low", "concerned", "tired"):
-            painter.drawLine(scaled(67), scaled(68), scaled(84), scaled(68))
-        else:
-            painter.drawArc(
-                scaled(66), scaled(58), scaled(19), scaled(12), 180 * 16, 180 * 16
-            )
-
-        painter.setPen(QPen(accent, max(1, scaled(4)), Qt.SolidLine, Qt.RoundCap))
-        painter.drawLine(scaled(42), scaled(75), scaled(29), scaled(96))
-        painter.drawLine(scaled(109), scaled(75), scaled(121), scaled(96))
-        painter.drawLine(scaled(58), scaled(118), scaled(54), scaled(130))
-        painter.drawLine(scaled(92), scaled(118), scaled(96), scaled(130))
-
-        if not self.compact:
-            painter.setPen(QColor(self.tokens["muted"]))
-            painter.setFont(QFont("Microsoft YaHei UI", 8))
-            painter.drawText(0, scaled(134), self.width(), scaled(14), Qt.AlignCenter, self.status)
-
-
-class AvatarOverlay(QWidget):
-    """Transparent always-on-top avatar with an executor-derived status bubble."""
-
-    def __init__(self, runtime, state_store=None):
-        super().__init__(None)
-        self.runtime = runtime
-        self.state_store = state_store or UiStateStore(runtime.data_dir)
-        self._dragging = False
-        self._drag_offset = QPoint()
-        self._interactive = False
-        self.setWindowFlags(
-            Qt.FramelessWindowHint
-            | Qt.WindowStaysOnTopHint
-            | Qt.Tool
-        )
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self._tokens = theme()
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        self.bubble = QLabel()
-        self.bubble.setObjectName("bubble")
-        self.bubble.setWordWrap(True)
-        self.bubble.setFixedWidth(210)
-        self.bubble.setMaximumHeight(76)
-        self.avatar = AvatarWidget()
-        layout.addWidget(self.bubble, 0, Qt.AlignHCenter)
-        layout.addWidget(self.avatar, 0, Qt.AlignHCenter)
-        self.apply_theme(self._tokens)
-        self.adjustSize()
-
-        self.hit_timer = QTimer(self)
-        self.hit_timer.setInterval(120)
-        self.hit_timer.timeout.connect(self.update_hit_test)
-        self.hit_timer.start()
-        self.status_timer = QTimer(self)
-        self.status_timer.setInterval(1000)
-        self.status_timer.timeout.connect(self.refresh_status)
-        self.status_timer.start()
-
-        self.restore_position()
-        self.refresh_status()
-
-    def apply_theme(self, tokens=None, font_scale=100):
-        self._tokens = dict(tokens or theme())
-        self._font_scale = normalize_font_scale(font_scale)
-        if getattr(self, "avatar", None) is not None:
-            self.avatar.set_theme(self._tokens)
-        if getattr(self, "bubble", None) is None:
-            return
-        scale = self._font_scale / 100.0
-        self.bubble.setFixedWidth(int(round(210 * scale)))
-        self.bubble.setMaximumHeight(int(round(76 * scale)))
-        background = QColor(self._tokens["page"])
-        self.setStyleSheet(
-            (
-                "QLabel#bubble {{"
-                " background: rgba({r}, {g}, {b}, 235);"
-                " border: 1px solid {border};"
-                " border-radius: 10px;"
-                " padding: 6px 8px;"
-                " color: {text};"
-                " font-family: 'Microsoft YaHei UI';"
-                " font-size: {size};"
-                "}}"
-            ).format(
-                r=background.red(),
-                g=background.green(),
-                b=background.blue(),
-                border=self._tokens["accent"],
-                text=self._tokens["text"],
-                size=font_px("ui", self._font_scale),
-            )
-        )
-
-    def refresh_status(self):
-        try:
-            status = self.runtime.desktop_status()
-        except Exception:
-            status = {"state": "idle", "label": "待机", "detail": ""}
-        self.avatar.set_state(status=status["label"], mood=self._mood())
-        detail = (status.get("detail") or "").strip()
-        if status.get("state") == "idle" or not detail:
-            self.bubble.hide()
-        else:
-            self.bubble.setText(detail)
-            self.bubble.show()
-        self.adjustSize()
-
-    def _mood(self):
-        try:
-            return self.runtime.affect_snapshot()["agent"]["mood_label"]
-        except Exception:
-            return None
-
-    def update_hit_test(self):
-        inside = self.avatar.rect().contains(
-            self.avatar.mapFromGlobal(QCursor.pos())
-        )
-        interactive = bool(inside or self._dragging)
-        if interactive != self._interactive:
-            self._interactive = interactive
-            self.setAttribute(Qt.WA_TransparentForMouseEvents, not interactive)
-
-    def restore_position(self):
-        screens = [
-            tuple(screen.availableGeometry().getRect())
-            for screen in QApplication.screens()
-        ]
-        stored = self.state_store.overlay_position()
-        if stored is not None:
-            x, y = stored
-        else:
-            available = (
-                QApplication.primaryScreen().availableGeometry()
-                if QApplication.primaryScreen()
-                else None
-            )
-            if available is None:
-                x, y = 40, 40
-            else:
-                x = available.x() + available.width() - self.width() - 24
-                y = available.y() + available.height() - self.height() - 24
-        x, y = clamp_position(x, y, self.width(), self.height(), screens)
-        self.move(x, y)
-
-    def save_position(self):
-        self.state_store.set_overlay_position(self.x(), self.y())
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._dragging = True
-            self._drag_offset = (
-                event.globalPosition().toPoint()
-                - self.frameGeometry().topLeft()
-            )
-            event.accept()
-
-    def mouseMoveEvent(self, event):
-        if self._dragging and event.buttons() & Qt.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
-            event.accept()
-
-    def mouseReleaseEvent(self, event):
-        if self._dragging:
-            self._dragging = False
-            self.save_position()
-            event.accept()
-
-    def closeEvent(self, event):
-        self.save_position()
-        self.hit_timer.stop()
-        self.status_timer.stop()
-        event.accept()
 
 
 class QtWorker(QThread):
@@ -1729,6 +1482,7 @@ class CompanionWindow(QMainWindow):
             self.application = create_application_service(runtime)
         self.runtime = self.application.runtime
         self.mode = AgentMode.CHAT
+        self.avatar_status = "待机"
         self.current_proposal = None
         self.memory_dialog = None
         self.affect_dialog = None
@@ -1743,7 +1497,6 @@ class CompanionWindow(QMainWindow):
         self._restore_geometry = None
         self.ui_state = UiStateStore(self.runtime.data_dir)
         self._restore_active_session()
-        self.overlay = None
         self.tray = None
         self.active_generation = None
         self.stopped_generation = None
@@ -1762,12 +1515,12 @@ class CompanionWindow(QMainWindow):
         self.inspector_shown = self.ui_state.inspector_visible()
         self.setWindowTitle(self.persona_name)
         # A Qt.Tool window has no taskbar entry, so hiding it leaves the tray as the
-        # only way back - unusable where the tray is missing or collapsed. Staying on
-        # top is left to the avatar overlay; the panel behaves like a normal window.
+        # only way back - unusable where the tray is missing or collapsed. The panel
+        # behaves like a normal window; only the Web overlay floats above others.
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowMinimizeButtonHint
         )
-        self.setWindowIcon(build_avatar_icon())
+        self.setWindowIcon(app_icon(self.runtime))
         self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
         self.setMinimumSize(MIN_WIDTH, MIN_HEIGHT)
         shell = QWidget()
@@ -1834,8 +1587,6 @@ class CompanionWindow(QMainWindow):
 
         identity = QHBoxLayout()
         identity.setSpacing(6)
-        self.avatar = AvatarWidget(compact=True, size=34)
-        identity.addWidget(self.avatar)
         who = QVBoxLayout()
         who.setSpacing(0)
         self.name_label = QLabel(self.persona_name)
@@ -1989,9 +1740,6 @@ class CompanionWindow(QMainWindow):
         self.settings_shortcut = QShortcut(QKeySequence("Ctrl+,"), self)
         self.settings_shortcut.activated.connect(self.open_settings)
 
-        self.overlay = AvatarOverlay(self.runtime, self.ui_state)
-        if self.ui_state.overlay_visible():
-            self.overlay.show()
         self.tray = TrayController(self, self.runtime)
         self._apply_stylesheet()
         self.restore_window_geometry()
@@ -2150,16 +1898,17 @@ class CompanionWindow(QMainWindow):
 
     def _apply_stylesheet(self):
         self.tokens = theme(self.theme_name)
-        css = stylesheet(self.theme_name, self.font_scale)
+        background = None
+        if self.ui_state.background_enabled():
+            asset = self.runtime.background_asset()
+            if asset is not None:
+                background = asset.path
+        css = stylesheet(self.theme_name, self.font_scale, background=background)
         self.setStyleSheet(css)
         self._apply_rail_icons()
         self._update_send_button_width()
         if getattr(self, "input", None) is not None:
             self._resize_input()
-        if getattr(self, "avatar", None) is not None:
-            self.avatar.set_theme(self.tokens)
-        if getattr(self, "overlay", None) is not None:
-            self.overlay.apply_theme(self.tokens, self.font_scale)
         for attribute in (
             "memory_dialog",
             "affect_dialog",
@@ -2402,13 +2151,12 @@ class CompanionWindow(QMainWindow):
         self.refresh_history()
         if getattr(self, "tray", None) is not None:
             self.tray.refresh()
-        if getattr(self, "overlay", None) is not None:
-            self.overlay.refresh_status()
         self._refresh_inspector()
 
     def set_avatar_state(self, status=None, mood=None):
-        self.avatar.set_state(status=status, mood=mood)
-        label = self.avatar.status
+        if status:
+            self.avatar_status = status
+        label = self.avatar_status
         self.status_pill.setText(label)
         idle = label in ("待机", "陪伴中", "工作中")
         self.status_pill.setObjectName("pill" if idle else "pillActive")
@@ -2744,8 +2492,6 @@ class CompanionWindow(QMainWindow):
         self.refresh_workspace()
         self.refresh_session_list()
         self._refresh_inspector()
-        if self.overlay is not None:
-            self.overlay.refresh_status()
 
     def _summary_for(self, session_id):
         for summary in self._session_summaries:
@@ -3062,8 +2808,6 @@ class CompanionWindow(QMainWindow):
                 )
                 if detail["sources"] and self.inspector_shown:
                     self._refresh_inspector(focus="sources")
-                if self.overlay is not None:
-                    self.overlay.refresh_status()
             self.render_history(self.stream_text)
         elif kind == "error":
             self.status.setText(event.get("message") or "生成失败")
@@ -3095,8 +2839,6 @@ class CompanionWindow(QMainWindow):
             self.run_bar.finish("cancelled", "已停止生成")
             self.status.setText("已停止生成。")
             self.refresh_history()
-            if self.overlay is not None:
-                self.overlay.refresh_status()
             if self.tray is not None:
                 self.tray.refresh()
             return
@@ -3120,8 +2862,6 @@ class CompanionWindow(QMainWindow):
                 self.set_avatar_state(status="等待补充")
                 self.run_bar.show_waiting("等待补充信息")
         self.refresh_affect_avatar()
-        if self.overlay is not None:
-            self.overlay.refresh_status()
         if self.tray is not None:
             self.tray.refresh()
 
@@ -3166,8 +2906,6 @@ class CompanionWindow(QMainWindow):
         self.set_avatar_state(status="等待确认")
         self.chat.scroll_to_latest()
         self._refresh_inspector(focus="execute")
-        if self.overlay is not None:
-            self.overlay.refresh_status()
 
     def refresh_pending(self):
         try:
@@ -3219,8 +2957,6 @@ class CompanionWindow(QMainWindow):
             self.set_avatar_state(
                 status="陪伴中" if self.mode == AgentMode.CHAT else "工作中"
             )
-            if self.overlay is not None:
-                self.overlay.refresh_status()
             if self.tray is not None:
                 self.tray.refresh()
 
@@ -3245,8 +2981,6 @@ class CompanionWindow(QMainWindow):
         self.confirm_frame.show_cancelled("已取消，没有写入文件。")
         self.status.setText("已取消，没有写入文件。")
         self._refresh_inspector(focus="execute")
-        if self.overlay is not None:
-            self.overlay.refresh_status()
 
     def undo_last(self):
         receipts = [
@@ -3267,8 +3001,6 @@ class CompanionWindow(QMainWindow):
                 self.confirm_frame.show_undone(message)
             self.refresh_history()
             self._refresh_inspector(focus="files")
-            if self.overlay is not None:
-                self.overlay.refresh_status()
 
         self.run_worker(
             lambda: self.application.undo_receipt(receipt.receipt_id),
@@ -3338,8 +3070,6 @@ class CompanionWindow(QMainWindow):
             if self.proactive_dialog is not None:
                 self.proactive_dialog.refresh()
             self._refresh_inspector()
-            if self.overlay is not None:
-                self.overlay.refresh_status()
 
         self.run_worker(self.runtime.proactive_tick, done)
 
@@ -3415,17 +3145,12 @@ class CompanionWindow(QMainWindow):
             self.tray.refresh()
 
     def overlay_visible(self):
-        return bool(self.overlay is not None and self.overlay.isVisible())
+        return False
 
     def set_overlay_visible(self, visible):
-        if self.overlay is None:
-            return
-        self.overlay.setVisible(bool(visible))
-        self.ui_state.set_overlay_visible(bool(visible))
+        self.status.setText("桌面浮窗需要 Web 界面（--ui web）")
         if getattr(self, "settings_dialog", None) is not None:
             self.settings_dialog.refresh()
-        if visible:
-            self.overlay.refresh_status()
         if self.tray is not None:
             self.tray.refresh()
 
@@ -3457,8 +3182,6 @@ class CompanionWindow(QMainWindow):
             dialog = getattr(self, attribute)
             if dialog is not None:
                 dialog.close()
-        if self.overlay is not None:
-            self.overlay.close()
         if self.tray is not None:
             self.tray.close()
         event.accept()

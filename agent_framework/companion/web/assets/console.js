@@ -319,6 +319,10 @@
     const skills = data.skills || {};
     const proactive = data.proactive || {};
     const available = skills.available || [];
+    const avatar = ((bootstrap || state.data || {}).assets || {}).avatar;
+    const avatarHtml = avatar
+      ? `<img class="persona-avatar" src="${avatar.url}?t=${encodeURIComponent(token)}&v=${avatar.stamp}" alt="当前人设头像" width="48" height="48">`
+      : "";
     el.page.innerHTML = `<div class="stats">
         <div class="stat"><div class="k">工作区</div><div class="v">${escapeHtml(data.workspace || "未授权")}</div></div>
         <div class="stat"><div class="k">模式</div><div class="v">${data.mode === "work" ? "工作" : "陪伴"}</div></div>
@@ -326,7 +330,9 @@
         <div class="stat"><div class="k">记忆</div><div class="v">${data.memories || 0} 条</div></div>
       </div>
       <div class="detail"><h2>人设与主题</h2>
-        <div class="meta">人设：${escapeHtml(persona.name || "数字分身")} ${escapeHtml(persona.version || "")} · 主题：${data.ui.theme === "pearl-white" ? "珍珠白" : "经典深色"} · 字号：${data.ui.font_scale}%</div>
+        <div class="persona-head">${avatarHtml}
+          <div class="meta">人设：${escapeHtml(persona.name || "数字分身")} ${escapeHtml(persona.version || "")} · 主题：${data.ui.theme === "pearl-white" ? "珍珠白" : "经典深色"} · 字号：${data.ui.font_scale}%</div>
+        </div>
         <div class="actions-row">
           <button class="ghost" id="openSettings">打开设置</button>
         </div>
@@ -393,17 +399,31 @@
       return;
     }
     if (action === "correct") {
-      const replacement = window.prompt("纠正后的内容", state.detail && state.detail.memory ? state.detail.memory.content : "");
+      const current = state.detail && state.detail.memory ? state.detail.memory.content : "";
+      const replacement = await CompanionDialog.prompt("纠正后的内容", current, {
+        title: "纠正记忆",
+        okText: "保存",
+      });
       if (!replacement) return;
       await guard(post("/api/console/memory", { action: "correct", memory_id: memoryId, replacement: replacement }));
     } else if (action === "forget") {
-      if (!window.confirm("忘记这条记忆？")) return;
+      const confirmed = await CompanionDialog.confirm("忘记这条记忆？", {
+        title: "忘记记忆",
+        okText: "忘记",
+        danger: true,
+      });
+      if (!confirmed) return;
       await guard(post("/api/console/memory", { action: "forget", memory_id: memoryId }));
     } else if (action === "protect") {
       const memory = state.detail && state.detail.memory ? state.detail.memory : {};
       await guard(post("/api/console/memory", { action: "protect", memory_id: memoryId, protected: !memory.protected }));
     } else if (action === "purge") {
-      if (!window.confirm("彻底删除不可撤销，继续？")) return;
+      const confirmed = await CompanionDialog.confirm("彻底删除不可撤销，继续？", {
+        title: "彻底删除",
+        okText: "彻底删除",
+        danger: true,
+      });
+      if (!confirmed) return;
       await guard(post("/api/console/memory", { action: "purge", memory_id: memoryId }));
     }
     state.selected = null;
@@ -505,6 +525,7 @@
     if (bootstrap) {
       state.data = bootstrap;
       applyTheme(bootstrap.ui);
+      CompanionBackground.apply(bootstrap.ui, bootstrap.assets, token);
     }
     bind();
     connectHost();

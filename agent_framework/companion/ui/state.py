@@ -151,6 +151,12 @@ class UiStateStore:
     def set_reduce_motion(self, enabled):
         return self.set(reduce_motion=bool(enabled))
 
+    def background_enabled(self):
+        return bool(self.load().get("background_enabled", True))
+
+    def set_background_enabled(self, enabled):
+        return self.set(background_enabled=bool(enabled))
+
     def inspector_visible(self):
         return bool(self.load().get("inspector_visible", True))
 

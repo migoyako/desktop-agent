@@ -69,10 +69,34 @@ class WebLayoutAuditTests(unittest.TestCase):
             self.skipTest(self.skip_reason)
         bars = [item for item in self.report["chrome"] if item["page"] == "main"]
         self.assertTrue(bars)
-        # The binding case is 200% type in the 780x560 minimum window, where the
-        # top bar and the two-line composer are both at their largest.
+        # The binding case is 200% type in the 1024x576 minimum window, where
+        # the top bar and the two-line composer are both at their largest.
         share = min(100.0 * item["chat"] / item["viewport"] for item in bars)
         self.assertGreaterEqual(share, 25, "the transcript only keeps {:.0f}%".format(share))
+
+    def test_a_user_background_keeps_the_layout_and_skips_the_overlay(self):
+        if self.report is None:
+            self.skipTest(self.skip_reason)
+        try:
+            report = run_audit(scales=(100,), background=True)
+        except Exception as error:
+            self.skipTest("浏览器不可用：{}".format(error))
+        self.assertEqual([], [describe(item) for item in report["problems"]])
+        checks = report["background"]
+        self.assertTrue(
+            any(
+                item["page"] == "main"
+                and item["on"]
+                and item["washed"]
+                and item["image"]
+                for item in checks
+            )
+        )
+        overlay = [item for item in checks if item["page"] == "overlay"]
+        self.assertTrue(overlay)
+        self.assertTrue(
+            all(not item["on"] and not item["washed"] and not item["image"] for item in overlay)
+        )
 
 
 if __name__ == "__main__":

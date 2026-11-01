@@ -13,7 +13,8 @@
 | 主语言 | Python 3.11 | 自动化、AI 生态成熟，兼容性优于追最新版 |
 | 桌面宿主 | PySide6 | 原生窗口、托盘、透明置顶、音视频和 WebEngine 支持完整 |
 | 首版形象 | 透明窗口 + PNG 序列帧 | 两周内可形成可运行闭环，避免先被 Live2D 管线阻塞 |
-| Live2D | `QWebEngineView` + PixiJS + `pixi-live2d-display` | Python 负责状态和桥接，渲染交给浏览器生态；2026-10-30 起它是桌宠的**唯一**载体，不可用即功能失效，不退回 PNG/序列帧（见 9.2 修订与进度文档 D58） |
+| Live2D | `QWebEngineView` + PixiJS + `pixi-live2d-display` | Python 负责状态和桥接，渲染交给浏览器生态；2026-10-30 起它是桌宠的载体，不可用即功能失效，不退回 PNG/序列帧（见 9.2 修订与进度文档 D58） |
+| Mesh 形象 | `QWebEngineView` + 内置 `mesh-avatar` 运行时 | 用户已有 Mesh Avatar Studio 工程时可直接用 `.mavatar` 归档；仅在没有 Live2D 模型时启用，两者不互相兜底（2026-10-31，进度文档 D72） |
 | Agent 内核 | 扩展现有 `ChatAgent` | 已有 LLM 与工具调用循环，可渐进演进 |
 | 数据边界 | Pydantic v2 模型 + 工具参数 Schema | 不让自由文本直接成为执行参数 |
 | 持久化 | SQLite（WAL）+ 版本化迁移 | 单机可靠、易备份、无需外部服务 |
@@ -558,7 +559,7 @@ relationship_state
 
 不要一开始实现复杂走动、多角色互动和拖拽物理。
 
-### 9.2 Live2D
+### 9.2 桌面形象渲染（Live2D / .mavatar）
 
 第二阶段使用本地 `QWebEngineView`：
 
@@ -579,7 +580,15 @@ Python 只发送高层状态：
 
 不要在 Python 中重新实现 Live2D 渲染器。还需要单独确认 Cubism Core、模型和声优素材的授权。
 
-**2026-10-30 修订（进度文档 D58/R25）**：Live2D 是桌面浮窗形象的**唯一载体**，跑在 `web/shell.py` 的透明置顶可穿透浮窗里，Qt 原生 `AvatarOverlay` 与 QPainter 程序化形象随接入同一次改动删除；**不可用即失效，不设回退链**（原设计里的"退回 PNG 角色/序列帧"作废）。开工前必须先在真实桌面验证 WebGL 与透明/置顶/点击穿透能否共存。`speech_energy` 一类由前端自行插值的抖动不做，口型只跟随 TTS 播放进度（阶段 5 语音切片）；表情映射由 Python 侧下发，映射缺失时使用模型默认姿态。
+**2026-10-30 修订（进度文档 D58/R25）**：Live2D 是桌面浮窗形象的载体，跑在 `web/shell.py` 的透明置顶可穿透浮窗里，Qt 原生 `AvatarOverlay` 与 QPainter 程序化形象随接入同一次改动删除；**不可用即失效，不设回退链**（原设计里的"退回 PNG 角色/序列帧"作废）。开工前必须先在真实桌面验证 WebGL 与透明/置顶/点击穿透能否共存（该闸门已于 2026-10-31 通过，见下）。`speech_energy` 一类由前端自行插值的抖动不做，口型只跟随 TTS 播放进度（阶段 5 语音切片）；表情映射由 Python 侧下发，映射缺失时使用模型默认姿态。
+
+**2026-10-31 追加（进度文档 D72/R26）**：浮窗新增第二个并列载体 `.mavatar`（Mesh Avatar Studio 归档）。选择规则固定且只有一条——`data/assets/<persona_id>/live2d/model3.json` 可用时用 Live2D，否则用 `avatar.mavatar`；**任一载体损坏都不静默改用另一个**，两者都不可用时 `pet.available=false`，浮窗不启动。归档只经 token 门控的 `GET /api/asset/mesh?v=<stamp>` 读取（`application/zip` + `nosniff`），Studio 运行时的归档校验在 Python 侧复刻（仅 STORED、条目/单条/总量上限、无加密重复名与路径逃逸、必需文件与 PNG 魔数、`avatar.json`/`rig.json`/`layers.json` 版本与眼睛曲线），前端不信任归档内容之外的任何路径。`mesh-avatar.min.js` 由 Studio `packages/runtime` 以 esbuild 打成 IIFE（内联 fflate，MIT）随包，版本与哈希记在 `vendor/NOTICE.md`；升级该运行时须重跑同一套归档校验用例。
+
+**2026-10-31 前置闸门结论（R25/D58）**：
+
+- **授权**：`live2dcubismcore.min.js` 属 Live2D 专有软件许可协议定义的 "Redistributable Code"，按 §5.2 原样随包：保留原头声明、不修改文件、不套用任何开源许可（§5.3.2），并在 `web/assets/vendor/NOTICE.md` 记录版本、哈希与条款。模型与贴图仍由用户自备于 `data/assets/`（gitignore、只读、不进安装包）；若将来公开发布，安装包与顶层许可必须携带 Live2D 条款并承担 §5.2 的赔偿与等效保护义务。
+- **可行性**：在真实桌面（2560×1440 @150%）用 `web/live2d_probe.py` 验证 300×250 无边框透明置顶浮窗——WebGL 2.0（ANGLE/D3D11）渲染正确，透明区 alpha=0、桌面合成保留，交互态命中浮窗、`WS_EX_TRANSPARENT` 时点击落到下层，待机 60.3 fps / CPU 3.1%，前置全屏游戏时置顶合成仍成立。结论：沿用本路线，命中区按光标位置动态切换穿透，不新增第二渲染层。
+- **运行时**：PixiJS 7.4.3 + `pixi-live2d-display` 0.5.0-beta（cubism4）+ Cubism Core 全部作为本地静态资源随包，仍无构建链（D56）；该 UMD 依赖 `process.env.NODE_ENV`，由同目录的 `process-env.js` 垫片提供。
 
 ### 9.3 状态可感知
 
@@ -821,7 +830,7 @@ event
 - 连续未回复后停止追问。
 - 安静模式下不主动闲聊。
 
-### 阶段 5：语音、Live2D 与发布
+### 阶段 5：语音、桌面形象与发布
 
 目标：提升体验，不改变权限与记忆边界。
 
@@ -829,8 +838,9 @@ event
 
 - 本地 ASR。
 - 流式 TTS 或系统语音。
-- `QWebEngineView` Live2D：**桌宠唯一载体**，与旧程序化形象的删除在同一切片完成（M13.3）。
-- 角色素材本地导入：`data/assets/<persona_id>/` 下 `avatar.*`（静态头像/立绘）、`background.*`（可替换窗口背景）、`live2d/model3.json`（模型），只读不写、不进版本库与安装包。
+- `QWebEngineView` Live2D：桌宠载体之一，与旧程序化形象的删除在同一切片完成（M13.3）。
+- `QWebEngineView` mesh：桌宠的第二载体，内置 `mesh-avatar` 运行时消费用户自备的 `.mavatar`（M13.4）；只有没有可用 Live2D 模型时才启用。
+- 角色素材本地导入：`data/assets/<persona_id>/` 下 `avatar.*`（静态头像/立绘）、`background.*`（可替换窗口背景）、`live2d/model3.json`（模型）、`avatar.mavatar`（Mesh 归档），只读不写、不进版本库与安装包。
 - 打包、签名、自动更新与崩溃日志。
 - 隐私数据导出和删除。
 
@@ -838,7 +848,8 @@ event
 
 - 语音链路失败时仍可用文本。
 - 语音和截图有明确隐私提示。
-- Live2D 不可用时桌宠功能失效并在设置页与 `doctor.py` 说明原因，不显示任何替代形象；文本、提醒与回执链路不受影响（2026-10-30 修订，原"自动退回 PNG 角色"作废）。
+- Live2D 与 `.mavatar` 都不可用时桌宠功能失效并在设置页与 `doctor.py` 说明原因，不显示任何替代形象；文本、提醒与回执链路不受影响（2026-10-30 修订，原"自动退回 PNG 角色"作废；2026-10-31 追加 `.mavatar`，两个载体之间也不互相兜底）。
+- Live2D 运行时与 Cubism Core 的再分发结论、真实桌面 WebGL 验证结果已记录在 §9.2（2026-10-31）；安装包不包含模型/贴图，但包含原样的 Cubism Core 时须同时携带 Live2D 专有许可条款；`mesh-avatar.min.js` 同样是随包预构建产物，版本/哈希/许可见 `web/assets/vendor/NOTICE.md`。
 - 数据目录可备份、迁移和彻底删除。
 - 安装包不包含未授权的角色、声音或模型资产。
 

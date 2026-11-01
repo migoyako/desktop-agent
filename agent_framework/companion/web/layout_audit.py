@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import struct
 import tempfile
 import time
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlencode
@@ -26,7 +28,7 @@ from .server import WebAdapter
 
 SCALES = (100, 125, 150, 200)
 PAGES = (
-    ("main", "/", (".msg", ((1000, 700), (780, 560)))),
+    ("main", "/", (".msg", ((1152, 648), (1024, 576)))),
     ("settings", "/settings", (".nav button", ((680, 560),))),
     ("console", "/console", (".tabs button", ((1040, 720),))),
     ("overlay", "/overlay", (".pet", ((300, 250),))),
@@ -41,6 +43,16 @@ SEEDS = (
     ("chat", "帮我把缩放整改讲清楚：字体放大时按钮高度、右栏标签和窗口控制都要跟得上。"),
     ("chat", "给个例子：`inline code` 与超长标识 companion_layout_audit_identifier_without_breaks"),
 )
+
+BACKGROUND_PROBE = """
+() => ({
+  on: document.documentElement.dataset.bg || "",
+  scrim: getComputedStyle(document.documentElement)
+    .getPropertyValue('--bg-scrim').trim(),
+  image: getComputedStyle(document.querySelector('.shell') || document.querySelector('.win') || document.body)
+    .backgroundImage
+})
+"""
 
 PROBE = """
 (selector) => {
@@ -133,8 +145,8 @@ def _url(adapter, path):
     return "http://{}{}?{}".format(adapter.address, path, urlencode({"t": adapter.token}))
 
 
-def _set_scale(adapter, scale):
-    body = json.dumps({"font_scale": scale}).encode("utf-8")
+def _post_ui(adapter, payload):
+    body = json.dumps(payload).encode("utf-8")
     request = Request(
         _url(adapter, "/api/ui"),
         data=body,
@@ -143,6 +155,39 @@ def _set_scale(adapter, scale):
     )
     with urlopen(request, timeout=10):
         pass
+
+
+def _set_scale(adapter, scale):
+    _post_ui(adapter, {"font_scale": scale})
+
+
+def _sample_png(size=8):
+    """A small coloured PNG so the background pass has a real image to load."""
+    raw = b"".join(
+        b"\x00" + bytes((198, 74, 108)) * size for _ in range(size)
+    )
+
+    def chunk(tag, data):
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _install_background(data_dir, persona_id):
+    folder = Path(data_dir) / "assets" / str(persona_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "background.png").write_bytes(_sample_png())
 
 
 def _wait_reply(adapter, before, limit=20.0):
@@ -192,14 +237,19 @@ def _scratch_temp(root):
                 os.environ[key] = value
 
 
-def run_audit(out_dir=None, scales=SCALES):
-    """Render every page/scale pair and return problems, control geometry and shots."""
+def run_audit(out_dir=None, scales=SCALES, background=False):
+    """Render every page/scale pair and return problems, control geometry and shots.
+
+    ``background=True`` adds the M13.2 combo: a user image is placed and enabled
+    before the pages load, and the overlay must stay transparent.
+    """
     from playwright.sync_api import sync_playwright
     shots = []
     problems = []
     controls = []
     measures = []
     chrome = []
+    background_checks = []
     output = Path(out_dir) if out_dir else None
     if output is not None:
         output.mkdir(parents=True, exist_ok=True)
@@ -207,9 +257,12 @@ def run_audit(out_dir=None, scales=SCALES):
     adapter = _adapter(Path(temp.name))
     try:
         _seed(adapter)
+        if background:
+            _install_background(Path(temp.name), adapter.runtime.persona_id)
+            _post_ui(adapter, {"background_enabled": True})
         with _scratch_temp(Path(temp.name)), sync_playwright() as playwright:
             browser = playwright.chromium.launch()
-            page = browser.new_page(viewport={"width": 1000, "height": 700})
+            page = browser.new_page(viewport={"width": 1152, "height": 648})
             try:
                 for scale in scales:
                     _set_scale(adapter, scale)
@@ -246,6 +299,34 @@ def run_audit(out_dir=None, scales=SCALES):
                                 {"page": name, "scale": scale, "size": [width, height],
                                  **result["chrome"]}
                             )
+                            if background:
+                                state = page.evaluate(BACKGROUND_PROBE)
+                                wants_image = name != "overlay"
+                                washed = state["scrim"] not in ("", "rgba(0, 0, 0, 0)")
+                                check = {
+                                    "page": name,
+                                    "scale": scale,
+                                    "size": [width, height],
+                                    "on": state["on"] == "on",
+                                    "washed": washed,
+                                    "image": "url(" in state["image"],
+                                }
+                                background_checks.append(check)
+                                if (
+                                    check["on"] != wants_image
+                                    or check["washed"] != wants_image
+                                    or check["image"] != wants_image
+                                ):
+                                    problems.append(
+                                        {
+                                            "page": name,
+                                            "scale": scale,
+                                            "size": [width, height],
+                                            "axis": "background",
+                                            "node": "html",
+                                            "delta": state,
+                                        }
+                                    )
                             if output is not None:
                                 shot = output / "{}-{}x{}-{}.png".format(name, width, height, scale)
                                 page.screenshot(path=str(shot))
@@ -268,18 +349,26 @@ def run_audit(out_dir=None, scales=SCALES):
             }
         )
     return {"problems": problems, "controls": controls, "measures": measures, "chrome": chrome,
-            "shots": shots}
+            "background": background_checks, "shots": shots}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Web 界面字号缩放回归")
     parser.add_argument("--out", help="截图输出目录，留空则不保存截图")
     parser.add_argument("--scale", type=int, action="append", help="只跑指定档位，可重复")
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="先放入并启用一张背景图，再跑一遍（浮窗必须保持透明）",
+    )
     args = parser.parse_args(argv)
     scales = tuple(args.scale) if args.scale else SCALES
-    report = run_audit(out_dir=args.out, scales=scales)
+    report = run_audit(out_dir=args.out, scales=scales, background=args.background)
     print("页面 × 档位：{} 档，问题 {} 项，控件 {} 个，截图 {} 张".format(
         len(scales), len(report["problems"]), len(report["controls"]), len(report["shots"])))
+    if args.background:
+        print("背景检查：{} 项（主窗/设置/管理台应有图与遮罩，浮窗应保持透明）".format(
+            len(report["background"])))
     for problem in report["problems"]:
         merged = {"size": "-", "scale": "?", **problem}
         print("[FAIL] {page} {size} {scale}% {axis} {node} +{delta}".format(**merged))

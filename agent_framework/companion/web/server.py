@@ -13,7 +13,7 @@ from dataclasses import fields, is_dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from ..models import AgentMode
 from ..policy import mode_label
@@ -106,6 +106,9 @@ class WebAdapter:
         self._closed = False
         self._stopped = False
         self._activate_handler = None
+        # The overlay page reports whether WebGL actually came up. Kept in
+        # memory only: a restart may find a working GPU again.
+        self._overlay_runtime = {"ok": True, "reason": ""}
 
     @property
     def address(self):
@@ -188,6 +191,8 @@ class WebAdapter:
             state.set_font_scale(body.get("font_scale"))
         if "reduce_motion" in body:
             state.set_reduce_motion(body.get("reduce_motion"))
+        if "background_enabled" in body:
+            state.set_background_enabled(body.get("background_enabled"))
         if "inspector_visible" in body:
             state.set_inspector_visible(body.get("inspector_visible"))
         if "inspector_width" in body:
@@ -200,6 +205,7 @@ class WebAdapter:
             "theme": state.theme(),
             "font_scale": state.font_scale(),
             "reduce_motion": state.reduce_motion(),
+            "background_enabled": state.background_enabled(),
             "inspector_visible": state.inspector_visible(),
             "inspector_width": state.inspector_width(),
             "overlay_visible": state.overlay_visible(),
@@ -218,6 +224,7 @@ class WebAdapter:
             "theme": self.ui_state.theme(),
             "font_scale": self.ui_state.font_scale(),
             "reduce_motion": self.ui_state.reduce_motion(),
+            "background_enabled": self.ui_state.background_enabled(),
             "inspector_visible": self.ui_state.inspector_visible(),
             "inspector_width": self.ui_state.inspector_width(),
             "overlay_visible": self.ui_state.overlay_visible(),
@@ -231,6 +238,7 @@ class WebAdapter:
                 "error": persona.get("error") or "",
             },
             "persona_preferences": persona.get("preferences") or {},
+            "assets": self.assets(),
             "mode": service.current_mode().value,
             "mode_label": mode_label(service.current_mode()),
             "workspace": self.runtime.workspace() or "",
@@ -261,11 +269,93 @@ class WebAdapter:
             "status": self._safe(lambda: self.runtime.desktop_status(), {}),
             "affect": self._affect_view(),
             "proactive": self._safe(lambda: self.runtime.proactive_status(), {}),
+            # The overlay bubble is one delivery path; the main window keeps
+            # the same events readable when the pet is unavailable.
+            "proactive_events": [
+                {
+                    "event_id": item.event_id,
+                    "text": clip(item.content, 200),
+                    "at": item.created_at,
+                    "read": item.read_at is not None,
+                    "status": item.status,
+                }
+                for item in self._safe(
+                    lambda: self.runtime.proactive_events(12), []
+                ) or []
+            ],
             "skills": self._safe(lambda: self.runtime.skills_status(), {}),
             "ui": ui,
             "draft": self._safe(lambda: service.draft(), ""),
             "settings_summary": self.settings_summary(),
         }
+
+    def assets(self):
+        payload = self._safe(lambda: self.runtime.character_assets(), {}) or {}
+        result = {"avatar": payload.get("avatar"), "background": payload.get("background")}
+        for slot in ("avatar", "background"):
+            item = result[slot]
+            if isinstance(item, dict):
+                result[slot] = dict(item, url="/api/asset/{}".format(slot))
+        live2d = payload.get("live2d")
+        valid = isinstance(live2d, dict) and bool(live2d.get("valid"))
+        runtime = self.overlay_runtime()
+        reason = ""
+        if not isinstance(live2d, dict):
+            live2d = {"size": 0, "valid": False, "expressions": []}
+            reason = "缺少 live2d/model3.json"
+        elif not valid:
+            reason = str(live2d.get("reason") or "Live2D 模型无效")
+        elif not runtime["ok"]:
+            reason = runtime["reason"] or "Live2D 运行环境不可用"
+        live2d = dict(live2d, available=valid and runtime["ok"], reason=reason)
+        if valid:
+            url = "/api/live2d/{}/model3.json".format(quote(self.token, safe=""))
+            live2d["model_url"] = "{}?v={}".format(url, int(live2d.get("stamp") or 0))
+        result["live2d"] = live2d
+
+        mesh = payload.get("mesh")
+        mesh_valid = isinstance(mesh, dict) and bool(mesh.get("valid"))
+        mesh_reason = ""
+        if not isinstance(mesh, dict):
+            mesh = {"size": 0, "valid": False, "expressions": []}
+            mesh_reason = "缺少 avatar.mavatar"
+        elif not mesh_valid:
+            mesh_reason = str(mesh.get("reason") or ".mavatar 无效")
+        elif not runtime["ok"]:
+            mesh_reason = runtime["reason"] or "mesh 运行环境不可用"
+        mesh = dict(mesh, available=mesh_valid and runtime["ok"], reason=mesh_reason)
+        if mesh_valid:
+            mesh["url"] = "/api/asset/mesh?v={}".format(int(mesh.get("stamp") or 0))
+        result["mesh"] = mesh
+
+        # One renderer per pages load: Live2D when its model file exists, else
+        # .mavatar. A broken Live2D model never silently becomes a mesh pet.
+        if isinstance(payload.get("live2d"), dict):
+            result["renderer"] = "live2d"
+            result["pet"] = dict(live2d, renderer="live2d")
+        elif isinstance(payload.get("mesh"), dict):
+            result["renderer"] = "mesh"
+            result["pet"] = dict(mesh, renderer="mesh")
+        else:
+            result["renderer"] = ""
+            result["pet"] = {
+                "available": False,
+                "reason": "缺少 live2d/model3.json 或 avatar.mavatar",
+                "renderer": "",
+            }
+        return result
+
+    def overlay_runtime(self):
+        return dict(self._overlay_runtime)
+
+    def report_overlay_runtime(self, ok, reason=""):
+        ok = bool(ok)
+        reason = "" if ok else clip(reason or "桌面形象无法启动。", 160)
+        current = self._overlay_runtime
+        self._overlay_runtime = {"ok": ok, "reason": reason}
+        if (ok, reason) != (current["ok"], current["reason"]):
+            self.broadcast({"type": "ui"})
+        return self.overlay_runtime()
 
     def sessions(self):
         rows = self._safe(lambda: self.service.session_summaries(), [])
@@ -318,6 +408,7 @@ class WebAdapter:
         status = self._safe(lambda: self.runtime.desktop_status(), {})
         affect = self._safe(lambda: self.runtime.affect_snapshot(), {})
         agent = affect.get("agent") or {}
+        assets = self.assets()
         return {
             "status": {
                 "label": status.get("label") or "待机",
@@ -332,7 +423,10 @@ class WebAdapter:
             or "数字分身",
             "theme": self.ui_state.theme(),
             "font_scale": self.ui_state.font_scale(),
+            "reduce_motion": self.ui_state.reduce_motion(),
             "collapsed": self.ui_state.overlay_collapsed(),
+            "renderer": assets.get("renderer"),
+            "pet": assets.get("pet"),
             "pending": len(self._safe(lambda: self.runtime.pending_proposals(), []) or []),
             "proactive": self._overlay_proactive(),
         }
@@ -504,6 +598,10 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
+        # Model files are fetched with relative URLs by the Live2D loader, so
+        # the token has to travel in the path; the route checks it itself.
+        if path.startswith("/api/live2d/"):
+            return self._live2d_file(path)
         if path.startswith("/api/"):
             if not self._authorized(parsed):
                 return self._json(403, {"error": "访问令牌无效。"})
@@ -548,6 +646,9 @@ class _Handler(BaseHTTPRequestHandler):
                 )
                 return self._json(200, plain(details) or {})
             return self._json(200, {"rows": [plain(item) for item in adapter._memories()]})
+        match = re.match(r"^/api/asset/([a-z]+)$", path)
+        if match:
+            return self._character_asset(match.group(1))
         match = re.match(r"^/api/console/([a-z]+)$", path)
         if match:
             return self._json(200, adapter.console_page(match.group(1)))
@@ -586,6 +687,13 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"saved": True})
             if path == "/api/ui":
                 return self._json(200, adapter.update_ui(body))
+            if path == "/api/overlay/runtime":
+                ok = body.get("ok")
+                if not isinstance(ok, bool):
+                    return self._json(400, {"error": "ok 必须是布尔值。"})
+                return self._json(
+                    200, adapter.report_overlay_runtime(ok, str(body.get("reason") or ""))
+                )
             if path == "/api/persona":
                 content = service.runtime.set_persona_preference(
                     str(body.get("field") or ""), body.get("content")
@@ -719,6 +827,65 @@ class _Handler(BaseHTTPRequestHandler):
         return self._json(200, plain(result) or {})
 
     # -- plumbing ------------------------------------------------------
+
+    def _character_asset(self, slot):
+        content_type = None
+        if slot == "avatar":
+            asset = self.adapter.runtime.avatar_asset()
+            missing = "没有头像素材。"
+        elif slot == "background":
+            asset = self.adapter.runtime.background_asset()
+            missing = "没有背景素材。"
+        elif slot == "mesh":
+            asset = self.adapter.runtime.mesh_asset()
+            missing = "没有 .mavatar 桌宠素材。"
+            if asset is not None and not asset.valid:
+                return self._json(404, {"error": asset.reason or ".mavatar 无效。"})
+            content_type = "application/zip"
+        else:
+            return self._json(404, {"error": "未找到。"})
+        if asset is None:
+            return self._json(404, {"error": missing})
+        try:
+            data = asset.path.read_bytes()
+        except OSError:
+            return self._json(404, {"error": "素材不可读。"})
+        if content_type is None:
+            content_type = {
+                "png": "image/png",
+                "webp": "image/webp",
+                "jpg": "image/jpeg",
+            }[asset.kind]
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _live2d_file(self, path):
+        match = re.match(r"^/api/live2d/([^/]+)/(.+)$", path)
+        if not match:
+            return self._json(404, {"error": "未找到。"})
+        supplied, relative = match.groups()
+        if not secrets.compare_digest(supplied, self.adapter.token):
+            return self._json(403, {"error": "访问令牌无效。"})
+        result = self.adapter.runtime.live2d_file(relative)
+        if result is None:
+            return self._json(404, {"error": "未找到。"})
+        target, media = result
+        try:
+            data = target.read_bytes()
+        except OSError:
+            return self._json(404, {"error": "素材不可读。"})
+        self.send_response(200)
+        self.send_header("Content-Type", media)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _authorized(self, parsed):
         supplied = (parse_qs(parsed.query).get("t") or [""])[0]

@@ -36,6 +36,7 @@
     theme: { cat: "data", name: "主题", desc: "经典深色与珍珠白" },
     font: { cat: "data", name: "字号", desc: "100% – 200% 缩放" },
     motion: { cat: "data", name: "减少动效", desc: "关闭过渡与呼吸动画" },
+    background: { cat: "data", name: "背景图", desc: "主窗、设置与管理台" },
     overlay: { cat: "data", name: "桌面浮窗", desc: "形象与主动气泡" },
   };
 
@@ -105,6 +106,7 @@
     document.documentElement.dataset.theme = ui.theme || "charcoal-pink";
     document.documentElement.style.setProperty("--scale", String((ui.font_scale || 100) / 100));
     document.body.classList.toggle("reduce-motion", Boolean(ui.reduce_motion));
+    CompanionBackground.apply(ui, (state.data || {}).assets, token);
   }
 
   function renderNav() {
@@ -199,6 +201,13 @@
     );
   }
 
+  function avatarMarkup() {
+    const avatar = (state.data.assets || {}).avatar;
+    if (!avatar) return "";
+    const src = avatar.url + "?t=" + encodeURIComponent(token) + "&v=" + avatar.stamp;
+    return `<img class="persona-avatar" src="${src}" alt="当前人设头像" width="64" height="64">`;
+  }
+
   function panelPersona() {
     const info = state.data.persona || {};
     const prefs = state.data.persona_preferences || {};
@@ -211,9 +220,12 @@
     </div>`;
     return wrapPanel(
       "persona",
-      `<div class="stat-grid">
-        <div class="stat"><div class="k">当前人设</div><div class="v">${escapeHtml(info.name || "数字分身")}</div></div>
-        <div class="stat"><div class="k">版本</div><div class="v">${escapeHtml(info.version || "未加载")}</div></div>
+      `<div class="persona-head">
+        ${avatarMarkup()}
+        <div class="stat-grid">
+          <div class="stat"><div class="k">当前人设</div><div class="v">${escapeHtml(info.name || "数字分身")}</div></div>
+          <div class="stat"><div class="k">版本</div><div class="v">${escapeHtml(info.version || "未加载")}</div></div>
+        </div>
       </div>
       ${field("address", "称呼", "希望被怎么称呼")}
       ${field("relationship", "关系", "你们之间的关系")}
@@ -319,13 +331,52 @@
 
   function panelOverlay() {
     const on = Boolean(state.data.ui.overlay_visible);
+    const pet = (state.data.assets || {}).pet || {};
+    const available = Boolean(pet.available);
+    const reason = String(pet.reason || "缺少 Live2D 模型或 avatar.mavatar");
+    const disabled = available
+      ? ""
+      : ` disabled aria-disabled="true" title="${escapeHtml(reason)}"`;
+    const notes = available
+      ? `<div class="hint">浮窗可以拖动；双击形象会回到主窗口。</div>`
+      : `<div class="hint danger-text">桌面浮窗不可用：${escapeHtml(
+          reason
+        )}。请把 Live2D 模型放到 data/assets/&lt;人设&gt;/live2d/model3.json，或把 .mavatar 归档放到 data/assets/&lt;人设&gt;/avatar.mavatar 后重启程序。</div>
+        <div class="hint">不会显示替代形象；主动消息仍可在主窗口“任务”面板和托盘查看。</div>`;
     return wrapPanel(
       "overlay",
       `<div class="switch-row">
         <div class="text"><div class="name">显示桌面浮窗</div><div class="desc">在桌面右下角显示形象与主动气泡</div></div>
-        <button class="switch ${on ? "on" : ""}" id="overlaySwitch"></button>
+        <button class="switch ${on ? "on" : ""}" id="overlaySwitch"${disabled}></button>
       </div>
-      <div class="hint">浮窗可以拖动；双击形象会回到主窗口。</div>`
+      ${notes}`
+    );
+  }
+
+  function panelBackground() {
+    const assets = state.data.assets || {};
+    const background = assets.background;
+    const enabled = Boolean(state.data.ui.background_enabled);
+    const using = enabled && Boolean(background);
+    const src = background
+      ? background.url + "?t=" + encodeURIComponent(token) + "&v=" + background.stamp
+      : "";
+    const preview = background
+      ? `<img class="bg-preview" src="${src}" alt="当前背景图">`
+      : '<div class="bg-preview none">未检测到背景图</div>';
+    return wrapPanel(
+      "background",
+      `${preview}
+      <div class="hint">把图片放到 data/assets/remielle/background.png（也支持 .jpg 与 .webp），回到这里启用。程序只读取，不会复制、重命名或删除你的文件；桌面浮窗始终透明。</div>
+      <div class="form-actions">
+        <button class="primary" data-bg-use ${background && !enabled ? "" : "disabled"}>使用背景</button>
+        <button class="ghost" data-bg-clear ${enabled ? "" : "disabled"}>清除背景</button>
+      </div>
+      <div class="hint">${
+        using
+          ? "当前已启用：主窗、设置与管理台显示这张图，遮罩由当前主题自动决定。"
+          : "当前未启用：界面保持纯色主题。"
+      }</div>`
     );
   }
 
@@ -339,6 +390,7 @@
     theme: panelTheme,
     font: panelFont,
     motion: panelMotion,
+    background: panelBackground,
     overlay: panelOverlay,
   };
 
@@ -402,6 +454,18 @@
         memory.classList.toggle("on");
         return;
       }
+      const useBg = event.target.closest("[data-bg-use]");
+      if (useBg) {
+        await setUi({ background_enabled: true });
+        toast("已启用背景图");
+        return;
+      }
+      const clearBg = event.target.closest("[data-bg-clear]");
+      if (clearBg) {
+        await setUi({ background_enabled: false });
+        toast("已清除背景显示");
+        return;
+      }
       const motion = event.target.closest("#motionSwitch");
       if (motion) {
         await setUi({ reduce_motion: !state.data.ui.reduce_motion });
@@ -409,6 +473,11 @@
       }
       const overlay = event.target.closest("#overlaySwitch");
       if (overlay) {
+        const pet = (state.data.assets || {}).pet || {};
+        if (!pet.available) {
+          toast("桌面浮窗不可用：" + (pet.reason || "缺少形象素材"));
+          return;
+        }
         const value = !state.data.ui.overlay_visible;
         await setUi({ overlay_visible: value });
         if (state.host) state.host.setOverlayVisible(value);
@@ -506,13 +575,15 @@
         }
       }
     };
-    document.addEventListener("click", (event) => {
+    document.addEventListener("click", async (event) => {
       const entry = event.target.closest("[data-panel]");
       if (entry) {
         state.panel = entry.dataset.panel;
         state.filter = "";
         el.search.value = "";
-        render();
+        // The asset folder is user-managed, so re-read it when the panel opens.
+        if (state.panel === "background") await refresh();
+        else render();
       }
     });
     bindDrag();

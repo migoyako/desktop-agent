@@ -1,6 +1,7 @@
 """HTTP adapter that hands the Pixso design to the web front end."""
 
 import json
+import base64
 import queue
 import socket
 import tempfile
@@ -9,6 +10,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 from urllib.parse import quote
 
@@ -21,6 +23,11 @@ from agent_framework.companion.store import CompanionStore
 from agent_framework.companion.web import WebAdapter
 from agent_framework.llm import OfflineLLMClient
 
+# 1x1 transparent PNG
+PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
 
 class StubSearch:
     def search(self, query, limit=5):
@@ -31,6 +38,7 @@ class WebAdapterTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
+        self.root = root
         store = CompanionStore(root / "companion.db")
         runtime = CompanionRuntime(
             store=store,
@@ -89,6 +97,286 @@ class WebAdapterTests(unittest.TestCase):
             self.assertIn(key, payload)
         status, _ = self.request("/api/bootstrap", token="wrong-token")
         self.assertEqual(403, status)
+
+    def test_character_asset_slot_is_token_gated(self):
+        status, payload = self.request("/api/bootstrap")
+        self.assertEqual(200, status)
+        self.assertIsNone(payload["assets"]["avatar"])
+        live2d = payload["assets"]["live2d"]
+        self.assertFalse(live2d["available"])
+        self.assertFalse(live2d["valid"])
+        self.assertIn("model3.json", live2d["reason"])
+        mesh = payload["assets"]["mesh"]
+        self.assertFalse(mesh["available"])
+        self.assertFalse(mesh["valid"])
+        self.assertIn("avatar.mavatar", mesh["reason"])
+        self.assertEqual("", payload["assets"]["renderer"])
+        self.assertFalse(payload["assets"]["pet"]["available"])
+        status, _ = self.request("/api/asset/avatar")
+        self.assertEqual(404, status)
+        status, _ = self.request("/api/asset/mesh")
+        self.assertEqual(404, status)
+        status, _ = self.request("/api/asset/avatar", token="wrong-token")
+        self.assertEqual(403, status)
+        for path in (
+            "/api/asset/background",
+            "/api/asset/mesh",
+            "/api/asset/avatar/..",
+            "/api/asset/avatar%2F..%2Fcompanion.db",
+        ):
+            with self.subTest(path=path):
+                status, _ = self.request(path)
+                self.assertEqual(404, status)
+
+    def test_avatar_is_served_after_placing_the_file(self):
+        folder = self.root / "assets" / "remielle"
+        folder.mkdir(parents=True)
+        (folder / "avatar.png").write_bytes(PNG_1PX)
+        status, payload = self.request("/api/bootstrap")
+        avatar = payload["assets"]["avatar"]
+        self.assertEqual("png", avatar["kind"])
+        self.assertEqual(len(PNG_1PX), avatar["size"])
+        self.assertEqual("/api/asset/avatar", avatar["url"])
+        source = "{}/api/asset/avatar?t={}".format(self.base, self.adapter.token)
+        with urllib.request.urlopen(source, timeout=10) as response:
+            self.assertEqual(200, response.status)
+            self.assertEqual("image/png", response.headers["Content-Type"])
+            self.assertEqual(str(len(PNG_1PX)), response.headers["Content-Length"])
+            self.assertEqual(PNG_1PX, response.read())
+
+    def test_avatar_disappears_when_the_file_is_removed(self):
+        folder = self.root / "assets" / "remielle"
+        folder.mkdir(parents=True)
+        avatar = folder / "avatar.png"
+        avatar.write_bytes(PNG_1PX)
+        status, payload = self.request("/api/bootstrap")
+        self.assertIsNotNone(payload["assets"]["avatar"])
+        avatar.unlink()
+        status, payload = self.request("/api/bootstrap")
+        self.assertIsNone(payload["assets"]["avatar"])
+        status, _ = self.request("/api/asset/avatar")
+        self.assertEqual(404, status)
+
+    def test_background_is_served_after_placing_the_file(self):
+        folder = self.root / "assets" / "remielle"
+        folder.mkdir(parents=True)
+        (folder / "background.png").write_bytes(PNG_1PX)
+        status, payload = self.request("/api/bootstrap")
+        background = payload["assets"]["background"]
+        self.assertEqual("png", background["kind"])
+        self.assertEqual(len(PNG_1PX), background["size"])
+        self.assertEqual("/api/asset/background", background["url"])
+        source = "{}/api/asset/background?t={}".format(self.base, self.adapter.token)
+        with urllib.request.urlopen(source, timeout=10) as response:
+            self.assertEqual(200, response.status)
+            self.assertEqual("image/png", response.headers["Content-Type"])
+            self.assertEqual(PNG_1PX, response.read())
+        status, _ = self.request("/api/asset/background", token="wrong-token")
+        self.assertEqual(403, status)
+
+    def test_background_switch_persists_and_broadcasts(self):
+        _, payload = self.request("/api/bootstrap")
+        self.assertTrue(payload["ui"]["background_enabled"])
+        channel = self.adapter.subscribe()
+        try:
+            status, payload = self.request("/api/ui", {"background_enabled": False})
+        finally:
+            self.adapter.unsubscribe(channel)
+        self.assertEqual(200, status)
+        self.assertFalse(payload["background_enabled"])
+        message = json.loads(channel.get(timeout=2))
+        self.assertEqual("ui", message["type"])
+        self.assertFalse(message["ui"]["background_enabled"])
+        _, bootstrap = self.request("/api/bootstrap")
+        self.assertFalse(bootstrap["ui"]["background_enabled"])
+        status, payload = self.request("/api/ui", {"background_enabled": True})
+        self.assertTrue(payload["background_enabled"])
+
+    def live2d_model(self):
+        entry = self.root / "assets" / "remielle" / "live2d"
+        (entry / "textures").mkdir(parents=True)
+        (entry / "textures" / "tex.png").write_bytes(PNG_1PX)
+        (entry / "model3.json").write_text(
+            json.dumps(
+                {
+                    "FileReferences": {
+                        "Moc": "model.moc3",
+                        "Textures": ["textures/tex.png"],
+                        "Expressions": [
+                            {"Name": "calm", "File": "expressions/calm.exp3.json"}
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (entry / "model.moc3").write_bytes(b"MOC3" + b"\x00" * 12)
+        return entry
+
+    def test_live2d_entry_is_reported_and_served_by_path_token(self):
+        self.live2d_model()
+        status, payload = self.request("/api/bootstrap")
+        self.assertEqual(200, status)
+        live2d = payload["assets"]["live2d"]
+        self.assertTrue(live2d["valid"])
+        self.assertTrue(live2d["available"])
+        self.assertEqual(["calm"], live2d["expressions"])
+        self.assertTrue(live2d["model_url"].startswith("/api/live2d/"))
+        status, _ = self.request("/api/asset/live2d")
+        self.assertEqual(404, status)
+        with urllib.request.urlopen(
+            self.base + live2d["model_url"], timeout=10
+        ) as response:
+            self.assertEqual(200, response.status)
+            body = json.loads(response.read().decode("utf-8"))
+        self.assertEqual("model.moc3", body["FileReferences"]["Moc"])
+        token = self.adapter.token
+        with urllib.request.urlopen(
+            self.base + "/api/live2d/{}/textures/tex.png".format(token), timeout=10
+        ) as response:
+            self.assertEqual(200, response.status)
+            self.assertEqual(PNG_1PX, response.read())
+        for path in (
+            "/api/live2d/{}/../model3.json".format(token),
+            "/api/live2d/{}/%2e%2e/secret.png".format(token),
+            "/api/live2d/{}/textures/../../companion.db".format(token),
+            "/api/live2d/{}/textures/tex.gif".format(token),
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(self.base + path, timeout=10)
+                self.assertEqual(404, caught.exception.code)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(
+                self.base + "/api/live2d/wrong-token/model3.json", timeout=10
+            )
+        self.assertEqual(403, caught.exception.code)
+
+    def mesh_archive(self):
+        folder = self.root / "assets" / "remielle"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "avatar.mavatar"
+        curve = lambda x0, x1: {
+            "x0": x0,
+            "x1": x1,
+            "top": [0.0] * 24,
+            "bot": [1.0] * 24,
+        }
+        files = {
+            "avatar.json": json.dumps(
+                {"format": "mesh-avatar", "version": 1, "name": "web-mesh"}
+            ),
+            "rig.json": json.dumps({"version": 1}),
+            "built/layers.json": json.dumps(
+                {
+                    "size": [16, 16],
+                    "layers": {"eye0_ball": [0, 0, 2, 2]},
+                    "eyes": [curve(2, 4), curve(8, 10)],
+                }
+            ),
+            "built/base.png": PNG_1PX,
+            "built/hairmask.png": PNG_1PX,
+            "built/eye0_ball.png": PNG_1PX,
+        }
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
+            for name, data in files.items():
+                archive.writestr(name, data)
+        return path
+
+    def test_mesh_archive_is_served_and_selected_without_live2d(self):
+        archive = self.mesh_archive()
+        _, payload = self.request("/api/bootstrap")
+        assets = payload["assets"]
+        self.assertEqual("mesh", assets["renderer"])
+        self.assertTrue(assets["mesh"]["valid"])
+        self.assertTrue(assets["mesh"]["available"])
+        self.assertEqual("web-mesh", assets["mesh"]["name"])
+        self.assertEqual("mesh", assets["pet"]["renderer"])
+        self.assertTrue(assets["pet"]["available"])
+        self.assertTrue(assets["pet"]["url"].startswith("/api/asset/mesh"))
+        request = urllib.request.Request(
+            self.base + "/api/asset/mesh",
+            headers={"X-Companion-Token": self.adapter.token},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual("application/zip", response.headers.get("Content-Type"))
+            self.assertEqual(archive.read_bytes(), response.read())
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    self.base + "/api/asset/mesh",
+                    headers={"X-Companion-Token": "wrong-token"},
+                ),
+                timeout=10,
+            )
+        self.assertEqual(403, caught.exception.code)
+        _, overlay = self.request("/api/overlay")
+        self.assertEqual("mesh", overlay["renderer"])
+        self.assertEqual("mesh", overlay["pet"]["renderer"])
+        self.assertTrue(overlay["pet"]["available"])
+        # A Live2D model file takes precedence over the mesh archive.
+        self.live2d_model()
+        _, payload = self.request("/api/bootstrap")
+        self.assertEqual("live2d", payload["assets"]["renderer"])
+        self.assertEqual("live2d", payload["assets"]["pet"]["renderer"])
+
+    def test_invalid_mesh_archive_is_not_served(self):
+        folder = self.root / "assets" / "remielle"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "avatar.mavatar").write_bytes(b"not a zip")
+        status, body = self.request("/api/asset/mesh")
+        self.assertEqual(404, status)
+        self.assertIn("归档", body["error"])
+        _, payload = self.request("/api/bootstrap")
+        self.assertFalse(payload["assets"]["mesh"]["available"])
+        self.assertFalse(payload["assets"]["pet"]["available"])
+
+    def test_overlay_runtime_failure_disables_the_pet(self):
+        self.live2d_model()
+        channel = self.adapter.subscribe()
+        try:
+            status, payload = self.request(
+                "/api/overlay/runtime", {"ok": False, "reason": "WebGL 不可用"}
+            )
+        finally:
+            self.adapter.unsubscribe(channel)
+        self.assertEqual(200, status)
+        self.assertFalse(payload["ok"])
+        message = json.loads(channel.get(timeout=2))
+        self.assertEqual("ui", message["type"])
+        _, bootstrap = self.request("/api/bootstrap")
+        live2d = bootstrap["assets"]["live2d"]
+        self.assertFalse(live2d["available"])
+        self.assertIn("WebGL", live2d["reason"])
+        _, overlay = self.request("/api/overlay")
+        self.assertFalse(overlay["pet"]["available"])
+        self.request("/api/overlay/runtime", {"ok": True})
+        _, bootstrap = self.request("/api/bootstrap")
+        self.assertTrue(bootstrap["assets"]["live2d"]["available"])
+        status, _ = self.request("/api/overlay/runtime", {"ok": "yes"})
+        self.assertEqual(400, status)
+
+    def test_bootstrap_carries_proactive_events_for_the_main_window(self):
+        self.service.runtime.store.add_proactive_event(
+            session_id="main",
+            source_type="system",
+            source_id="m133",
+            trigger_reason="probe",
+            content="记得喝水，休息一下。",
+            status="delivered",
+        )
+        status, payload = self.request("/api/bootstrap")
+        self.assertEqual(200, status)
+        events = payload["proactive_events"]
+        self.assertEqual(1, len(events))
+        self.assertEqual("记得喝水，休息一下。", events[0]["text"])
+        self.assertFalse(events[0]["read"])
+        status, result = self.request(
+            "/api/proactive", {"action": "read", "event_id": events[0]["event_id"]}
+        )
+        self.assertEqual(200, status)
+        _, payload = self.request("/api/bootstrap")
+        self.assertTrue(payload["proactive_events"][0]["read"])
 
     def test_ui_update_persists_and_broadcasts(self):
         channel = self.adapter.subscribe()

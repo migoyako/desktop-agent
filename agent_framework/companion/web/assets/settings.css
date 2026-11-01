@@ -256,6 +256,44 @@ body {
   gap: var(--sp-md);
 }
 
+.persona-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-lg);
+}
+
+.persona-head .stat-grid {
+  flex: 1;
+}
+
+.persona-avatar {
+  flex: none;
+  width: calc(var(--fs-display) * 2.6);
+  height: calc(var(--fs-display) * 2.6);
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  background: var(--page);
+}
+
+/* M13.2: the chosen window background, shown at the same 16:9-ish crop. */
+.bg-preview {
+  display: block;
+  width: 100%;
+  height: calc(var(--fs-display) * 8);
+  object-fit: cover;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.bg-preview.none {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: var(--fs-caption);
+}
+
 .stat {
   padding: var(--sp-md);
   border: 1px solid var(--border);

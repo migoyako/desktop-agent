@@ -18,6 +18,7 @@ ASSETS = (
 PAGES = ("tokens.css", "app.css", "settings.css", "console.css")
 
 FIXED_HEIGHT = re.compile(r"^\s*height:\s*\d+px", re.MULTILINE)
+OUTLINE_NONE = re.compile(r"(?m)^([^\n{}]+)\{\s*outline:\s*none;\s*\}")
 PX_SPACING = re.compile(r"^\s*(padding|margin|gap)[a-z-]*:\s*\d+px \d+px", re.MULTILINE)
 PX_FONT_SIZE = re.compile(r"^\s*font-size:\s*\d+px", re.MULTILINE)
 MEDIA_BLOCK = re.compile(r"@media[^{]*\{(?:[^{}]|\{[^{}]*\})*\}")
@@ -123,10 +124,11 @@ class OverflowAndReachabilityTests(unittest.TestCase):
         self.assertIn("max-height", block)
         self.assertIn("var(--pet-size)", rule_block(overlay, ".pet"))
 
-    def test_avatar_box_holds_its_own_graphic(self):
-        block = rule_block(asset("overlay.css"), ".pet svg")
+    def test_stage_canvas_fills_the_pet_box(self):
+        block = rule_block(asset("overlay.css"), ".pet canvas")
         self.assertIn("display: block", block)
-        self.assertIn("var(--pet-size)", block)
+        self.assertIn("width: 100%", block)
+        self.assertIn("height: 100%", block)
 
     def test_responsive_breakpoints_follow_the_font_scale(self):
         script = asset("app.js")
@@ -165,9 +167,29 @@ class AccessibilityMarkupTests(unittest.TestCase):
         self.assertIn("onkeydown", script)
 
     def test_focus_ring_is_visible(self):
-        self.assertIn(":focus-visible", asset("tokens.css"))
+        tokens = asset("tokens.css")
+        self.assertIn("outline: 2px solid var(--accent)", rule_block(tokens, ":focus-visible"))
+        # Only the two text controls may drop their own outline; both delegate
+        # the visible ring to the rounded container that wraps them.
+        allowed = {
+            ".composer textarea:focus-visible",
+            ".rail-search input:focus-visible",
+        }
         for name in PAGES + ("overlay.css",):
-            self.assertNotIn("outline: none", asset(name), name)
+            selectors = {match.group(1).strip() for match in OUTLINE_NONE.finditer(asset(name))}
+            self.assertLessEqual(selectors, allowed, name)
+
+    def test_text_controls_ring_their_container(self):
+        app = asset("app.css")
+        for selector in (".composer textarea:focus-visible", ".rail-search input:focus-visible"):
+            self.assertIn("outline: none", rule_block(app, selector), selector)
+        composer = rule_block(app, ".composer:focus-within")
+        self.assertIn("var(--accent)", composer)
+        self.assertIn("0 0 0 2px var(--accent-soft)", composer)
+        self.assertIn(
+            "0 0 0 2px var(--accent-soft)",
+            rule_block(app, ".rail-search:focus-within"),
+        )
 
 
 class ContextGaugeTests(unittest.TestCase):
@@ -584,25 +606,42 @@ class MessageActionTests(unittest.TestCase):
 class OverlayCapabilityTests(unittest.TestCase):
     """M12.4: one avatar mount point, a real menu, and pushed updates."""
 
-    def test_avatar_art_lives_in_one_module(self):
-        script = asset("avatar.js")
-        self.assertIn("global.CompanionAvatar", script)
-        for name in ("group: group", "mount: mount", "svg: svg"):
-            self.assertIn(name, script)
-        for name in ("app.js", "overlay.js"):
+    def test_stage_module_is_the_only_figure(self):
+        self.assertFalse((ASSETS / "avatar.js").exists())
+        overlay = asset("overlay.js")
+        self.assertNotIn("avatarSvg", overlay)
+        self.assertNotIn("CompanionAvatar", overlay)
+        self.assertIn("CompanionStage", overlay)
+        self.assertIn("CompanionMeshStage", overlay)
+        for name in ("app.js", "settings.js", "console.js"):
             with self.subTest(script=name):
                 page = asset(name)
-                self.assertNotIn("function avatarSvg", page)
-                self.assertIn("CompanionAvatar.mount", page)
-        for name in ("index.html", "overlay.html"):
-            markup = asset(name)
-            scripts = re.findall(r'<script src="([^"]+)"', markup)
-            self.assertIn("/assets/avatar.js", scripts)
-            page_script = "/assets/app.js" if name == "index.html" else "/assets/overlay.js"
-            self.assertLess(scripts.index("/assets/avatar.js"), scripts.index(page_script))
+                self.assertNotIn("avatarSvg", page)
+                self.assertNotIn("CompanionAvatar", page)
 
-    def test_avatar_moods_match_the_affect_labels(self):
-        script = asset("avatar.js")
+    def test_only_the_overlay_loads_the_live2d_stage(self):
+        scripts = re.findall(
+            r'<script src="([^"]+)"', asset("overlay.html")
+        )
+        self.assertIn("/assets/stage.js", scripts)
+        self.assertIn("/assets/mesh-stage.js", scripts)
+        for vendor in (
+            "/assets/vendor/pixi.min.js",
+            "/assets/vendor/live2dcubismcore.min.js",
+            "/assets/vendor/pixi-live2d-display-cubism4.min.js",
+            "/assets/vendor/mesh-avatar.min.js",
+        ):
+            self.assertIn(vendor, scripts)
+        for stage in ("/assets/stage.js", "/assets/mesh-stage.js"):
+            self.assertLess(scripts.index(stage), scripts.index("/assets/overlay.js"))
+        self.assertNotIn("/assets/avatar.js", scripts)
+        index = re.findall(r'<script src="([^"]+)"', asset("index.html"))
+        self.assertNotIn("/assets/stage.js", index)
+        self.assertNotIn("/assets/mesh-stage.js", index)
+        self.assertNotIn("/assets/avatar.js", index)
+
+    def test_expression_groups_match_the_affect_labels(self):
+        script = asset("stage.js")
         warm = re.search(r"const WARM = \[([^\]]+)\]", script).group(1)
         low = re.search(r"const LOW = \[([^\]]+)\]", script).group(1)
         self.assertIn('"warm"', warm)
@@ -613,6 +652,9 @@ class OverlayCapabilityTests(unittest.TestCase):
         affect = (ASSETS.parent.parent.parent / "companion" / "affect.py").read_text(encoding="utf-8")
         for label in ("warm", "positive", "low", "tired", "concerned"):
             self.assertIn('"' + label + '"', affect)
+        mesh = asset("mesh-stage.js")
+        for label in ("warm", "positive", "low", "tired", "concerned"):
+            self.assertIn('"' + label + '"', mesh)
 
     def test_context_menu_offers_the_four_actions(self):
         markup = asset("overlay.html")
@@ -659,6 +701,176 @@ class OverlayCapabilityTests(unittest.TestCase):
         self.assertIn("state.timer = setTimeout(acknowledge, BUBBLE_MS);", script)
         self.assertIn("if (state.kind === \"proactive\") acknowledge();", script)
         self.assertIn('state.seen.add(event.id)', script)
+
+
+class Live2dRuntimeContractTests(unittest.TestCase):
+    """M13.3: Live2D is the only figure; unavailable means no pet, not a stand-in."""
+
+    def test_vendored_runtime_and_stage_are_served_locally(self):
+        for name in (
+            "vendor/pixi.min.js",
+            "vendor/live2dcubismcore.min.js",
+            "vendor/pixi-live2d-display-cubism4.min.js",
+            "vendor/process-env.js",
+            "vendor/mesh-avatar.min.js",
+            "stage.js",
+            "mesh-stage.js",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue((ASSETS / name).is_file(), name)
+
+    def test_mesh_stage_mounts_the_archive_without_a_fallback(self):
+        script = asset("mesh-stage.js")
+        for needle in (
+            "MeshAvatarRuntime.loadMeshAvatar",
+            "X-Companion-Token",
+            "manual: true",
+            "setExpression",
+            "advance(0)",
+            "setAutoIdle(false)",
+            "setSwayGain(0)",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, script)
+        self.assertNotIn("<img", script)
+        self.assertNotIn("avatarSvg", script)
+
+    def test_hit_region_is_what_keeps_clicks_on_the_pet(self):
+        script = asset("overlay.js")
+        self.assertIn("window.__companionHit", script)
+        self.assertIn("document.elementFromPoint(x, y)", script)
+        for selector in ("#pet, #ball, #bubble, #quick, #menu, #close"):
+            self.assertIn(selector, script)
+
+    def test_reduce_motion_and_scale_stay_on_the_stage_container(self):
+        stage = asset("stage.js")
+        self.assertIn("autoStart: !options.reduceMotion", stage)
+        self.assertIn("setReduceMotion", stage)
+        overlay = asset("overlay.css")
+        self.assertIn("clamp(120px, calc(132px * var(--scale)), 150px)", overlay)
+        script = asset("overlay.js")
+        self.assertIn(".mount(el.pet, options)", script)
+        self.assertIn("reduceMotion", script)
+
+    def test_settings_explain_why_the_pet_is_disabled(self):
+        script = asset("settings.js")
+        self.assertIn("disabled aria-disabled", script)
+        self.assertIn("桌面浮窗不可用", script)
+        self.assertIn("不会显示替代形象", script)
+        self.assertIn("pet.available", script)
+        self.assertIn("avatar.mavatar", script)
+
+    def test_main_window_keeps_proactive_messages_reachable(self):
+        script = asset("app.js")
+        self.assertIn("function proactiveCard()", script)
+        self.assertIn("state.data.proactive_events", script)
+        self.assertIn("data-proactive-read", script)
+        self.assertIn("data-proactive-read-all", script)
+
+
+class CharacterAssetSlotTests(unittest.TestCase):
+    """M13.1: slots show the user's avatar when present and stay empty otherwise."""
+
+    def test_header_renders_the_avatar_asset(self):
+        script = asset("app.js")
+        self.assertIn("function renderAvatar()", script)
+        self.assertIn("(state.data.assets || {}).avatar", script)
+        self.assertIn("avatar.url", script)
+        self.assertIn("avatar.stamp", script)
+        self.assertIn("el.avatarSlot.innerHTML = src", script)
+        self.assertIn('alt=""', script)
+
+    def test_empty_slot_does_not_hold_space(self):
+        css = asset("app.css")
+        self.assertIn("display: none", rule_block(css, "#avatarSlot:empty"))
+        block = rule_block(css, ".avatar")
+        self.assertIn("var(--fs-display)", block)
+        self.assertIn("object-fit: cover", block)
+
+    def test_settings_and_console_share_the_same_slot(self):
+        for name, sheet in (("settings", "settings.css"), ("console", "console.css")):
+            with self.subTest(page=name):
+                script = asset(name + ".js")
+                self.assertIn('class="persona-avatar"', script)
+                self.assertIn("avatar.url", script)
+                self.assertIn("avatar.stamp", script)
+                css = asset(sheet)
+                self.assertIn("var(--fs-display)", rule_block(css, ".persona-avatar"))
+                self.assertIn("object-fit: cover", rule_block(css, ".persona-avatar"))
+                self.assertIn("display: flex", rule_block(css, ".persona-head"))
+
+    def test_asset_route_is_token_gated_and_reads_only_the_slot(self):
+        server = (ASSETS.parent / "server.py").read_text(encoding="utf-8")
+        self.assertIn('re.match(r"^/api/asset/([a-z]+)$", path)', server)
+        self.assertIn("avatar_asset()", server)
+        self.assertIn("background_asset()", server)
+        self.assertNotIn('"/assets/" + slot', server)
+        start = server.index("def _character_asset(")
+        block = server[start : server.index("def _authorized(", start)]
+        self.assertIn("read_bytes()", block)
+        self.assertIn("Content-Length", block)
+
+    def test_bootstrap_publishes_the_asset_state(self):
+        server = (ASSETS.parent / "server.py").read_text(encoding="utf-8")
+        self.assertIn('"assets": self.assets(),', server)
+        self.assertIn('"/api/asset/{}".format(slot)', server)
+
+    def test_doctor_reports_character_assets(self):
+        doctor = (ASSETS.parents[3] / "doctor.py").read_text(encoding="utf-8")
+        self.assertIn("character_assets_check", doctor)
+        self.assertIn('check("Character assets", False', doctor)
+        self.assertIn('"Character assets"', doctor)
+
+
+class BackgroundLayerTests(unittest.TestCase):
+    """M13.2: one photo switch for the three windows, never the overlay."""
+
+    def test_the_module_is_shared_by_chrome_windows_only(self):
+        module = asset("background.js")
+        self.assertIn("CompanionBackground", module)
+        self.assertIn('root.dataset.bg = "on"', module)
+        self.assertIn('style.removeProperty("--bg-image")', module)
+        for page in ("index.html", "settings.html", "console.html"):
+            with self.subTest(page=page):
+                self.assertIn("/assets/background.js", asset(page))
+        self.assertNotIn("/assets/background.js", asset("overlay.html"))
+
+    def test_each_page_applies_the_switch(self):
+        for script in ("app.js", "settings.js"):
+            with self.subTest(script=script):
+                self.assertIn("CompanionBackground.apply(", asset(script))
+        self.assertIn(
+            "CompanionBackground.apply(bootstrap.ui, bootstrap.assets, token)",
+            asset("console.js"),
+        )
+
+    def test_the_scrim_seam_is_assigned_only_for_a_background(self):
+        tokens = asset("tokens.css")
+        self.assertEqual(2, tokens.count("--bg-scrim:"))
+        self.assertIn('html[data-bg="on"]', tokens)
+        self.assertIn(
+            "--bg-scrim: var(--bg-scrim-image);",
+            rule_block(tokens, 'html[data-bg="on"]'),
+        )
+        for theme in (
+            ':root,\n:root[data-theme="charcoal-pink"]',
+            ':root[data-theme="pearl-white"]',
+        ):
+            with self.subTest(theme=theme):
+                self.assertIn("--bg-scrim-image:", rule_block(tokens, theme))
+        self.assertIn("var(--bg-image) center / cover no-repeat", rule_block(asset("app.css"), ".shell"))
+        self.assertIn("var(--bg-image) center / cover no-repeat", rule_block(tokens, ".win"))
+
+    def test_settings_offer_use_and_clear_without_deleting_the_file(self):
+        script = asset("settings.js")
+        self.assertIn("function panelBackground()", script)
+        self.assertIn("background_enabled", script)
+        self.assertIn('data-bg-use', script)
+        self.assertIn('data-bg-clear', script)
+        self.assertIn("不会复制、重命名或删除你的文件", script)
+        css = asset("settings.css")
+        self.assertIn("object-fit: cover", rule_block(css, ".bg-preview"))
+        self.assertIn("height: calc(var(--fs-display) * 8)", rule_block(css, ".bg-preview"))
 
 
 if __name__ == "__main__":

@@ -23,6 +23,15 @@
     timer: 0,
     refreshTimer: 0,
     suppressClick: false,
+    stage: null,
+    stagePending: false,
+    stageToken: 0,
+    stageSource: "",
+    stageScale: 0,
+    stageFailed: false,
+    petAvailable: false,
+    desired: { mood: "", reduceMotion: false },
+    reported: null,
   };
 
   const el = {
@@ -60,7 +69,7 @@
   function applyCollapsed(collapsed, persist) {
     state.collapsed = Boolean(collapsed);
     document.body.classList.toggle("collapsed", state.collapsed);
-    el.pet.hidden = state.collapsed;
+    el.pet.hidden = state.collapsed || !state.petAvailable;
     el.ball.hidden = !state.collapsed;
     el.status.hidden = state.collapsed;
     el.quickCollapse.textContent = state.collapsed ? "展开" : "折叠";
@@ -82,11 +91,10 @@
       "--scale",
       String((data.font_scale || 100) / 100)
     );
+    document.body.classList.toggle("reduce-motion", Boolean(data.reduce_motion));
     const mood = data.mood || "";
-    if (mood !== state.mood) {
-      state.mood = mood;
-      CompanionAvatar.mount(el.pet, 132, mood);
-    }
+    state.mood = mood;
+    applyStage(data);
     applyCollapsed(Boolean(data.collapsed), false);
     el.status.textContent = (data.status && data.status.label) || "待机";
     applyProactive(data.proactive || { enabled: false, unread: [] });
@@ -191,6 +199,138 @@
     hideBubble();
   }
 
+  // -- pet stage (Live2D or .mavatar) ----------------------------------
+
+  function reportRuntime(ok, reason) {
+    const signature = (ok ? "ok:" : "fail:") + (reason || "");
+    if (state.reported === signature) return;
+    state.reported = signature;
+    api("/api/overlay/runtime", {
+      method: "POST",
+      body: JSON.stringify({ ok: ok, reason: reason || "" }),
+    }).catch(() => {
+      state.reported = null;
+    });
+  }
+
+  function teardownStage() {
+    state.stageToken += 1;
+    if (state.stage) {
+      state.stage.destroy();
+      state.stage = null;
+    }
+    state.stagePending = false;
+    state.stageSource = "";
+    state.stageScale = 0;
+  }
+
+  function stageModule(renderer) {
+    if (renderer === "live2d") return window.CompanionStage;
+    if (renderer === "mesh") return window.CompanionMeshStage;
+    return undefined;
+  }
+
+  function applyStage(data) {
+    const pet = data.pet || {};
+    const renderer = String(data.renderer || pet.renderer || "");
+    const url =
+      renderer === "live2d"
+        ? String(pet.model_url || "")
+        : renderer === "mesh"
+        ? String(pet.url || "")
+        : "";
+    const source = renderer + "|" + url;
+    if (source !== state.stageSource) {
+      teardownStage();
+      state.stageFailed = false;
+      state.stageSource = source;
+    }
+    const available = Boolean(pet.available) && Boolean(url) && !state.stageFailed;
+    state.petAvailable = available;
+    if (!available) {
+      if (state.stage) {
+        state.stage.destroy();
+        state.stage = null;
+      }
+      return;
+    }
+    state.desired.mood = data.mood || "";
+    state.desired.reduceMotion = Boolean(data.reduce_motion);
+    const scale = Number(data.font_scale || 100) / 100;
+    if (state.stage) {
+      state.stage.setMood(state.desired.mood);
+      state.stage.setReduceMotion(state.desired.reduceMotion);
+      if (state.stageScale !== scale) {
+        state.stageScale = scale;
+        state.stage.resize();
+      }
+      return;
+    }
+    if (state.stagePending) return;
+    const module = stageModule(renderer);
+    if (!module) {
+      state.stageFailed = true;
+      state.petAvailable = false;
+      reportRuntime(
+        false,
+        renderer === "live2d" ? "缺少 Live2D 前端模块。" : "缺少 mesh 前端模块。"
+      );
+      return;
+    }
+    const missing = module.unavailableReason();
+    if (missing) {
+      state.stageFailed = true;
+      state.petAvailable = false;
+      reportRuntime(false, missing);
+      return;
+    }
+    state.stagePending = true;
+    state.stageScale = scale;
+    const generation = ++state.stageToken;
+    const options = {
+      mood: state.desired.mood,
+      expressions: pet.expressions || [],
+      reduceMotion: state.desired.reduceMotion,
+      onError: (message) => {
+        if (generation !== state.stageToken) return;
+        teardownStage();
+        state.stageFailed = true;
+        state.petAvailable = false;
+        el.pet.hidden = true;
+        reportRuntime(false, message);
+      },
+    };
+    if (renderer === "live2d") options.modelUrl = url;
+    else {
+      options.archiveUrl = url;
+      options.token = token;
+    }
+    module
+      .mount(el.pet, options)
+      .then((stage) => {
+        if (generation !== state.stageToken) {
+          stage.destroy();
+          return;
+        }
+        state.stagePending = false;
+        state.stage = stage;
+        stage.setMood(state.desired.mood);
+        stage.setReduceMotion(state.desired.reduceMotion);
+        reportRuntime(true, "");
+      })
+      .catch((error) => {
+        if (generation !== state.stageToken) return;
+        state.stagePending = false;
+        state.stageFailed = true;
+        state.petAvailable = false;
+        el.pet.hidden = true;
+        reportRuntime(
+          false,
+          (error && error.message) || (renderer === "live2d" ? "Live2D 加载失败。" : "mesh 加载失败。")
+        );
+      });
+  }
+
   // -- menu and quick actions -----------------------------------------
 
   function dndEnabled() {
@@ -253,6 +393,19 @@
     else if (action === "hide") hideOverlay();
   }
 
+  // -- native click-through hit test -----------------------------------
+
+  // The shell polls this with window-local CSS pixels; false means the
+  // window keeps WS_EX_TRANSPARENT so the desktop behind it stays usable.
+  // Hidden controls are out of the hit region because [hidden] and the
+  // hover-gated pointer-events rules make elementFromPoint skip them.
+  window.__companionHit = function (x, y) {
+    if (document.body.classList.contains("browser")) return false;
+    const target = document.elementFromPoint(x, y);
+    if (!target) return false;
+    return Boolean(target.closest("#pet, #ball, #bubble, #quick, #menu, #close"));
+  };
+
   // -- wiring ---------------------------------------------------------
 
   function bind() {
@@ -260,8 +413,11 @@
     const startDrag = (event) => {
       if (!state.host || event.button !== 0) return;
       grab = {
-        x: event.screenX - event.clientX,
-        y: event.screenY - event.clientY,
+        // Offset of the pointer inside the window, not the window origin:
+        // screenX - clientX would translate the window by its own position
+        // on the first move and make it jump.
+        x: event.clientX,
+        y: event.clientY,
         sx: event.screenX,
         sy: event.screenY,
         moved: false,
@@ -381,6 +537,10 @@
   bind();
   connectHost();
   connectEvents();
+  window.addEventListener("beforeunload", () => {
+    if (state.stage) state.stage.destroy();
+    state.stage = null;
+  });
   refresh();
   // Fallback only: while the event stream is connected the overlay is pushed.
   setInterval(() => {

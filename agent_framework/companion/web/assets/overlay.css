@@ -18,9 +18,9 @@ body {
   position: relative;
   width: 100vw;
   height: 100vh;
-  /* The avatar artwork stays a fixed size; only the text around it scales.
-     Bubble offsets are derived from it so the speech bubble never overlaps it. */
-  --pet-size: 132px;
+  /* The stage container follows --scale but is capped so the bubble keeps
+     room inside the fixed 300x250 window. Model internals never scale. */
+  --pet-size: clamp(120px, calc(132px * var(--scale)), 150px);
   --pet-right: 14px;
   --pet-bottom: 26px;
   --tail: 10px;
@@ -38,10 +38,10 @@ body {
   filter: var(--pet-shadow);
 }
 
-.pet svg {
+.pet canvas {
   display: block;
-  width: var(--pet-size);
-  height: var(--pet-size);
+  width: 100%;
+  height: 100%;
 }
 
 .pet:active {
@@ -239,11 +239,14 @@ body.collapsed .overlay {
   font-size: var(--fs-ui);
   line-height: var(--lh-control);
   opacity: 0;
+  /* Invisible controls must not claim the desktop's clicks. */
+  pointer-events: none;
   transition: opacity 0.15s ease;
 }
 
 .overlay:hover .close {
   opacity: 1;
+  pointer-events: auto;
 }
 
 .close:hover {

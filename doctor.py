@@ -23,6 +23,16 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent
 
 
+def _keep_stdout_writable():
+    """Diagnostic text embeds third-party errors (Tcl/Tk, PySide6); on a GBK
+    console one unencodable character would abort the whole report."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def check(name, passed, detail):
     status = "OK" if passed else "FAIL"
     print("[{}] {:<20} {}".format(status, name, detail))
@@ -30,6 +40,7 @@ def check(name, passed, detail):
 
 
 def main():
+    _keep_stdout_writable()
     checks = []
     version = platform.python_version()
     checks.append(
@@ -290,6 +301,47 @@ def main():
                 ))
     except Exception as error:
         checks.append(check("Skills", False, str(error)))
+
+    try:
+        from agent_framework.companion.assets import character_assets_check
+        from agent_framework.companion.persona import DEFAULT_PERSONA_ID
+        from agent_framework.companion.ui.state import UiStateStore
+
+        data_dir = ROOT / "data"
+        overlay_on = UiStateStore(data_dir).overlay_visible()
+        level, detail = character_assets_check(
+            data_dir, DEFAULT_PERSONA_ID, overlay_on
+        )
+        if level == "fail":
+            checks.append(check("Character assets", False, detail))
+        elif level == "warn":
+            print("[WARN] {:<20} {}".format("Character assets", detail))
+        else:
+            checks.append(check("Character assets", True, detail))
+    except Exception as error:
+        checks.append(check("Character assets", False, str(error)))
+
+    try:
+        web_assets = ROOT / "agent_framework" / "companion" / "web" / "assets"
+        vendored = (
+            "vendor/pixi.min.js",
+            "vendor/pixi-live2d-display-cubism4.min.js",
+            "vendor/live2dcubismcore.min.js",
+            "vendor/process-env.js",
+            "vendor/mesh-avatar.min.js",
+            "stage.js",
+            "mesh-stage.js",
+        )
+        missing = [name for name in vendored if not (web_assets / name).is_file()]
+        checks.append(
+            check(
+                "Pet runtime",
+                not missing,
+                "vendored" if not missing else "missing: " + ", ".join(missing),
+            )
+        )
+    except Exception as error:
+        checks.append(check("Pet runtime", False, str(error)))
 
     try:
         from agent_framework.companion.proactive import (

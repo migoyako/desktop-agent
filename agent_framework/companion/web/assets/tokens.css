@@ -52,8 +52,9 @@
   --radius-pill: 999px;
   --shadow: var(--shadow-2);
   --bubble-tail: calc(6px * var(--sp-scale));
-  /* The M13.2 seam. No background image exists yet, so the wash is invisible;
-     that slice assigns this one value and leaves the depth tokens alone. */
+  /* M13.2 seam: no image means the wash is invisible and the page colour shows.
+     With an image, html[data-bg="on"] swaps in the theme's own scrim. */
+  --bg-image: none;
   --bg-scrim: rgba(0, 0, 0, 0);
 }
 
@@ -85,6 +86,9 @@
   --avatar-ink: #24151b;
   --avatar-outline: #4a4a4a;
   --scrim: rgba(0, 0, 0, 0.55);
+  /* Derived from the page ink, so an arbitrary photo keeps the dark theme's
+     text contrast once the wash sits on top of it. */
+  --bg-scrim-image: rgba(8, 9, 12, 0.72);
   /* Depth: near, raised and floating. Dark ink on a dark page needs stronger
      alpha than the same tiers get on pearl-white, so each theme owns its ink. */
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.32), 0 2px 6px rgba(0, 0, 0, 0.22);
@@ -133,6 +137,8 @@
   --avatar-ink: #1d1d1f;
   --avatar-outline: #d2d2d7;
   --scrim: rgba(20, 20, 22, 0.32);
+  /* Pearl-white reads dark text, so its wash is a page-tinted light veil. */
+  --bg-scrim-image: rgba(247, 246, 244, 0.84);
   /* A light page takes soft neutral ink, not the dark theme's 0.28 black: that
      was the grey halo that made pearl-white look dirty. */
   --shadow-1: 0 1px 2px rgba(28, 28, 34, 0.06), 0 2px 6px rgba(28, 28, 34, 0.05);
@@ -150,6 +156,12 @@
   );
   --pet-shadow: drop-shadow(0 8px 16px rgba(28, 28, 34, 0.18));
   color-scheme: light;
+}
+
+/* M13.2: a chosen image swaps the transparent seam for the theme's wash. The
+   user never tunes blur, tiling or scrim strength. */
+html[data-bg="on"] {
+  --bg-scrim: var(--bg-scrim-image);
 }
 
 * {
@@ -189,10 +201,13 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* The same background wash the main shell carries (app.css). It is a no-op
-   layer until M13.2 assigns --bg-scrim. */
+/* Layers: theme wash, optional user image, page colour. The image layer is
+   `none` until M13.2 sets --bg-image, so this rule is a no-op by default. */
 .win {
-  background-image: linear-gradient(var(--bg-scrim), var(--bg-scrim));
+  background:
+    linear-gradient(var(--bg-scrim), var(--bg-scrim)),
+    var(--bg-image) center / cover no-repeat,
+    var(--page);
 }
 
 button,
@@ -379,6 +394,11 @@ textarea.field {
   transform: translateX(calc(var(--ctl-switch-w) - var(--ctl-switch-h)));
 }
 
+.switch:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .segmented {
   display: inline-flex;
   gap: var(--sp-xs);
@@ -468,6 +488,83 @@ textarea.field {
 .toast.on {
   opacity: 1;
   transform: translateX(-50%) translateY(0);
+}
+
+/* Shared in-page confirm/prompt (dialog.js); the script dismisses only when
+   the click target is the scrim itself, so clicks inside the card do nothing. */
+.dialog-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-xl);
+  background: var(--scrim);
+  animation: dialog-fade 0.12s ease;
+}
+
+.dialog-scrim .dialog {
+  width: min(calc(var(--read-measure) * 0.8), calc(100vw - var(--sp-xl) * 2));
+  max-height: calc(100vh - var(--sp-xl) * 2);
+  overflow-y: auto;
+  padding: var(--sp-lg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-3);
+  animation: dialog-rise 0.14s ease;
+}
+
+.dialog-title {
+  font-size: var(--fs-large);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-meta);
+}
+
+.dialog-message {
+  margin-top: var(--sp-sm);
+  color: var(--muted);
+  font-size: var(--fs-ui);
+  line-height: var(--lh-body);
+  overflow-wrap: anywhere;
+}
+
+.dialog .field {
+  margin-top: var(--sp-lg);
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-md);
+  margin-top: var(--sp-xl);
+}
+
+.dialog-actions .ghost,
+.dialog-actions .primary {
+  min-width: calc(var(--fs-ui) * 4);
+}
+
+.dialog-actions .primary.danger {
+  background: var(--danger);
+}
+
+.dialog-actions .primary.danger:hover {
+  filter: brightness(1.08);
+}
+
+@keyframes dialog-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes dialog-rise {
+  from {
+    opacity: 0;
+    transform: translateY(var(--sp-md));
+  }
 }
 
 :focus-visible {

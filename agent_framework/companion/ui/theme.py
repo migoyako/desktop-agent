@@ -1,7 +1,7 @@
 """Semantic colour tokens and Qt stylesheet builders for the companion UI.
 
-Widget code reads tokens instead of literals so the painted avatar, the chat
-bubbles and the dialogs all follow one theme contract.
+Widget code reads tokens instead of literals so the chat bubbles and the
+dialogs all follow one theme contract.
 """
 
 from __future__ import annotations
@@ -57,11 +57,9 @@ CHARCOAL_PINK = {
     "bubble_agent_border": "#363636",
     "bubble_user": "#3a232c",
     "bubble_user_border": "#4a2936",
-    "avatar_body": "#ededf0",
-    "avatar_ink": "#24151b",
-    "avatar_outline": "#4a4a4a",
-    "avatar_mood_low": "#8a8a8a",
-    "avatar_mood_warm": "#ff7aa0",
+    # M13.2: the wash the Web page puts over a user photo, mirrored here so the
+    # Qt compatibility window dims the same image by the same amount.
+    "bg_scrim": "rgba(8, 9, 12, 184)",
 }
 
 PEARL_WHITE = {
@@ -89,23 +87,13 @@ PEARL_WHITE = {
     "bubble_agent_border": "#e5e5ea",
     "bubble_user": "#fde0ed",
     "bubble_user_border": "#ff9fbd",
-    "avatar_body": "#ffffff",
-    "avatar_ink": "#1d1d1f",
-    "avatar_outline": "#d2d2d7",
-    "avatar_mood_low": "#9a9aa0",
-    "avatar_mood_warm": "#ff7aa0",
+    "bg_scrim": "rgba(247, 246, 244, 214)",
 }
 
 THEMES = {
     CHARCOAL_PINK["id"]: dict(CHARCOAL_PINK),
     PEARL_WHITE["id"]: dict(PEARL_WHITE),
 }
-
-MOOD_GROUPS = {
-    "low": ("low", "tired", "concerned"),
-    "warm": ("warm", "positive"),
-}
-
 
 def normalize_theme(name) -> str:
     theme_id = str(name or "").strip().lower()
@@ -140,24 +128,6 @@ def theme_choices():
     return [(key, THEMES[key]["label"]) for key in (PEARL_WHITE["id"], CHARCOAL_PINK["id"])]
 
 
-def avatar_palette(tokens, mood=None):
-    """Return the paints used by the drawn character for one mood."""
-    mood = str(mood or "").strip().lower()
-    accent = tokens["accent"]
-    if any(mood.startswith(item) for item in MOOD_GROUPS["low"]):
-        accent = tokens["avatar_mood_low"]
-    elif any(mood.startswith(item) for item in MOOD_GROUPS["warm"]):
-        accent = tokens["avatar_mood_warm"]
-    return {
-        "accent": accent,
-        "body": tokens["avatar_body"],
-        "ink": tokens["avatar_ink"],
-        "outline": tokens["avatar_outline"],
-        "shadow": tokens["selected"] if tokens["scheme"] == "dark" else tokens["hover"],
-        "status_text": tokens["muted"],
-    }
-
-
 def _rule(selector, properties):
     body = "".join("{}: {};".format(key, value) for key, value in properties.items())
     return "{} {{\n{}\n}}".format(selector, body)
@@ -167,7 +137,22 @@ def _type(token):
     return "{}px".format(TYPE_TOKENS.get(token, TYPE_TOKENS["body"]))
 
 
-def stylesheet(name=None, font_scale=100) -> str:
+def _rgba(color, alpha):
+    value = str(color).lstrip("#")
+    return "rgba({}, {}, {}, {})".format(
+        int(value[0:2], 16),
+        int(value[2:4], 16),
+        int(value[4:6], 16),
+        int(round(alpha * 255)),
+    )
+
+
+def stylesheet(name=None, font_scale=100, background=None) -> str:
+    """Qt stylesheet for the compatibility UI.
+
+    ``background`` is the resolved photo path; None keeps the solid theme so a
+    page without an image is byte-for-byte the M12.5 sheet.
+    """
     t = theme(name)
     scale = normalize_font_scale(font_scale)
     base_font = {
@@ -205,7 +190,6 @@ def stylesheet(name=None, font_scale=100) -> str:
             ),
         ),
         _rule("QLabel#brandSmall", {"font-size": _type("ui"), "font-weight": "600", "color": t["text"]}),
-        _rule("QWidget#avatar", {"background": "transparent", "border": "0"}),
         _rule("QLabel#heading", {"font-size": _type("subtitle"), "font-weight": "600", "color": t["text"]}),
         _rule("QLabel#muted", {"color": t["muted"]}),
         _rule("QLabel#faint", {"color": t["disabled"], "font-size": _type("caption")}),
@@ -1173,6 +1157,32 @@ def stylesheet(name=None, font_scale=100) -> str:
         ),
         _rule("QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal", {"height": "0", "width": "0"}),
     ]
+    if background is not None:
+        image = str(background).replace("\\", "/")
+        rules.extend(
+            [
+                _rule(
+                    "QMainWindow, QDialog",
+                    {
+                        "background-image": 'url("{}")'.format(image),
+                        "background-position": "center",
+                        "background-repeat": "no-repeat",
+                    },
+                ),
+                # The scrim sits on the shell; the working surfaces go translucent
+                # so the photo reads through them without hurting text contrast.
+                _rule("QWidget#shell", {"background": t["bg_scrim"]}),
+                _rule("QFrame#rail", {"background": _rgba(t["page"], 0.88)}),
+                _rule(
+                    "QScrollArea#chat, QWidget#chatList",
+                    {"background": _rgba(t["workspace"], 0.82)},
+                ),
+                _rule(
+                    "QFrame#inspector, QScrollArea#inspectorArea, QWidget#inspectorList",
+                    {"background": _rgba(t["page"], 0.88)},
+                ),
+            ]
+        )
     css = "\n".join(rules)
     if scale != 100:
         css = re.sub(

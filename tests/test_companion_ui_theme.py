@@ -18,7 +18,6 @@ from agent_framework.companion.ui.theme import (
     SPACE_TOKENS,
     THEMES,
     TYPE_TOKENS,
-    avatar_palette,
     font_px,
     normalize_font_scale,
     normalize_theme,
@@ -86,21 +85,25 @@ class ThemeTokenTest(unittest.TestCase):
         self.assertEqual(theme()["accent"], CHARCOAL_PINK["accent"])
         self.assertEqual(theme("bogus")["id"], DEFAULT_THEME)
 
+    def test_stylesheet_carries_the_optional_background(self):
+        plain = stylesheet("charcoal-pink")
+        self.assertNotIn("background-image", plain)
+        css = stylesheet(
+            "charcoal-pink", background=Path("C:/data/assets/remielle/background.png")
+        )
+        self.assertIn(
+            'background-image: url("C:/data/assets/remielle/background.png")', css
+        )
+        self.assertIn("rgba(8, 9, 12, 184)", css)
+        light = stylesheet("pearl-white", background=Path("C:/bg.webp"))
+        self.assertIn("rgba(247, 246, 244, 214)", light)
+        self.assertIn('background-image: url("C:/bg.webp")', light)
+
     def test_theme_choices_cover_both_packs(self):
         self.assertEqual(
             [key for key, _label in theme_choices()],
             ["pearl-white", "charcoal-pink"],
         )
-
-    def test_avatar_palette_follows_mood_and_scheme(self):
-        dark = theme("charcoal-pink")
-        self.assertEqual(avatar_palette(dark, "low")["accent"], dark["avatar_mood_low"])
-        self.assertEqual(avatar_palette(dark, "tired_today")["accent"], dark["avatar_mood_low"])
-        self.assertEqual(avatar_palette(dark, "warm")["accent"], dark["avatar_mood_warm"])
-        self.assertEqual(avatar_palette(dark, "calm")["accent"], dark["accent"])
-        self.assertEqual(avatar_palette(dark, "calm")["shadow"], dark["selected"])
-        light = theme("pearl-white")
-        self.assertEqual(avatar_palette(light, "calm")["shadow"], light["hover"])
 
     def test_stylesheet_emits_the_expected_selectors(self):
         css = stylesheet("charcoal-pink")
@@ -1072,6 +1075,13 @@ class UiStateChromeTest(unittest.TestCase):
         self.assertEqual(self.store.active_session(), "")
         self.store.set(active_session=42)
         self.assertEqual(self.store.active_session(), "")
+
+    def test_background_switch_defaults_on_and_round_trips(self):
+        self.assertTrue(self.store.background_enabled())
+        self.store.set_background_enabled(False)
+        self.assertFalse(self.store.background_enabled())
+        self.store.set_background_enabled(True)
+        self.assertTrue(self.store.background_enabled())
 
     def test_window_geometry_validates_all_four_numbers(self):
         self.assertIsNone(self.store.window_geometry())

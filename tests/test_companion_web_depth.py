@@ -20,6 +20,7 @@ from agent_framework.companion.web.layout_audit import (
     CONTROLS,
     PROBE,
     _adapter,
+    _sample_png,
     _scratch_temp,
     _seed,
     _settle,
@@ -114,12 +115,16 @@ class DepthTokenTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertGreaterEqual(references, 1)
 
-    def test_the_scrim_seam_is_defined_once_and_stays_transparent(self):
+    def test_the_scrim_seam_is_transparent_until_a_background_is_chosen(self):
         tokens = asset("tokens.css")
-        self.assertEqual(1, tokens.count("--bg-scrim:"))
+        self.assertEqual(2, tokens.count("--bg-scrim:"))
         self.assertIn("--bg-scrim: rgba(0, 0, 0, 0);", tokens)
-        # M13.2 may only assign this value; the layers that would show it exist
-        # already so the wash cannot be wired twice.
+        # M13.2 only swaps the value under data-bg; the layers that show it exist
+        # already, so the wash cannot be wired twice.
+        self.assertIn(
+            "--bg-scrim: var(--bg-scrim-image);",
+            rule_block(tokens, 'html[data-bg="on"]'),
+        )
         shell = rule_block(asset("app.css"), ".shell")
         self.assertIn(
             "linear-gradient(var(--bg-scrim), var(--bg-scrim))", shell
@@ -336,6 +341,75 @@ class DepthBrowserTests(unittest.TestCase):
         _settle(page, "1")
         page.wait_for_timeout(150)
         return page
+
+    def install_background(self):
+        folder = Path(self.temp.name) / "assets" / "remielle"
+        folder.mkdir(parents=True)
+        (folder / "background.png").write_bytes(_sample_png())
+        self.assertEqual(200, _ui(self.adapter, background_enabled=True))
+
+    def background_state(self, page, selector):
+        return page.evaluate(
+            """(selector) => ({
+              on: document.documentElement.dataset.bg || "",
+              scrim: getComputedStyle(document.documentElement)
+                .getPropertyValue('--bg-scrim').trim(),
+              image: getComputedStyle(document.querySelector(selector)).backgroundImage
+            })""",
+            selector,
+        )
+
+    def test_the_background_paints_the_three_windows_with_the_theme_wash(self):
+        self.install_background()
+        page = self.open_main()
+        state = self.background_state(page, ".shell")
+        self.assertEqual("on", state["on"])
+        self.assertEqual("rgba(8, 9, 12, 0.72)", state["scrim"])
+        self.assertIn("/api/asset/background", state["image"])
+
+        self.assertEqual(200, _ui(self.adapter, theme="pearl-white"))
+        page.reload(wait_until="load")
+        page.wait_for_selector(".msg", timeout=15000)
+        _settle(page, "1")
+        page.wait_for_timeout(150)
+        pearl = self.background_state(page, ".shell")
+        self.assertEqual("rgba(247, 246, 244, 0.84)", pearl["scrim"])
+        self.assertIn("/api/asset/background", pearl["image"])
+
+        for path, ready in (("/settings", ".nav button"), ("/console", ".tabs button")):
+            with self.subTest(page=path):
+                page.goto(_url(self.adapter, path), wait_until="load")
+                page.wait_for_selector(ready, timeout=15000)
+                page.wait_for_timeout(250)
+                state = self.background_state(page, ".win")
+                self.assertEqual("on", state["on"])
+                self.assertIn("/api/asset/background", state["image"])
+
+    def test_clearing_restores_the_solid_page_and_the_overlay_stays_clear(self):
+        self.install_background()
+        overlay = self.context.new_page()
+        overlay.set_viewport_size({"width": 300, "height": 250})
+        overlay.goto(_url(self.adapter, "/overlay"), wait_until="load")
+        overlay.wait_for_selector(".pet", timeout=15000)
+        overlay.wait_for_timeout(300)
+        state = overlay.evaluate(
+            """() => ({
+              on: document.documentElement.dataset.bg || "",
+              scrim: getComputedStyle(document.documentElement)
+                .getPropertyValue('--bg-scrim').trim(),
+              body: getComputedStyle(document.body).backgroundImage
+            })"""
+        )
+        self.assertEqual("", state["on"])
+        self.assertEqual("rgba(0, 0, 0, 0)", state["scrim"])
+        self.assertEqual("none", state["body"])
+
+        self.assertEqual(200, _ui(self.adapter, background_enabled=False))
+        page = self.open_main()
+        cleared = self.background_state(page, ".shell")
+        self.assertEqual("", cleared["on"])
+        self.assertEqual("rgba(0, 0, 0, 0)", cleared["scrim"])
+        self.assertNotIn("url(", cleared["image"])
 
     def test_the_rail_collapses_to_glyphs_and_expands_back(self):
         page = self.open_main()

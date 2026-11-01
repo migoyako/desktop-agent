@@ -75,6 +75,7 @@
     inspectorDrawer: false,
     filter: "",
     host: null,
+    avatarSrc: "",
   };
 
   const COMMANDS = ["minimize", "hide"];
@@ -191,8 +192,20 @@
 
   // ---------- avatar ----------
 
-  // Artwork lives in avatar.js so the header slot and the desktop overlay draw
-  // the same figure; this page only chooses the size and the CSS class.
+  // The header shows the user's own portrait; with no avatar.png the slot stays
+  // empty instead of drawing a stand-in figure (D58). The desktop overlay keeps
+  // the programmatic figure until M13.3 replaces the whole carrier.
+  function renderAvatar() {
+    const avatar = (state.data.assets || {}).avatar;
+    const src = avatar
+      ? avatar.url + "?t=" + encodeURIComponent(token) + "&v=" + avatar.stamp
+      : "";
+    if (state.avatarSrc === src) return;
+    state.avatarSrc = src;
+    el.avatarSlot.innerHTML = src
+      ? '<img class="avatar" src="' + src + '" alt="" width="34" height="34">'
+      : "";
+  }
 
   // ---------- markdown ----------
 
@@ -267,6 +280,7 @@
     document.documentElement.dataset.theme = ui.theme || "charcoal-pink";
     document.documentElement.style.setProperty("--scale", String((ui.font_scale || 100) / 100));
     document.body.classList.toggle("reduce-motion", Boolean(ui.reduce_motion));
+    CompanionBackground.apply(ui, (state.data || {}).assets, token);
     state.inspectorOpen = ui.inspector_visible !== false;
     state.inspectorWidth = ui.inspector_width || 268;
   }
@@ -275,12 +289,7 @@
     if (!state.data) return;
     const data = state.data;
     el.personaName.textContent = data.persona.name || "数字分身";
-    CompanionAvatar.mount(
-      el.avatarSlot,
-      34,
-      (data.affect.agent || {}).mood_label || "calm",
-      "avatar"
-    );
+    renderAvatar();
     const status = data.status || {};
     el.personaState.textContent = shortState(status);
     el.personaState.className = "pill state " + (status.state === "awaiting_confirmation" ? "accent" : "");
@@ -639,11 +648,35 @@
       .join("");
   }
 
+  function proactiveCard() {
+    const events = (state.data && state.data.proactive_events) || [];
+    if (!events.length) return "";
+    const unread = events.filter((item) => !item.read).length;
+    const rows = events
+      .map(
+        (item) => `<div class="proactive-item${item.read ? "" : " unread"}">
+          <span class="meta">${escapeHtml(clock(item.at) || "")}</span>
+          <div class="line">${escapeHtml(item.text)}</div>
+          ${
+            item.read
+              ? ""
+              : `<button class="ghost" data-proactive-read="${escapeHtml(item.event_id)}">标为已读</button>`
+          }
+        </div>`
+      )
+      .join("");
+    return `<div class="section-card proactive-card">
+      <div class="section-title">主动消息${unread ? " · 未读 " + unread : ""}</div>
+      ${unread ? '<button class="ghost" data-proactive-read-all>全部标为已读</button>' : ""}
+      ${rows}
+    </div>`;
+  }
+
   function renderInspector() {
     const data = state.data;
     const wanted = TAB_MAP[state.tab] || [];
     const sections = (data.inspector || []).filter((section) => wanted.includes(section.title));
-    const cards = state.tab === "任务" ? taskCards() : "";
+    const cards = state.tab === "任务" ? taskCards() + proactiveCard() : "";
     if (!sections.length && !cards) {
       el.inspectorBody.innerHTML = '<div class="empty-note">这一栏暂时没有内容</div>';
     } else {
@@ -662,6 +695,11 @@
       const active = button.dataset.tab === state.tab;
       button.classList.toggle("on", active);
       button.setAttribute("aria-selected", active ? "true" : "false");
+      if (button.dataset.tab === "任务") {
+        const unread = ((data.proactive_events || []).filter((item) => !item.read)).length;
+        button.textContent = unread ? "任务 · " + unread : "任务";
+        button.title = unread ? "有未读主动消息" : "";
+      }
     }
   }
 
@@ -987,8 +1025,14 @@
       } else if (payload.type === "refresh") {
         scheduleRefresh();
       } else if (payload.type === "ui") {
+        const previous = (state.data && state.data.ui) || {};
+        if (state.data) state.data.ui = payload.ui;
         applyUi(payload.ui);
         render();
+        // The switch can outrun the asset snapshot, so refetch it when it flips.
+        if (previous.background_enabled !== payload.ui.background_enabled) {
+          scheduleRefresh();
+        }
       } else if (payload.type === "shutdown") {
         source.close();
       }
@@ -1179,7 +1223,11 @@
   }
 
   async function chooseWorkspace() {
-    const path = window.prompt("输入要授权的工作目录绝对路径", state.data.workspace || "");
+    const path = await CompanionDialog.prompt(
+      "输入要授权的工作目录绝对路径",
+      state.data.workspace || "",
+      { title: "授权工作目录", okText: "授权" }
+    );
     if (!path) return;
     await guard(post("/api/workspace", { path: path }));
     await refresh();
@@ -1222,20 +1270,37 @@
 
   async function taskAction(action, taskId) {
     if (action === "approve") {
-      if (!window.confirm("批准这份计划并开始执行？")) return;
+      const approved = await CompanionDialog.confirm("批准这份计划并开始执行？", {
+        title: "批准计划",
+        okText: "批准",
+      });
+      if (!approved) return;
       await guard(post("/api/console/tasks", { action: "approve", task_id: taskId }));
     } else if (action === "revise") {
-      const instruction = window.prompt("要修改什么？");
+      const instruction = await CompanionDialog.prompt("要修改什么？", "", {
+        title: "修改计划",
+        okText: "提交",
+      });
       if (!instruction) return;
       await guard(
         post("/api/console/tasks", { action: "revise", task_id: taskId, instruction: instruction })
       );
     } else if (action === "reject") {
-      const reason = window.prompt("拒绝原因（可留空）", "");
+      const reason = await CompanionDialog.prompt("拒绝原因（可留空）", "", {
+        title: "拒绝计划",
+        okText: "拒绝",
+      });
       if (reason === null) return;
       await guard(post("/api/console/tasks", { action: "reject", task_id: taskId, reason: reason }));
     }
     await refresh();
+  }
+
+  async function markProactiveRead(eventId) {
+    const body = eventId
+      ? { action: "read", event_id: eventId }
+      : { action: "read" };
+    if (await guard(post("/api/proactive", body))) await refresh();
   }
 
   function showContextMenu(event, sessionId) {
@@ -1244,6 +1309,7 @@
     if (existing) existing.remove();
     const menu = document.createElement("div");
     menu.id = "sessionMenu";
+    menu.setAttribute("role", "menu");
     menu.style.cssText =
       "position:fixed;z-index:60;min-width:120px;padding:4px;border:1px solid var(--border-strong);border-radius:8px;background:var(--surface);box-shadow:var(--shadow);font-size:var(--fs-ui)";
     menu.style.left = Math.min(event.clientX, window.innerWidth - 140) + "px";
@@ -1251,7 +1317,10 @@
     const options = [
       ["重命名", async () => {
         const item = state.data.sessions.find((row) => row.id === sessionId);
-        const title = window.prompt("会话名称", item ? item.title : "");
+        const title = await CompanionDialog.prompt("会话名称", item ? item.title : "", {
+          title: "重命名会话",
+          okText: "保存",
+        });
         if (!title) return;
         await guard(post("/api/sessions/rename", { session_id: sessionId, title: title }));
         await refresh();
@@ -1262,31 +1331,51 @@
         await refresh();
       }],
       ["删除", async () => {
-        if (!window.confirm("删除这个会话及其消息？")) return;
+        const confirmed = await CompanionDialog.confirm("删除这个会话及其消息？", {
+          title: "删除会话",
+          okText: "删除",
+          danger: true,
+        });
+        if (!confirmed) return;
         await guard(post("/api/sessions/delete", { session_id: sessionId }));
         await refresh();
       }],
     ];
+    function dismiss() {
+      menu.remove();
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", dismiss);
+      window.removeEventListener("scroll", dismiss, true);
+    }
+    function close(mouseEvent) {
+      // mousedown precedes click; closing on any mousedown inside the menu
+      // would remove the button before its click handler can run.
+      if (menu.contains(mouseEvent.target)) return;
+      dismiss();
+    }
+    function onKey(keyEvent) {
+      if (keyEvent.key === "Escape") dismiss();
+    }
     for (const [label, action] of options) {
       const button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("role", "menuitem");
       button.textContent = label;
       button.style.cssText = "display:block;width:100%;text-align:left;padding:6px 9px;border-radius:5px";
       button.onmouseenter = () => (button.style.background = "var(--hover)");
       button.onmouseleave = () => (button.style.background = "transparent");
       button.onclick = () => {
-        menu.remove();
+        dismiss();
         action();
       };
       menu.appendChild(button);
     }
     document.body.appendChild(menu);
-    setTimeout(() => {
-      const close = () => {
-        menu.remove();
-        document.removeEventListener("mousedown", close);
-      };
-      document.addEventListener("mousedown", close);
-    }, 0);
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", onKey);
+    window.addEventListener("blur", dismiss);
+    window.addEventListener("scroll", dismiss, true);
   }
 
   // ---------- events ----------
@@ -1425,6 +1514,15 @@
       if (cancel) cancelApproval(cancel.dataset.cancelApproval);
     });
     el.inspectorBody.onclick = (event) => {
+      const read = event.target.closest("[data-proactive-read]");
+      if (read) {
+        markProactiveRead(read.dataset.proactiveRead);
+        return;
+      }
+      if (event.target.closest("[data-proactive-read-all]")) {
+        markProactiveRead();
+        return;
+      }
       const button = event.target.closest("[data-task-act]");
       if (!button) return;
       taskAction(button.dataset.taskAct, button.dataset.taskId);
@@ -1478,6 +1576,7 @@
     });
     bindInspectorResize();
     bindWindowDrag();
+    bindWindowResize();
   }
 
   function bindInspectorResize() {
@@ -1500,21 +1599,63 @@
   }
 
   function bindWindowDrag() {
-    let grab = null;
+    // The OS caption loop owns the move; page-level mousemove stops as soon as
+    // the cursor leaves the WebView and would make the window jump.
     el.topbar.addEventListener("mousedown", (event) => {
       if (!state.host || event.button !== 0) return;
       if (event.target.closest("button, input, textarea")) return;
-      grab = { x: event.screenX - event.clientX, y: event.screenY - event.clientY };
+      event.preventDefault();
+      if (typeof state.host.beginWindowDrag === "function") {
+        state.host.beginWindowDrag();
+        return;
+      }
+      // Shells started before the native-drag slot only expose moveWindow.
+      // Grab the pointer offset (not the window origin) so the first move is
+      // 1:1 instead of translating the window by its own position.
+      const grab = { x: event.clientX, y: event.clientY };
+      const move = (moveEvent) => {
+        state.host.moveWindow(
+          moveEvent.screenX - grab.x,
+          moveEvent.screenY - grab.y
+        );
+      };
+      const stop = () => {
+        document.body.style.userSelect = "";
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", stop);
+        window.removeEventListener("blur", stop);
+      };
       document.body.style.userSelect = "none";
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", stop);
+      window.addEventListener("blur", stop);
     });
-    window.addEventListener("mousemove", (event) => {
-      if (!grab || !state.host) return;
-      state.host.moveWindow(event.screenX - grab.x, event.screenY - grab.y);
-    });
-    window.addEventListener("mouseup", () => {
-      grab = null;
-      document.body.style.userSelect = "";
-    });
+  }
+
+  function bindWindowResize() {
+    // Windows gets native hit-testing; elsewhere the page reports the edge so
+    // QWindow.startSystemResize can take over. 8px matches the shell border.
+    const EDGE = 8;
+    document.addEventListener("mousedown", (event) => {
+      if (!state.host || event.button !== 0) return;
+      if (typeof state.host.beginWindowResize !== "function") return;
+      // Window buttons sit inside the top/right band; a control under the
+      // pointer must activate instead of starting a resize.
+      if (event.target.closest("button, input, textarea, a")) return;
+      const x = event.clientX;
+      const y = event.clientY;
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      if (x > EDGE && x < width - EDGE && y > EDGE && y < height - EDGE) return;
+      const vertical = y <= EDGE ? "top" : y >= height - EDGE ? "bottom" : "";
+      const horizontal = x <= EDGE ? "left" : x >= width - EDGE ? "right" : "";
+      const edge = vertical + horizontal;
+      if (!edge) return;
+      // Not stopPropagation: a corner press may also be the press that closes
+      // an open menu, and that handler must still run.
+      event.preventDefault();
+      state.host.beginWindowResize(edge);
+    }, true);
   }
 
   function connectHost() {

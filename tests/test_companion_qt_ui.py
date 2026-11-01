@@ -17,7 +17,6 @@ from agent_framework.companion.models import AgentMode, SearchResult
 from agent_framework.companion.runtime import CompanionRuntime
 from agent_framework.companion.search import SearchService
 from agent_framework.companion.store import CompanionStore
-from agent_framework.companion.ui.state import UiStateStore
 from agent_framework.llm import LLMResponse, OfflineLLMClient, StreamEvent
 
 
@@ -31,17 +30,18 @@ try:
         RAIL_WIDTH,
         WINDOW_HEIGHT,
         WINDOW_WIDTH,
-        AvatarOverlay,
         CompanionWindow,
         side_dialog_geometry,
     )
     from agent_framework.companion.ui.theme import DEFAULT_THEME, theme
-    from agent_framework.companion.ui.tray import TrayController
+    from agent_framework.companion.ui.tray import TrayController, app_icon
+    from agent_framework.companion.web.shell import Shell
 except ImportError:
     QApplication = None
     CompanionWindow = None
-    AvatarOverlay = None
     TrayController = None
+    app_icon = None
+    Shell = None
     QPoint = None
     QRect = None
     QSize = None
@@ -676,10 +676,12 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
         self.assertNotEqual(self.window.theme_name, previous_theme)
         self.assertIn(theme(self.window.theme_name)["label"], dialog.theme_button.text())
 
-        overlay_before = self.window.overlay_visible()
+        self.assertFalse(self.window.overlay_visible())
         dialog.overlay_button.click()
-        self.assertEqual(self.window.overlay_visible(), not overlay_before)
-        self.assertEqual(dialog.overlay_button.isChecked(), not overlay_before)
+        self.app.processEvents()
+        self.assertFalse(self.window.overlay_visible())
+        self.assertFalse(dialog.overlay_button.isChecked())
+        self.assertIn("--ui web", self.window.status.text())
 
         QTest.mouseClick(dialog.memory_button, Qt.LeftButton)
         self.assertTrue(
@@ -962,107 +964,60 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
         self.app.processEvents()
         self.assertIsNone(self.window.proactive_dialog)
 
-    def test_overlay_is_click_through_with_status_bubble(self):
+    def test_qt_entry_has_no_desktop_overlay_and_points_to_web(self):
         if CompanionWindow is None:
             self.skipTest("PySide6 unavailable")
-        overlay = self.window.overlay
-        self.assertIsNotNone(overlay)
-        self.assertTrue(overlay.isVisible())
-        self.assertTrue(overlay.testAttribute(Qt.WA_TranslucentBackground))
-        self.assertTrue(overlay.testAttribute(Qt.WA_TransparentForMouseEvents))
-        flags = overlay.windowFlags()
-        self.assertTrue(flags & Qt.FramelessWindowHint)
-        self.assertTrue(flags & Qt.WindowStaysOnTopHint)
-        self.assertTrue(flags & Qt.Tool)
-
-        workspace = Path(self.temp.name) / "workspace"
-        workspace.mkdir(exist_ok=True)
-        self.runtime.select_workspace(str(workspace))
-        self.runtime.search = SearchService(StubSearch())
-        result = self.runtime.handle_message(
-            "搜索 Python Agent 并保存为笔记",
-            AgentMode.WORK,
-        )
-        proposal = result["proposal"]
-        self.assertIsNotNone(proposal)
-        overlay.refresh_status()
+        stored = self.window.ui_state.overlay_visible()
+        self.assertFalse(self.window.overlay_visible())
+        self.window.set_overlay_visible(True)
         self.app.processEvents()
+        self.assertFalse(self.window.overlay_visible())
+        self.assertIn("--ui web", self.window.status.text())
+        self.assertEqual(self.window.ui_state.overlay_visible(), stored)
 
-        self.assertEqual(overlay.avatar.status, "等待确认写入")
-        self.assertTrue(overlay.bubble.isVisible())
-        self.assertTrue(overlay.bubble.text())
-        self.assertEqual(
-            self.runtime.desktop_status()["proposal_id"],
-            proposal.action_id,
-        )
-
-        self.runtime.cancel_proposal(proposal.action_id)
-        overlay.refresh_status()
-        self.app.processEvents()
-        self.assertFalse(overlay.bubble.isVisible())
-        self.assertEqual(overlay.avatar.status, "待机")
-
-    def test_overlay_hit_test_toggles_click_through(self):
-        if CompanionWindow is None:
+    def test_shell_overlay_gates_on_pet_availability(self):
+        if Shell is None:
             self.skipTest("PySide6 unavailable")
-        overlay = self.window.overlay
-        center = overlay.avatar.mapToGlobal(overlay.avatar.rect().center())
-        outside = center + QPoint(2000, 2000)
-
-        with patch(
-            "agent_framework.companion.ui.qt_app.QCursor.pos",
-            return_value=center,
-        ):
-            overlay.update_hit_test()
+        namespace = SimpleNamespace
         self.assertFalse(
-            overlay.testAttribute(Qt.WA_TransparentForMouseEvents)
+            Shell.pet_available(
+                namespace(adapter=namespace(assets=lambda: {"pet": {"available": False}}))
+            )
         )
-
-        with patch(
-            "agent_framework.companion.ui.qt_app.QCursor.pos",
-            return_value=outside,
-        ):
-            overlay.update_hit_test()
         self.assertTrue(
-            overlay.testAttribute(Qt.WA_TransparentForMouseEvents)
+            Shell.pet_available(
+                namespace(adapter=namespace(assets=lambda: {"pet": {"available": True}}))
+            )
+        )
+        self.assertTrue(
+            Shell.pet_available(
+                namespace(
+                    adapter=namespace(
+                        assets=lambda: {"pet": {"available": True, "renderer": "mesh"}}
+                    )
+                )
+            )
+        )
+        self.assertFalse(
+            Shell.pet_available(
+                namespace(
+                    adapter=namespace(
+                        assets=lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+                    )
+                )
+            )
         )
 
-    def test_overlay_position_is_remembered_and_clamped(self):
-        if CompanionWindow is None:
+    def test_window_and_tray_icons_never_draw_the_old_figure(self):
+        if app_icon is None:
             self.skipTest("PySide6 unavailable")
-        overlay = self.window.overlay
-        overlay.move(120, 80)
-        overlay.save_position()
-        self.assertEqual(self.window.ui_state.overlay_position(), (120, 80))
-
-        restored = AvatarOverlay(
-            self.runtime,
-            UiStateStore(self.runtime.data_dir),
+        self.assertFalse(app_icon().isNull())
+        folder = Path(self.temp.name) / "assets" / "remielle"
+        folder.mkdir(parents=True)
+        (folder / "avatar.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
         )
-        try:
-            self.assertEqual((restored.x(), restored.y()), (120, 80))
-        finally:
-            restored.close()
-
-        self.window.ui_state.set_overlay_position(10000, 10000)
-        clamped = AvatarOverlay(
-            self.runtime,
-            UiStateStore(self.runtime.data_dir),
-        )
-        try:
-            screen = QApplication.primaryScreen().availableGeometry()
-            self.assertGreaterEqual(clamped.x(), screen.x())
-            self.assertGreaterEqual(clamped.y(), screen.y())
-            self.assertLessEqual(
-                clamped.x() + clamped.width(),
-                screen.x() + screen.width(),
-            )
-            self.assertLessEqual(
-                clamped.y() + clamped.height(),
-                screen.y() + screen.height(),
-            )
-        finally:
-            clamped.close()
+        self.assertFalse(app_icon(self.runtime).isNull())
 
     def test_tray_controller_guards_unavailable_tray(self):
         if CompanionWindow is None or TrayController is None:
@@ -1105,6 +1060,8 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
 
             controller.pause_action.trigger()
             self.assertTrue(self.runtime.proactive_status()["enabled"])
+            self.assertFalse(controller.overlay_action.isEnabled())
+            self.assertIn("--ui web", controller.overlay_action.toolTip())
         finally:
             controller.close()
 
@@ -1119,8 +1076,8 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
         # whenever the system tray was unavailable or collapsed.
         self.assertNotEqual(window.windowFlags() & Qt.Tool, Qt.Tool)
         self.assertTrue(window.windowFlags() & Qt.WindowMinimizeButtonHint)
-        # Only the avatar overlay floats over other programs; the panel must not
-        # cover the window the user is actually working in.
+        # The Qt entry has no floating window; the panel must not cover the
+        # window the user is actually working in.
         self.assertFalse(window.windowFlags() & Qt.WindowStaysOnTopHint)
         self.assertFalse(window.windowFlags() & Qt.WindowStaysOnBottomHint)
         self.assertFalse(window.windowIcon().isNull())
