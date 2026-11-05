@@ -21,7 +21,13 @@ from agent_framework.companion.ui.state import (
 )
 from agent_framework.companion.web import WebAdapter
 from agent_framework.companion.web.layout_audit import _scratch_temp
-from agent_framework.companion.web.shell import _rect_matches
+from agent_framework.companion.web.shell import (
+    MAIN_SIZE,
+    _cursor_script,
+    _hit_script,
+    _rect_matches,
+    overlay_size_for,
+)
 from agent_framework.llm import OfflineLLMClient
 
 try:
@@ -130,6 +136,16 @@ class OverlayGeometryTests(unittest.TestCase):
         self.assertTrue(_rect_matches((0, 0, 1920, 1080), (1, 0, 1919, 1080)))
         self.assertFalse(_rect_matches((0, 0, 1920, 1040), (0, 0, 1920, 1080)))
 
+    def test_poll_scripts_interpolate_the_cursor_and_keep_the_braces(self):
+        # The script body is full of JavaScript braces; interpolating it with
+        # str.format raises KeyError inside the 120ms timer slot, and an
+        # unhandled exception in a Qt slot aborts the whole process.
+        hit = _hit_script(7, -2)
+        self.assertIn("window.__companionHit(x,y)", hit)
+        self.assertIn("window.__companionCursor(x,y)", hit)
+        self.assertTrue(hit.endswith("})(7,-2)"))
+        self.assertTrue(_cursor_script(-1, 300).endswith("})(-1,300)"))
+
 
 class OverlayPayloadTests(unittest.TestCase):
     def setUp(self):
@@ -224,7 +240,12 @@ class OverlayBrowserTests(unittest.TestCase):
         self.service, self.adapter = make_adapter(self.root)
         self.adapter.start()
         self.store = self.service.runtime.store
-        self.context = self.browser.new_context(viewport={"width": 300, "height": 250})
+        self.context = self.browser.new_context(
+            viewport={
+                "width": overlay_size_for(MAIN_SIZE[1])[0],
+                "height": overlay_size_for(MAIN_SIZE[1])[1],
+            }
+        )
         self.page = None
 
     def tearDown(self):
@@ -405,6 +426,44 @@ class OverlayBrowserTests(unittest.TestCase):
             page.evaluate("window.__hostCalls"),
         )
 
+    def test_live2d_fit_is_stable_when_reapplied(self):
+        page = self.open_overlay()
+        self.wait_for(
+            "typeof window.CompanionStage?.fit === 'function'",
+            "Live2D 舞台提供 fit 入口",
+        )
+        sizes = page.evaluate(
+            """() => {
+              const model = {
+                internalModel: { originalWidth: 1000, originalHeight: 2000 },
+                scale: {
+                  x: 0.01, y: 0.01,
+                  set(value) { this.x = value; this.y = value; },
+                },
+                anchor: {
+                  x: 0, y: 0,
+                  set(x, y) { this.x = x; this.y = y; },
+                },
+                x: 0, y: 0,
+                get width() { return 1000 * this.scale.x; },
+                get height() { return 2000 * this.scale.y; },
+              };
+              const stage = {
+                model,
+                app: { screen: { width: 400, height: 300 } },
+              };
+              CompanionStage.fit(stage);
+              const first = [model.scale.x, model.width, model.height];
+              CompanionStage.fit(stage);
+              const second = [model.scale.x, model.width, model.height];
+              return { first, second };
+            }"""
+        )
+        self.assertAlmostEqual(sizes["first"][0], 0.147)
+        self.assertAlmostEqual(sizes["first"][0], sizes["second"][0])
+        self.assertAlmostEqual(sizes["first"][1], sizes["second"][1])
+        self.assertAlmostEqual(sizes["first"][2], sizes["second"][2])
+
     def test_collapse_hides_the_pet_and_persists(self):
         page = self.open_overlay()
         self.wait_for(
@@ -436,6 +495,31 @@ class OverlayBrowserTests(unittest.TestCase):
         self.assertEqual("56px", page.evaluate(
             "getComputedStyle(document.querySelector('#ball')).width"
         ))
+
+    def test_poll_scripts_drive_the_page_cursor_hooks(self):
+        page = self.open_overlay()
+        self.wait_for(
+            "typeof window.__companionCursor === 'function' && "
+            "typeof window.__companionHit === 'function'",
+            "浮窗注册命中与视线接口",
+        )
+        page.evaluate(
+            "(function(){window.__calls=[];"
+            "var record=function(name){return function(x,y){"
+            "window.__calls.push([name,x,y]);return true;};};"
+            "window.__companionHit=record('hit');"
+            "window.__companionCursor=record('cursor');})()"
+        )
+        # Nothing on the page polls these hooks; only the shell does.
+        self.assertEqual(0, page.evaluate("window.__calls.length"))
+        # Out-of-window pixels are the whole point: the figure keeps turning
+        # toward a cursor that has already left the 300x250 card.
+        self.assertTrue(page.evaluate(_hit_script(12, -3)))
+        page.evaluate(_cursor_script(260, 480))
+        self.assertEqual(
+            [["hit", 12, -3], ["cursor", 12, -3], ["cursor", 260, 480]],
+            page.evaluate("window.__calls"),
+        )
 
 
 if __name__ == "__main__":

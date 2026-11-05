@@ -208,6 +208,15 @@ def main():
                     report["fts_rows"],
                     report["memory_rows"],
                 ))
+            if (
+                report["doc_fts_present"]
+                and report["doc_fts_rows"] != report["doc_chunk_rows"]
+            ):
+                print("[WARN] {:<20} doc_fts={} doc_chunks={}; rebuilt on launch".format(
+                    "Doc FTS parity",
+                    report["doc_fts_rows"],
+                    report["doc_chunk_rows"],
+                ))
         else:
             checks.append(check("Database", True, "尚未创建"))
 
@@ -301,6 +310,125 @@ def main():
                 ))
     except Exception as error:
         checks.append(check("Skills", False, str(error)))
+
+    try:
+        import json
+        import sqlite3
+
+        from agent_framework.companion.mcp.keys import status as mcp_keys_status
+
+        # Credentials are reported as existence and permission only — never a
+        # value, never a name that could be pasted into a ticket.
+        keys = mcp_keys_status()
+        servers = 0
+        enabled = 0
+        no_tools = 0
+        database = ROOT / "data" / "companion.db"
+        if database.exists():
+            connection = sqlite3.connect(
+                "file:{}?mode=ro".format(database.as_posix()), uri=True
+            )
+            try:
+                rows = connection.execute(
+                    "SELECT enabled, tools FROM mcp_servers"
+                ).fetchall()
+            except sqlite3.Error:
+                # 旧库还没有这张表：下一次启动由迁移梯子补上，不当成故障。
+                rows = []
+            finally:
+                connection.close()
+            servers = len(rows)
+            for row in rows:
+                if not row[0]:
+                    continue
+                enabled += 1
+                try:
+                    chosen = json.loads(row[1] or "[]")
+                except ValueError:
+                    chosen = ["?"]
+                if not chosen:
+                    no_tools += 1
+        detail = (
+            "servers={} enabled={} keys={} entries={} mode={}".format(
+                servers,
+                enabled,
+                "present" if keys["exists"] else "none",
+                keys["entries"],
+                keys["mode"] or "-",
+            )
+        )
+        world_readable = (
+            os.name == "posix"
+            and keys["exists"]
+            and bool(int(keys["mode"] or "0", 8) & 0o077)
+        )
+        if keys["error"] or world_readable:
+            print("[WARN] {:<20} {}".format(
+                "MCP credentials",
+                keys["error"]
+                or "凭据文件对同组和其他用户可读：{}".format(keys["mode"]),
+            ))
+        elif not keys["exists"]:
+            print("[WARN] {:<20} {}".format(
+                "MCP credentials",
+                "no file yet; created when a server gets a secret",
+            ))
+        if no_tools:
+            print("[WARN] {:<20} {}".format(
+                "MCP tools",
+                "{} 台服务器已开启但没勾任何工具，模型看不到远程工具".format(no_tools),
+            ))
+        checks.append(check("MCP servers", True, detail))
+    except Exception as error:
+        checks.append(check("MCP servers", False, str(error)))
+
+    try:
+        from agent_framework.companion.access_control import state_report
+
+        database = ROOT / "data" / "companion.db"
+        if not database.exists():
+            print("[WARN] {:<20} {}".format(
+                "Access grants",
+                "database not created yet",
+            ))
+        else:
+            access = state_report(database)
+            if not access["available"]:
+                print("[WARN] {:<20} {}".format(
+                    "Access grants",
+                    access["reason"],
+                ))
+            else:
+                detail = "grants={} legacy={} drifted={} override={} leases={}/{}".format(
+                    access["active_count"],
+                    "yes" if access["workspace"] else "none",
+                    access["drifted_count"],
+                    access["override_count"],
+                    access["live_lease_count"],
+                    access["expired_lease_count"],
+                )
+                for item in access["grants"]:
+                    if item["status"] != "active":
+                        continue
+                    if item["drifted"]:
+                        print("[WARN] {:<20} {}: {}".format(
+                            "Grant drifted",
+                            item["path"],
+                            item.get("reason", "identity_changed"),
+                        ))
+                    if item["sensitivity_override"]:
+                        print("[WARN] {:<20} {}".format(
+                            "Grant override",
+                            "凭据目录被显式授权：{}".format(item["path"]),
+                        ))
+                if not access["active_count"]:
+                    print("[WARN] {:<20} {}".format(
+                        "Access grants",
+                        "没有任何目录授权，文件类操作会被全部拒绝",
+                    ))
+                checks.append(check("Access grants", True, detail))
+    except Exception as error:
+        checks.append(check("Access grants", False, str(error)))
 
     try:
         from agent_framework.companion.assets import character_assets_check

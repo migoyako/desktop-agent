@@ -34,6 +34,7 @@ from .ports import CompanionRuntimePort
 from .projection import (
     build_context_view,
     build_inspector_sections,
+    build_sources,
     clip,
     stage_for_event,
 )
@@ -104,6 +105,7 @@ class CompanionApplicationService:
                 pending if pending is not None else None,
             ),
             context=build_context_view(self.runtime),
+            sources=build_sources(self.runtime),
             message_actions=self.message_actions(),
         )
 
@@ -226,7 +228,9 @@ class CompanionApplicationService:
             if assistant is not None:
                 regenerate_id = int(assistant["id"])
         source_id = 0
-        sources = getattr(self.runtime, "last_tool_sources", None) or []
+        # 跳转来源 offered whenever this turn has any provenance at all: a web
+        # hit or a chunk from the local library.
+        sources = build_sources(self.runtime)
         if sources:
             for row in reversed(rows):
                 if row.get("role") == "assistant":

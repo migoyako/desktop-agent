@@ -126,6 +126,9 @@
         setReduceMotion(stage.reduceMotion);
         return {
           setMood: applyMood,
+          // A .mavatar has no clip library and no rig to point at the cursor.
+          setMotion: () => {},
+          setFocus: () => {},
           setReduceMotion: setReduceMotion,
           resize: () => {
             if (stage.reduceMotion) draw();

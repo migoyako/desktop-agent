@@ -1,0 +1,25 @@
+<style>*{box-sizing:border-box;margin:0;padding:0}
+body{width:680px;height:780px;background:#ececee;font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;color:#1d1d1f;font-size:13px;line-height:1.5}
+.win{width:664px;height:764px;margin:8px;border:1px solid #ededf0;border-radius:14px;background:#ffffff;display:flex;flex-direction:column;overflow:hidden}
+.wrap{padding:14px 18px;display:flex;flex-direction:column;gap:10px}
+.card{border:1px solid #ededf0;border-radius:8px;background:#ffffff;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.row{display:flex;align-items:center;gap:8px}
+.fv{font-size:13px;color:#1d1d1f;white-space:nowrap}
+.mono{font-family:Consolas,monospace;font-size:12px}
+.m11{font-family:Consolas,monospace;font-size:11px}
+.g{height:28px;padding:0 10px;border:1px solid #ededf0;border-radius:6px;display:flex;align-items:center;flex:none}
+.gs{font-size:11px;color:#8e8e93;white-space:nowrap}
+.p{height:32px;padding:0 12px;border-radius:8px;background:#ff5b8a;display:flex;align-items:center;flex:none}
+.ps{font-size:13px;font-weight:600;color:#ffffff;white-space:nowrap}
+.pill{height:19px;padding:0 8px;border:1px solid #ededf0;border-radius:99px;display:flex;align-items:center;flex:none}
+.pills{font-size:11px;color:#8e8e93;white-space:nowrap}
+.pilla{border-color:#ff9fbd;background:#fde0ed}
+.pillsa{color:#ff5b8a}
+.pillk{border-color:#43a877}
+.pillsk{color:#43a877}
+.pilld{border-color:#d94f61}
+.pillsd{color:#d94f61}
+.h11{font-size:11px;color:#8e8e93;line-height:1.5}
+.dis{opacity:0.45}
+.meta{font-size:16px;font-weight:600}
+.kv{width:52px;flex:none;font-size:11px;color:#6e6e73}</style><div class="win"><div class="wrap"><div class="row"><span class="meta">外部调用确认卡</span><div class="pill"><span class="pills">聊天流内组件</span></div></div><div class="h11">这是插入聊天流的卡片，不是设置页。三种状态：待确认、已执行回执、被档位直接拒绝。</div><div class="card" style="border-color:#ff5b8a;gap:6px"><div class="row" style="gap:4px"><div class="pill pilla"><span class="pills pillsa">待确认外部调用</span></div><div class="pill"><span class="pills">等待审批</span></div></div><div style="display:flex;flex-direction:column;gap:2px"><div class="row"><span class="kv">目标</span><span class="mono fv">mcp__filesystem__write_file</span></div><div class="row"><span class="kv">风险</span><span class="mono fv">外部调用</span></div><div class="row"><span class="kv">服务器</span><span class="mono fv">filesystem · stdio</span></div><div class="row"><span class="kv">可撤销</span><span class="mono fv">不可撤销</span></div><div class="row"><span class="kv">模式</span><span class="mono fv">工作</span></div><div class="row"><span class="kv">有效期</span><span class="mono fv">2026-11-03 15:42</span></div></div><div class="card" style="background:#f5f5f7;padding:6px 8px;gap:0"><span class="m11" style="color:#8e8e93">{ "path": "D:\\docs\\周报.md", "mode": "overwrite" }</span><span class="m11" style="color:#8e8e93">"content": "# 本周进展…"（共 1 284 字符，已截断）</span></div><div class="row"><span class="h11">远端服务会真的收到这次调用；本机没有备份，执行后无法撤销。</span></div><div class="row"><div class="p"><span class="ps">允许这次调用</span></div><div class="g"><span class="gs">取消</span></div></div></div><div class="card" style="border-color:#ededf0;gap:6px"><div class="row" style="gap:4px"><div class="pill pilla"><span class="pills pillsa">已执行</span></div><div class="pill pillk"><span class="pills pillsk">已完成</span></div></div><div style="display:flex;flex-direction:column;gap:2px"><div class="row"><span class="kv">目标</span><span class="mono fv">mcp__web_search__search</span></div><div class="row"><span class="kv">风险</span><span class="mono fv">外部调用</span></div><div class="row"><span class="kv">服务器</span><span class="mono fv">web-search · sse</span></div><div class="row"><span class="kv">回执</span><span class="mono fv">成功 · 远端返回 3 条结果</span></div><div class="row"><span class="kv">可撤销</span><span class="mono fv">不可撤销</span></div></div><div class="row"><span class="h11">回执已写入审计日志，导出时不含凭据。</span></div><div class="row"><div class="g dis"><span class="gs dis">撤销</span></div><span class="h11">外部调用不提供撤销，点击只会说明原因。</span></div></div><div class="card" style="border-color:#d2d2d7;gap:6px"><div class="row" style="gap:4px"><div class="pill pilld"><span class="pills pillsd">已拒绝</span></div><div class="pill"><span class="pills">档位：保守</span></div></div><div style="display:flex;flex-direction:column;gap:2px"><div class="row"><span class="kv">目标</span><span class="mono fv">mcp__calendar__create_event</span></div><div class="row"><span class="kv">风险</span><span class="mono fv">外部调用</span></div><div class="row"><span class="kv">服务器</span><span class="mono fv">calendar · stdio</span></div><div class="row"><span class="kv">模式</span><span class="mono fv">陪伴</span></div></div><div class="h11">当前权限档位（保守）在陪伴模式下拒绝一切外部调用，模型已收到拒绝原因，不会重试。</div></div></div></div>

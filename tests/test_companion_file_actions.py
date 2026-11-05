@@ -11,12 +11,12 @@ from agent_framework.companion.file_actions import (
     PREVIEW_LINE_CHARS,
     FileActionError,
     NoteActionService,
-    WorkspaceGuard,
     diff_lines,
     fingerprint,
     safe_note_filename,
 )
 from agent_framework.companion.models import AgentMode
+from agent_framework.companion.path_safety import WorkspaceGuard
 from agent_framework.companion.store import CompanionStore
 
 

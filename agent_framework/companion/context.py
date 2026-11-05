@@ -15,6 +15,7 @@ KEEP_RATIO = 0.55
 MIN_RECENT_CHARS = 4000
 MAX_SUMMARY_CHARS = 1200
 MAX_RECALL_CHARS = 1600
+MAX_DOCS_CHARS = 2400
 MAX_SETTINGS_CHARS = 2000
 MESSAGE_OVERHEAD = 4
 
@@ -132,11 +133,14 @@ def select_history(
     trigger: float = COMPRESS_TRIGGER,
     keep_ratio: float = KEEP_RATIO,
     min_recent: int = MIN_RECENT_CHARS,
+    max_messages: int = 0,
 ) -> HistorySelection:
     """Select whole messages, newest first, and never split a turn.
 
     Stored history only contains user/assistant messages, so any window
-    boundary falls between complete turns.
+    boundary falls between complete turns. ``max_messages`` caps how many turns
+    stay verbatim; the overflow joins ``dropped`` so it still reaches the
+    checkpoint summary instead of vanishing from the conversation.
     """
     items = [
         item
@@ -145,27 +149,35 @@ def select_history(
     ]
     total = sum(message_chars(item) for item in items)
     budget = max(0, int(budget_chars))
+    dropped: List[Dict[str, Any]] = []
     if total <= max(0, int(budget * trigger)):
-        return HistorySelection(items, [], total, total, False)
-
-    target = max(min_recent, int(budget * keep_ratio))
-    target = min(target, budget)
-    kept: List[Dict[str, Any]] = []
-    used = 0
-    for item in reversed(items):
-        size = message_chars(item)
-        if kept and used + size > target:
-            break
-        kept.append(item)
-        used += size
-    kept.reverse()
-    dropped_count = len(items) - len(kept)
+        kept = items
+        used = total
+    else:
+        target = max(min_recent, int(budget * keep_ratio))
+        target = min(target, budget)
+        kept = []
+        used = 0
+        for item in reversed(items):
+            size = message_chars(item)
+            if kept and used + size > target:
+                break
+            kept.append(item)
+            used += size
+        kept.reverse()
+        dropped = items[: len(items) - len(kept)]
+    cap = max(0, int(max_messages or 0))
+    if cap and len(kept) > cap:
+        cut = kept[: len(kept) - cap]
+        kept = kept[len(kept) - cap :]
+        dropped = list(dropped) + cut
+        used = sum(message_chars(item) for item in kept)
     return HistorySelection(
         messages=kept,
-        dropped=items[:dropped_count],
+        dropped=dropped,
         used_chars=used,
         total_chars=total,
-        compressed=dropped_count > 0,
+        compressed=bool(dropped),
     )
 
 

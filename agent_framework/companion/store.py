@@ -7,7 +7,7 @@ from pathlib import Path
 import hashlib
 import json
 import sqlite3
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from .models import (
     ActionProposal,
@@ -15,6 +15,7 @@ from .models import (
     AffectRecord,
     APPROVAL_PENDING,
     AgentMode,
+    EXECUTOR_NOTE,
     ExperienceRecord,
     FORWARD_UNKNOWN,
     MemoryRecord,
@@ -35,6 +36,8 @@ from .models import (
 )
 from .textseg import fts_match_query, fts_segment
 from .redaction import redact_text
+from .path_safety import path_key, resource_identity
+from . import settings as app_settings
 
 
 SCHEMA = """
@@ -173,7 +176,7 @@ CREATE TABLE IF NOT EXISTS workspace_grants (
 """
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 13
 
 MEMORY_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
@@ -452,6 +455,142 @@ CREATE TABLE IF NOT EXISTS session_drafts (
 """
 
 
+APP_SETTINGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS app_settings (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    data TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+DOCUMENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS documents (
+    document_id TEXT PRIMARY KEY,
+    persona_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    path TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    converted INTEGER NOT NULL DEFAULT 0,
+    chunks INTEGER NOT NULL DEFAULT 0,
+    chars INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_documents_persona
+    ON documents(persona_id, created_at);
+
+CREATE TABLE IF NOT EXISTS doc_chunks (
+    chunk_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    heading TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL,
+    chars INTEGER NOT NULL,
+    FOREIGN KEY(document_id) REFERENCES documents(document_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_doc_chunks_document
+    ON doc_chunks(document_id, ordinal);
+"""
+
+# FTS5 lives apart from DOCUMENT_SCHEMA so a build without the extension only
+# loses lexical doc search, exactly like memory_fts does for memories.
+DOC_FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS doc_fts USING fts5(
+    chunk_id UNINDEXED,
+    seg
+);
+"""
+
+
+# The user's MCP servers. Credentials are deliberately absent: an env var or a
+# header that carries a token lives in config/mcp_keys.json, so a backup of this
+# database can be handed to anyone without leaking a key.
+MCP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    server_id TEXT PRIMARY KEY,
+    label TEXT NOT NULL DEFAULT '',
+    transport TEXT NOT NULL DEFAULT 'stdio',
+    command TEXT NOT NULL DEFAULT '',
+    args TEXT NOT NULL DEFAULT '[]',
+    cwd TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    timeout REAL NOT NULL DEFAULT 15,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    tools TEXT NOT NULL DEFAULT '[]',
+    discovered TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_enabled
+    ON mcp_servers(enabled, server_id);
+"""
+
+
+# 桌面执行代理 S1：目录授权与任务级短期租约。
+#
+# 一行代表"这个目录"，不是一行代表"一项能力"：合并授权卡一次勾走读/写/搜索，
+# 撤销也按整条目录撤，拆成多行会让"撤回了哪些权限"无法一句话回答。
+# 凭据目录的覆盖位留在行上，授权状态本身可审计，不藏在调用方内存里。
+ACCESS_GRANT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS access_grants (
+    grant_id TEXT PRIMARY KEY,
+    resource_kind TEXT NOT NULL DEFAULT 'directory',
+    path TEXT NOT NULL DEFAULT '',
+    path_key TEXT NOT NULL DEFAULT '',
+    volume_id TEXT NOT NULL DEFAULT '',
+    file_id TEXT NOT NULL DEFAULT '',
+    capabilities TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active',
+    source TEXT NOT NULL DEFAULT 'grant',
+    sensitivity_override INTEGER NOT NULL DEFAULT 0,
+    legacy_workspace INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_used_at TEXT NOT NULL DEFAULT '',
+    revoked_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_access_grants_path
+    ON access_grants(resource_kind, path_key)
+    WHERE resource_kind = 'directory';
+
+CREATE INDEX IF NOT EXISTS idx_access_grants_status
+    ON access_grants(status, resource_kind);
+
+CREATE TABLE IF NOT EXISTS grant_leases (
+    lease_id TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    resource_ids TEXT NOT NULL DEFAULT '[]',
+    nonce TEXT NOT NULL,
+    confirm_digest TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL,
+    max_operations INTEGER NOT NULL DEFAULT 1,
+    operations_used INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    released_at TEXT NOT NULL,
+    FOREIGN KEY(grant_id) REFERENCES access_grants(grant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_grant_leases_task
+    ON grant_leases(task_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_grant_leases_active
+    ON grant_leases(status, expires_at);
+"""
+
+# 旧 workspace_grants 只有一行，它的授权面就是"在这目录里写笔记"。提升时按
+# P1 的三档勾选补齐读/写/搜索，但不给删除和外发——那两项从来没有被用户授予过。
+LEGACY_WORKSPACE_CAPABILITIES = ("fs-read", "fs-write", "fs-search")
+
+
 def _add_column_if_missing(connection, table, column, definition):
     existing = {
         row[1]
@@ -459,6 +598,10 @@ def _add_column_if_missing(connection, table, column, definition):
             "PRAGMA table_info({})".format(table)
         ).fetchall()
     }
+    if not existing:
+        # 半迁移的库（迁移中途崩溃后重开）可能还没有这张表；跳过它让梯子继续，
+        # 缺的表由 SCHEMA 或它自己的迁移步骤补上。
+        return
     if column not in existing:
         connection.execute(
             "ALTER TABLE {} ADD COLUMN {} {}".format(
@@ -467,6 +610,39 @@ def _add_column_if_missing(connection, table, column, definition):
                 definition,
             )
         )
+
+
+# The server row is stored as the user typed it, so these three helpers are the
+# only place that decides how a command, a list or a JSON column is represented.
+MAX_MCP_STORED_DESCRIPTION = 400
+
+
+def _mcp_json(value) -> str:
+    if value is None:
+        return "[]"
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return "[]"
+    if not isinstance(value, (list, tuple, dict)):
+        return "[]"
+    return json.dumps(list(value) if isinstance(value, (list, tuple)) else value, ensure_ascii=False)
+
+
+def _mcp_command_text(command) -> str:
+    if isinstance(command, (list, tuple)):
+        return " ".join(str(item) for item in command if str(item).strip())
+    return str(command or "").strip()
+
+
+def _mcp_server_from_row(row) -> Dict:
+    value = dict(row)
+    value["args"] = json.loads(value.get("args") or "[]")
+    value["tools"] = json.loads(value.get("tools") or "[]")
+    value["discovered"] = json.loads(value.get("discovered") or "[]")
+    value["enabled"] = bool(value.get("enabled"))
+    return value
 
 
 def _migrate_v1(connection):
@@ -612,6 +788,151 @@ def _migrate_v9(connection):
     connection.executescript(SESSION_DRAFT_SCHEMA)
 
 
+def _migrate_v10(connection):
+    """应用级设置：模型推理与记忆召回偏好，单行 JSON blob。"""
+    connection.executescript(APP_SETTINGS_SCHEMA)
+
+
+def _migrate_v11(connection):
+    """文档库：documents/doc_chunks 与 recall_log 的召回范围列。"""
+    _add_column_if_missing(
+        connection,
+        "recall_log",
+        "scope",
+        "TEXT NOT NULL DEFAULT 'memory'",
+    )
+    connection.executescript(DOCUMENT_SCHEMA)
+
+
+def _migrate_v12(connection):
+    """MCP 治理：mcp_servers 表与 action_proposals 的执行器分派列。"""
+    _add_column_if_missing(
+        connection,
+        "action_proposals",
+        "executor",
+        "TEXT NOT NULL DEFAULT 'note'",
+    )
+    connection.executescript(MCP_SCHEMA)
+
+
+def _migrate_v13(connection):
+    """桌面执行代理 S1：目录授权表、任务级短期租约表与旧工作区提升。"""
+    connection.executescript(ACCESS_GRANT_SCHEMA)
+    _promote_legacy_workspace_grant(connection)
+
+
+def _access_json_list(value) -> str:
+    """Store a capability or resource list as JSON, never as a bare string."""
+    if value is None:
+        return "[]"
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return "[]"
+    if isinstance(value, (list, tuple, set)):
+        value = sorted({str(item) for item in value if str(item).strip()})
+    else:
+        return "[]"
+    return json.dumps(list(value), ensure_ascii=False)
+
+
+def _directory_identity_or_empty(path) -> Dict:
+    """Best-effort identity: a grant to a currently missing directory is still a
+    fact the user authorized, it just cannot be used until the directory returns."""
+    try:
+        return resource_identity(path)
+    except (OSError, sqlite3.Error):
+        return {"root": "", "device": "", "file_id": ""}
+
+
+def _access_grant_from_row(row) -> Optional[Dict]:
+    if row is None:
+        return None
+    value = dict(row)
+    value["capabilities"] = json.loads(value.get("capabilities") or "[]")
+    value["sensitivity_override"] = bool(value.get("sensitivity_override"))
+    value["legacy_workspace"] = bool(value.get("legacy_workspace"))
+    return value
+
+
+def _grant_lease_from_row(row) -> Optional[Dict]:
+    if row is None:
+        return None
+    value = dict(row)
+    value["resource_ids"] = json.loads(value.get("resource_ids") or "[]")
+    value["max_operations"] = int(value.get("max_operations") or 0)
+    value["operations_used"] = int(value.get("operations_used") or 0)
+    return value
+
+
+def _promote_legacy_workspace_grant(connection):
+    """Copy the pre-v13 single workspace row into access_grants once.
+
+    Called both from the migration and on every launch: an archive exported before
+    v13 carries only ``workspace_grants``, and importing it must not silently drop
+    the user's authorization.
+
+    The old row is disabled either way. Leaving it enabled would resurrect a
+    workspace the user revoked as soon as the app restarts, because nothing writes
+    that table any more.
+    """
+    try:
+        legacy = connection.execute(
+            "SELECT path, created_at, enabled FROM workspace_grants WHERE id = 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return
+    if legacy is None or not int(legacy["enabled"] or 0):
+        return
+    already = connection.execute(
+        "SELECT grant_id FROM access_grants WHERE legacy_workspace = 1 LIMIT 1"
+    ).fetchone()
+    if already is None:
+        path = str(legacy["path"] or "").strip()
+        if path:
+            identity = _directory_identity_or_empty(path)
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO access_grants(
+                    grant_id, resource_kind, path, path_key, volume_id, file_id,
+                    capabilities, status, source, legacy_workspace,
+                    created_at, updated_at
+                ) VALUES (?, 'directory', ?, ?, ?, ?, ?, 'active', 'workspace', 1, ?, ?)
+                ON CONFLICT(resource_kind, path_key)
+                    WHERE resource_kind = 'directory' DO UPDATE SET
+                    status = 'active',
+                    legacy_workspace = 1,
+                    revoked_at = '',
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    new_id("grant"),
+                    path,
+                    path_key(path),
+                    identity["device"],
+                    identity["file_id"],
+                    _access_json_list(LEGACY_WORKSPACE_CAPABILITIES),
+                    str(legacy["created_at"] or now),
+                    now,
+                ),
+            )
+    connection.execute("UPDATE workspace_grants SET enabled = 0 WHERE id = 1")
+
+
+def _reindex_doc_fts(connection):
+    """从 doc_chunks 全量重建 doc_fts 索引（幂等）。"""
+    connection.execute("DELETE FROM doc_fts")
+    rows = connection.execute(
+        "SELECT chunk_id, text FROM doc_chunks"
+    ).fetchall()
+    connection.executemany(
+        "INSERT INTO doc_fts(chunk_id, seg) VALUES (?, ?)",
+        [(row["chunk_id"], fts_segment(row["text"])) for row in rows],
+    )
+
+
 def _reindex_memory_fts(connection):
     """从 memories 全量重建 memory_fts 索引（幂等）。"""
     connection.execute("DELETE FROM memory_fts")
@@ -645,6 +966,7 @@ class CompanionStore:
 
     def _initialize(self):
         self.fts_enabled = False
+        self.doc_fts_enabled = False
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
@@ -707,10 +1029,27 @@ class CompanionStore:
                 if version < 9:
                     _migrate_v9(connection)
                     version = 9
+                if version < 10:
+                    _migrate_v10(connection)
+                    version = 10
+                if version < 11:
+                    _migrate_v11(connection)
+                    version = 11
+                if version < 12:
+                    _migrate_v12(connection)
+                    version = 12
+                if version < 13:
+                    _migrate_v13(connection)
+                    version = 13
             connection.execute(
                 "PRAGMA user_version = {}".format(int(version))
             )
+            if int(version) >= 13:
+                # Self-heal, not just a migration step: a pre-v13 archive imported
+                # into a v13 database carries its workspace in the old table only.
+                _promote_legacy_workspace_grant(connection)
             self.fts_enabled = self._ensure_memory_fts(connection)
+            self.doc_fts_enabled = self._ensure_doc_fts(connection)
 
     @staticmethod
     def _ensure_memory_fts(connection) -> bool:
@@ -729,6 +1068,28 @@ class CompanionStore:
             if int(indexed) != int(total):
                 _reindex_memory_fts(connection)
             connection.execute("SELECT COUNT(*) FROM memory_fts").fetchone()
+            return True
+        except sqlite3.Error:
+            return False
+
+    @staticmethod
+    def _ensure_doc_fts(connection) -> bool:
+        """文档索引自愈：缺表建表、行数不符则全量重建。
+
+        与 ``_ensure_memory_fts`` 同理：任何异常只关闭词法文档检索，
+        不阻塞启动，也不影响记忆召回。
+        """
+        try:
+            connection.executescript(DOC_FTS_SCHEMA)
+            indexed = connection.execute(
+                "SELECT COUNT(*) AS value FROM doc_fts"
+            ).fetchone()["value"]
+            total = connection.execute(
+                "SELECT COUNT(*) AS value FROM doc_chunks"
+            ).fetchone()["value"]
+            if int(indexed) != int(total):
+                _reindex_doc_fts(connection)
+            connection.execute("SELECT COUNT(*) FROM doc_fts").fetchone()
             return True
         except sqlite3.Error:
             return False
@@ -850,6 +1211,43 @@ class CompanionStore:
                 (session_id, content, utc_now(), session_id),
             )
             return cursor.rowcount > 0
+
+    def schema_version(self) -> int:
+        """``PRAGMA user_version`` as it currently stands on disk."""
+        with self._connection() as connection:
+            return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+    def load_settings(self) -> Optional[Dict[str, Any]]:
+        """Stored settings, or None when nothing has been saved yet."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT data FROM app_settings WHERE id = 1"
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(str(row["data"]))
+        except ValueError:
+            return None
+        return app_settings.normalize(payload)
+
+    def save_settings(self, values) -> Dict[str, Any]:
+        clean = app_settings.normalize(values)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO app_settings(id, data, updated_at)
+                VALUES (1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    data = excluded.data,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    json.dumps(clean, ensure_ascii=False, sort_keys=True),
+                    utc_now(),
+                ),
+            )
+        return clean
 
     def delete_session(self, session_id: str) -> bool:
         """Remove one session and every row scoped to it, including drafts."""
@@ -1058,8 +1456,8 @@ class CompanionStore:
                     raw_arguments, normalized_arguments, expected_state,
                     risk, target_summary, reversible, user_visible_plan,
                     confirmation_digest, idempotency_key, status,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, executor
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     proposal.action_id,
@@ -1079,6 +1477,7 @@ class CompanionStore:
                     ProposalStatus(proposal.status).value,
                     proposal.created_at,
                     proposal.updated_at,
+                    str(proposal.executor or EXECUTOR_NOTE),
                 ),
             )
 
@@ -2573,6 +2972,7 @@ class CompanionStore:
         scores: List[float],
         latency_ms: float,
         source: str = "",
+        scope: str = "memory",
     ):
         recall_id = new_id("rcl")
         with self._connection() as connection:
@@ -2580,8 +2980,8 @@ class CompanionStore:
                 """
                 INSERT INTO recall_log(
                     recall_id, session_id, query_hash, fact_ids, scores,
-                    used_in_reply, latency_ms, source, created_at
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+                    used_in_reply, latency_ms, source, scope, created_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                 """,
                 (
                     recall_id,
@@ -2591,6 +2991,7 @@ class CompanionStore:
                     json.dumps(scores),
                     float(latency_ms),
                     source,
+                    scope or "memory",
                     utc_now(),
                 ),
             )
@@ -3311,32 +3712,754 @@ class CompanionStore:
             created_at=row["created_at"],
         )
 
-    def set_workspace(self, path: str):
+    def set_workspace(self, path: str, sensitivity_override: bool = False):
+        """Compatibility adapter: the workspace is one flagged row in access_grants.
+
+        The path is stored exactly as the caller wrote it, like the pre-v13 table
+        did; identity columns are computed separately so a moved directory is
+        detectable instead of silently re-resolved.
+        """
+        return self.upsert_directory_grant(
+            path,
+            LEGACY_WORKSPACE_CAPABILITIES,
+            source="workspace",
+            sensitivity_override=bool(sensitivity_override),
+            legacy_workspace=True,
+        )
+
+    def get_workspace(self) -> Optional[str]:
+        grant = self.get_legacy_workspace_grant()
+        return grant["path"] if grant else None
+
+    def clear_workspace(self):
+        grant = self.get_legacy_workspace_grant()
+        if grant is None:
+            return
+        self.set_access_grant_status(grant["grant_id"], "revoked")
+
+    # -- 授权中心（桌面执行代理 S1）----------------------------------------
+
+    def get_legacy_workspace_grant(self) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM access_grants
+                WHERE legacy_workspace = 1 AND status = 'active' AND resource_kind = 'directory'
+                ORDER BY updated_at DESC
+                """
+            ).fetchone()
+        return _access_grant_from_row(row) if row else None
+
+    def upsert_directory_grant(
+        self,
+        path,
+        capabilities,
+        source="grant",
+        sensitivity_override=False,
+        legacy_workspace=False,
+    ) -> Dict:
+        """Insert or replace the one row that stands for this directory.
+
+        Capabilities are replaced, not merged: the merged authorization card shows
+        the whole set at once, so "re-grant" means "this is what it is now".
+        """
+        key = path_key(path)
+        identity = _directory_identity_or_empty(path)
+        caps = _access_json_list(capabilities)
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT grant_id FROM access_grants
+                WHERE resource_kind = 'directory' AND path_key = ?
+                """,
+                (key,),
+            ).fetchone()
+            if row is None:
+                grant_id = new_id("grant")
+                connection.execute(
+                    """
+                    INSERT INTO access_grants(
+                        grant_id, resource_kind, path, path_key,
+                        volume_id, file_id, capabilities, status, source,
+                        sensitivity_override, legacy_workspace,
+                        created_at, updated_at
+                    ) VALUES (?, 'directory', ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        grant_id,
+                        str(path),
+                        key,
+                        identity["device"],
+                        identity["file_id"],
+                        caps,
+                        str(source or "grant"),
+                        1 if sensitivity_override else 0,
+                        1 if legacy_workspace else 0,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                grant_id = row["grant_id"]
+                connection.execute(
+                    """
+                    UPDATE access_grants
+                    SET path = ?, volume_id = ?, file_id = ?, capabilities = ?,
+                        status = 'active', source = ?, sensitivity_override = ?,
+                        legacy_workspace = ?, revoked_at = '', updated_at = ?
+                    WHERE grant_id = ?
+                    """,
+                    (
+                        str(path),
+                        identity["device"],
+                        identity["file_id"],
+                        caps,
+                        str(source or "grant"),
+                        1 if sensitivity_override else 0,
+                        1 if legacy_workspace else 0,
+                        now,
+                        grant_id,
+                    ),
+                )
+            if legacy_workspace:
+                # At most one row carries the workspace flag, or get_workspace()
+                # would have two candidates to guess between.
+                connection.execute(
+                    """
+                    UPDATE access_grants SET legacy_workspace = 0
+                    WHERE legacy_workspace = 1 AND grant_id != ?
+                    """,
+                    (grant_id,),
+                )
+            current = connection.execute(
+                "SELECT * FROM access_grants WHERE grant_id = ?", (grant_id,)
+            ).fetchone()
+        return _access_grant_from_row(current)
+
+    def get_access_grant(self, grant_id) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM access_grants WHERE grant_id = ?", (grant_id,)
+            ).fetchone()
+        return _access_grant_from_row(row) if row else None
+
+    def find_directory_grant(self, path) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM access_grants
+                WHERE resource_kind = 'directory' AND path_key = ?
+                """,
+                (path_key(path),),
+            ).fetchone()
+        return _access_grant_from_row(row) if row else None
+
+    def list_access_grants(self, status=None) -> List[Dict]:
+        with self._connection() as connection:
+            if status:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM access_grants WHERE status = ?
+                    ORDER BY updated_at DESC, path_key
+                    """,
+                    (status,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM access_grants
+                    ORDER BY status, updated_at DESC, path_key
+                    """
+                ).fetchall()
+        return [_access_grant_from_row(row) for row in rows]
+
+    def count_access_grants(self, status="active") -> int:
+        with self._connection() as connection:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM access_grants WHERE status = ?",
+                    (status,),
+                ).fetchone()[0]
+            )
+
+    def set_access_grant_status(self, grant_id, status) -> bool:
+        """Move a grant between active and revoked.
+
+        Revocation also retires every live lease in the same transaction: the plan
+        says a revoked resource invalidates immediately, and a lease that outlives
+        its grant by one TTL window is exactly the hole that promise closes.
+        """
+        if status not in ("active", "revoked"):
+            raise ValueError("未知的授权状态：{}".format(status))
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT grant_id FROM access_grants WHERE grant_id = ?",
+                (grant_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                """
+                UPDATE access_grants
+                SET status = ?, revoked_at = ?, updated_at = ?
+                WHERE grant_id = ?
+                """,
+                (
+                    status,
+                    now if status == "revoked" else "",
+                    now,
+                    grant_id,
+                ),
+            )
+            if status == "revoked":
+                connection.execute(
+                    """
+                    UPDATE grant_leases
+                    SET status = 'revoked', released_at = ?
+                    WHERE grant_id = ? AND status = 'active'
+                    """,
+                    (now, grant_id),
+                )
+        return True
+
+    def bind_grant_identity(self, grant_id, identity: Dict) -> bool:
+        """Record the directory identity the first time it becomes readable.
+
+        A grant created while the directory was offline (a drive that was
+        unplugged, a promotion from before v13) has no identity to compare against.
+        Binding it on first sight keeps such a grant usable; a directory that later
+        changes identity still fails the comparison.
+        """
+        if not identity or not identity.get("root"):
+            return False
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE access_grants
+                SET volume_id = ?, file_id = ?, updated_at = ?
+                WHERE grant_id = ? AND volume_id = '' AND file_id = ''
+                """,
+                (
+                    str(identity["device"]),
+                    str(identity["file_id"]),
+                    utc_now(),
+                    grant_id,
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def touch_access_grant(self, grant_id):
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE access_grants SET last_used_at = ? WHERE grant_id = ?",
+                (utc_now(), grant_id),
+            )
+
+    def add_grant_lease(
+        self,
+        grant_id,
+        task_id,
+        capability,
+        expires_at,
+        nonce,
+        resource_ids=(),
+        max_operations=1,
+        confirm_digest="",
+    ) -> Dict:
+        now = utc_now()
+        lease_id = new_id("lease")
         with self._connection() as connection:
             connection.execute(
                 """
-                INSERT INTO workspace_grants(id, path, enabled, created_at)
-                VALUES (1, ?, 1, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    path = excluded.path,
-                    enabled = 1,
-                    created_at = excluded.created_at
+                INSERT INTO grant_leases(
+                    lease_id, grant_id, task_id, capability, resource_ids,
+                    nonce, confirm_digest, expires_at, max_operations,
+                    operations_used, status, created_at, released_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, '')
                 """,
-                (path, utc_now()),
+                (
+                    lease_id,
+                    grant_id,
+                    str(task_id),
+                    str(capability),
+                    _access_json_list(resource_ids),
+                    str(nonce),
+                    str(confirm_digest or ""),
+                    str(expires_at),
+                    int(max_operations),
+                    now,
+                ),
             )
+            row = connection.execute(
+                "SELECT * FROM grant_leases WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+        return _grant_lease_from_row(row)
 
-    def get_workspace(self) -> Optional[str]:
+    def get_grant_lease(self, lease_id) -> Optional[Dict]:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT path FROM workspace_grants WHERE id = 1 AND enabled = 1"
+                "SELECT * FROM grant_leases WHERE lease_id = ?", (lease_id,)
             ).fetchone()
-        return row["path"] if row else None
+        return _grant_lease_from_row(row) if row else None
 
-    def clear_workspace(self):
+    def list_grant_leases(self, status=None, task_id=None, grant_id=None) -> List[Dict]:
+        clauses = []
+        values = []
+        if status:
+            clauses.append("status = ?")
+            values.append(status)
+        if task_id:
+            clauses.append("task_id = ?")
+            values.append(str(task_id))
+        if grant_id:
+            clauses.append("grant_id = ?")
+            values.append(str(grant_id))
+        query = "SELECT * FROM grant_leases"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC"
+        with self._connection() as connection:
+            rows = connection.execute(query, tuple(values)).fetchall()
+        return [_grant_lease_from_row(row) for row in rows]
+
+    def consume_grant_lease(self, lease_id, now=None) -> bool:
+        """Take one operation from a lease, atomically.
+
+        Expiry and the operation budget are checked inside the UPDATE, so two
+        concurrent callers cannot both read "one left" and both spend it.
+        """
+        moment = str(now or utc_now())
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE grant_leases
+                SET operations_used = operations_used + 1
+                WHERE lease_id = ? AND status = 'active'
+                  AND expires_at > ? AND operations_used < max_operations
+                """,
+                (lease_id, moment),
+            )
+            spent = cursor.rowcount == 1
+            if spent:
+                row = connection.execute(
+                    "SELECT grant_id FROM grant_leases WHERE lease_id = ?",
+                    (lease_id,),
+                ).fetchone()
+                if row is not None:
+                    connection.execute(
+                        "UPDATE access_grants SET last_used_at = ? WHERE grant_id = ?",
+                        (moment, row["grant_id"]),
+                    )
+        return spent
+
+    def finish_grant_leases(
+        self,
+        status="released",
+        task_id=None,
+        grant_id=None,
+        lease_id=None,
+    ) -> int:
+        if status not in ("released", "revoked"):
+            raise ValueError("未知的租约状态：{}".format(status))
+        clauses = ["status = 'active'"]
+        filters = []
+        if lease_id:
+            filters.append(("lease_id", str(lease_id)))
+        if task_id:
+            filters.append(("task_id", str(task_id)))
+        if grant_id:
+            filters.append(("grant_id", str(grant_id)))
+        if not filters:
+            # Without a filter this would close every lease in the table; the
+            # caller has to say which task, grant or lease it means.
+            raise ValueError("结束租约需要指定 lease_id、task_id 或 grant_id")
+        for column, _ in filters:
+            clauses.append("{} = ?".format(column))
+        values = [status, utc_now()] + [value for _, value in filters]
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE grant_leases
+                SET status = ?, released_at = ?
+                WHERE {}
+                """.format(" AND ".join(clauses)),
+                tuple(values),
+            )
+            return int(cursor.rowcount)
+
+
+    # -- 文档库（M16 切片 1）------------------------------------------------
+
+    def add_document(self, meta: Dict, chunks: List[Dict]) -> int:
+        """写入一条文档与其分块，返回落库的块数。
+
+        词法索引与 ``doc_chunks`` 同事务写入；FTS 语句失败只关掉
+        ``doc_fts_enabled``，行数不一致会在下次启动被自愈重建。
+        """
+        document_id = str(meta["document_id"])
+        indexed = 0
         with self._connection() as connection:
             connection.execute(
-                "UPDATE workspace_grants SET enabled = 0 WHERE id = 1"
+                """
+                INSERT INTO documents(
+                    document_id, persona_id, name, kind, path, bytes,
+                    sha256, converted, chunks, chars, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    str(meta.get("persona_id") or ""),
+                    str(meta.get("name") or ""),
+                    str(meta.get("kind") or ""),
+                    str(meta.get("path") or ""),
+                    int(meta.get("bytes") or 0),
+                    str(meta.get("sha256") or ""),
+                    1 if meta.get("converted") else 0,
+                    len(chunks),
+                    int(meta.get("chars") or 0),
+                    str(meta.get("created_at") or utc_now()),
+                ),
             )
+            pairs = []
+            for ordinal, chunk in enumerate(chunks):
+                chunk_id = str(chunk.get("chunk_id") or new_id("dck"))
+                text = str(chunk["text"])
+                connection.execute(
+                    """
+                    INSERT INTO doc_chunks(
+                        chunk_id, document_id, ordinal, heading, text, chars
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chunk_id,
+                        document_id,
+                        ordinal,
+                        str(chunk.get("heading") or ""),
+                        text,
+                        len(text),
+                    ),
+                )
+                pairs.append((chunk_id, fts_segment(text)))
+            if pairs and self.doc_fts_enabled:
+                try:
+                    connection.executemany(
+                        "INSERT INTO doc_fts(chunk_id, seg) VALUES (?, ?)",
+                        pairs,
+                    )
+                    indexed = len(pairs)
+                except sqlite3.Error:
+                    self.doc_fts_enabled = False
+        return indexed
+
+    def list_documents(self, persona_id=None) -> List[Dict]:
+        with self._connection() as connection:
+            if persona_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM documents ORDER BY created_at DESC, name
+                    """
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM documents
+                    WHERE persona_id = ? OR persona_id = ''
+                    ORDER BY created_at DESC, name
+                    """,
+                    (str(persona_id),),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_document(self, document_id: str) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM documents WHERE document_id = ?",
+                (str(document_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def document_total_bytes(self) -> int:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(bytes), 0) AS value FROM documents"
+            ).fetchone()
+        return int(row["value"])
+
+    def delete_document(self, document_id: str) -> int:
+        """删除文档及其分块与索引行，返回删除的块数。"""
+        text_id = str(document_id)
+        with self._connection() as connection:
+            ids = [
+                row["chunk_id"]
+                for row in connection.execute(
+                    "SELECT chunk_id FROM doc_chunks WHERE document_id = ?",
+                    (text_id,),
+                ).fetchall()
+            ]
+            if ids and self.doc_fts_enabled:
+                try:
+                    connection.executemany(
+                        "DELETE FROM doc_fts WHERE chunk_id = ?",
+                        [(value,) for value in ids],
+                    )
+                except sqlite3.Error:
+                    self.doc_fts_enabled = False
+            connection.execute(
+                "DELETE FROM doc_chunks WHERE document_id = ?", (text_id,)
+            )
+            cursor = connection.execute(
+                "DELETE FROM documents WHERE document_id = ?", (text_id,)
+            )
+        if int(cursor.rowcount) <= 0:
+            return 0
+        return len(ids)
+
+    def get_doc_chunks_by_ids(self, chunk_ids) -> Dict[str, Dict]:
+        values = [str(item) for item in chunk_ids if str(item)]
+        if not values:
+            return {}
+        marks = ",".join("?" for _ in values)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.chunk_id AS chunk_id, c.document_id AS document_id,
+                    c.ordinal AS ordinal, c.heading AS heading,
+                    c.text AS text, c.chars AS chars,
+                    d.name AS name, d.kind AS kind, d.path AS path
+                FROM doc_chunks c
+                JOIN documents d ON d.document_id = c.document_id
+                WHERE c.chunk_id IN ({})
+                """.format(marks),
+                values,
+            ).fetchall()
+        return {row["chunk_id"]: dict(row) for row in rows}
+
+    def search_documents_fts(
+        self,
+        query: str,
+        limit: int = 30,
+        persona_id: Optional[str] = None,
+    ) -> Optional[List[Dict]]:
+        """FTS5/BM25 文档块候选。
+
+        ``None`` 表示词法索引不可用或查询异常（调用方应退化为"没有文档
+        可注入"，绝不阻塞回合）；``[]`` 表示索引可用但没有候选。分数只
+        用于候选排序，最终裁剪由文档服务的字符预算完成。
+        """
+        if not self.doc_fts_enabled:
+            return None
+        match = fts_match_query(query)
+        if not match:
+            return []
+        with self._connection() as connection:
+            try:
+                if persona_id is None:
+                    rows = connection.execute(
+                        """
+                        SELECT doc_fts.chunk_id AS chunk_id,
+                            bm25(doc_fts) AS score
+                        FROM doc_fts
+                        WHERE doc_fts MATCH ?
+                        ORDER BY score
+                        LIMIT ?
+                        """,
+                        (match, max(1, min(int(limit), 100))),
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        """
+                        SELECT doc_fts.chunk_id AS chunk_id,
+                            bm25(doc_fts) AS score
+                        FROM doc_fts
+                        JOIN doc_chunks c
+                            ON c.chunk_id = doc_fts.chunk_id
+                        JOIN documents d
+                            ON d.document_id = c.document_id
+                        WHERE doc_fts MATCH ?
+                            AND (d.persona_id = ? OR d.persona_id = '')
+                        ORDER BY score
+                        LIMIT ?
+                        """,
+                        (
+                            match,
+                            str(persona_id),
+                            max(1, min(int(limit), 100)),
+                        ),
+                    ).fetchall()
+            except sqlite3.Error:
+                self.doc_fts_enabled = False
+                return None
+        return [
+            {"chunk_id": row["chunk_id"], "bm25": float(row["score"])}
+            for row in rows
+        ]
+
+    def upsert_mcp_server(self, record: Dict) -> None:
+        """Insert or replace one server row; ``created_at`` survives an edit.
+
+        Credentials never come through here — env values and headers live in
+        config/mcp_keys.json, so a database backup holds addresses only.
+        """
+        server_id = str(record.get("server_id") or "").strip().lower()
+        if not server_id:
+            raise ValueError("MCP 服务器缺少标识。")
+        now = utc_now()
+        created = str(record.get("created_at") or now)
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT created_at FROM mcp_servers WHERE server_id = ?",
+                (server_id,),
+            ).fetchone()
+            if existing is not None:
+                created = str(existing["created_at"] or created)
+            connection.execute(
+                """
+                INSERT INTO mcp_servers(
+                    server_id, label, transport, command, args, cwd, url,
+                    timeout, enabled, tools, discovered, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(server_id) DO UPDATE SET
+                    label = excluded.label,
+                    transport = excluded.transport,
+                    command = excluded.command,
+                    args = excluded.args,
+                    cwd = excluded.cwd,
+                    url = excluded.url,
+                    timeout = excluded.timeout,
+                    enabled = excluded.enabled,
+                    tools = excluded.tools,
+                    discovered = excluded.discovered,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    server_id,
+                    str(record.get("label") or ""),
+                    str(record.get("transport") or "stdio"),
+                    _mcp_command_text(record.get("command")),
+                    _mcp_json(record.get("args")),
+                    str(record.get("cwd") or ""),
+                    str(record.get("url") or ""),
+                    float(record.get("timeout") or 15.0),
+                    1 if record.get("enabled") else 0,
+                    _mcp_json(record.get("tools")),
+                    _mcp_json(record.get("discovered")),
+                    created,
+                    now,
+                ),
+            )
+
+    def list_mcp_servers(self) -> List[Dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM mcp_servers ORDER BY created_at, server_id"
+            ).fetchall()
+        return [_mcp_server_from_row(row) for row in rows]
+
+    def get_mcp_server(self, server_id: str) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM mcp_servers WHERE server_id = ?",
+                (str(server_id or "").strip().lower(),),
+            ).fetchone()
+        return _mcp_server_from_row(row) if row else None
+
+    def set_mcp_server_enabled(self, server_id: str, enabled: bool) -> bool:
+        """Turn a server into the model's tool list, or take it out.
+
+        Switching off keeps the per-tool selections: the user turns the server
+        back on with the tools they had chosen, not with nothing.
+        """
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE mcp_servers SET enabled = ?, updated_at = ?"
+                " WHERE server_id = ?",
+                (
+                    1 if enabled else 0,
+                    utc_now(),
+                    str(server_id or "").strip().lower(),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def set_mcp_server_tools(self, server_id: str, tools) -> bool:
+        """Store the per-tool switches (A9) as one JSON column on the row."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE mcp_servers SET tools = ?, updated_at = ?"
+                " WHERE server_id = ?",
+                (
+                    _mcp_json(tools),
+                    utc_now(),
+                    str(server_id or "").strip().lower(),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def set_mcp_server_discovered(self, server_id: str, tools) -> bool:
+        """Cache what tools/list reported so the panel can draw the switches.
+
+        Only name, description and the server's own ``readOnlyHint`` are kept: an
+        inputSchema is the server's untrusted text and can be arbitrarily large.
+        ``read_only`` stays three-valued (True / False / None) because 「远端写入」
+        may only be claimed by a server that actually said so.
+        """
+        slim = []
+        for item in tools or []:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "")
+                if not name:
+                    continue
+                description = " ".join(
+                    str(item.get("description") or "").split()
+                )
+                if len(description) > MAX_MCP_STORED_DESCRIPTION:
+                    description = description[:MAX_MCP_STORED_DESCRIPTION] + "…"
+                hint = item.get("annotations")
+                read_only = None
+                if isinstance(hint, dict) and isinstance(
+                    hint.get("readOnlyHint"), bool
+                ):
+                    read_only = hint["readOnlyHint"]
+                slim.append(
+                    {"name": name, "description": description, "read_only": read_only}
+                )
+            else:
+                slim.append(
+                    {"name": str(item), "description": "", "read_only": None}
+                )
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE mcp_servers SET discovered = ?, updated_at = ?"
+                " WHERE server_id = ?",
+                (
+                    json.dumps(slim, ensure_ascii=False),
+                    utc_now(),
+                    str(server_id or "").strip().lower(),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def delete_mcp_server(self, server_id: str) -> bool:
+        text_id = str(server_id or "").strip().lower()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM mcp_servers WHERE server_id = ?",
+                (text_id,),
+            )
+        return cursor.rowcount == 1
+
+    def rebuild_doc_fts(self) -> bool:
+        with self._connection() as connection:
+            try:
+                connection.executescript(DOC_FTS_SCHEMA)
+                _reindex_doc_fts(connection)
+            except sqlite3.Error:
+                self.doc_fts_enabled = False
+                return False
+        self.doc_fts_enabled = True
+        return True
 
     @staticmethod
     def _proposal_from_row(row):
@@ -3358,6 +4481,9 @@ class CompanionStore:
             status=ProposalStatus(row["status"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            executor=str(row["executor"] or EXECUTOR_NOTE)
+            if "executor" in row.keys()
+            else EXECUTOR_NOTE,
         )
 
     @staticmethod

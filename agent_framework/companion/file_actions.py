@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import difflib
 import hashlib
 import os
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 import stat
 import tempfile
 from typing import Dict, List, Optional, Tuple
@@ -24,55 +24,27 @@ from .models import (
 )
 
 
+from .path_safety import (
+    PathSafetyError,
+    WorkspaceGuard,
+    assert_not_link,
+    resource_identity,
+    resource_identity_valid,
+)
+
+
+FileActionError = PathSafetyError
+
+
 MAX_NOTE_BYTES = 512 * 1024
 ALLOWED_NOTE_SUFFIXES = {".md", ".txt"}
 PROPOSAL_TTL_HOURS = 24
 PREVIEW_DIFF_LINES = 80
 PREVIEW_LINE_CHARS = 180
-BLOCKED_NAMES = {
-    ".git",
-    ".codex",
-    ".agents",
-    ".ssh",
-    ".aws",
-    ".env",
-    "node_modules",
-}
-
-
-class FileActionError(RuntimeError):
-    pass
 
 
 class UncertainExecutionError(FileActionError):
     """The action may have produced a side effect, but the outcome is unknown."""
-
-
-def workspace_identity(root) -> Dict:
-    path = Path(root).resolve()
-    value = os.stat(path, follow_symlinks=False)
-    return {
-        "root": str(path),
-        "device": str(value.st_dev),
-        "file_id": str(value.st_ino),
-    }
-
-
-def workspace_identity_valid(snapshot: Dict) -> bool:
-    if not snapshot or not snapshot.get("root"):
-        return False
-    root = Path(snapshot["root"])
-    if not root.exists() or not root.is_dir():
-        return False
-    try:
-        current = workspace_identity(root)
-    except OSError:
-        return False
-    return (
-        current["root"] == snapshot.get("root")
-        and current["device"] == str(snapshot.get("device"))
-        and current["file_id"] == str(snapshot.get("file_id"))
-    )
 
 
 def proposal_expired(expected_state: Dict, now=None) -> bool:
@@ -126,21 +98,6 @@ def _clip_preview_line(line) -> str:
     return text[: PREVIEW_LINE_CHARS - 1] + "…"
 
 
-def _is_reparse_point(path: Path) -> bool:
-    try:
-        value = path.lstat()
-    except FileNotFoundError:
-        return False
-    return bool(
-        getattr(value, "st_file_attributes", 0) & 0x400
-    )
-
-
-def _assert_not_link(path: Path):
-    if path.is_symlink() or _is_reparse_point(path):
-        raise FileActionError("不允许访问符号链接或目录联接：{}".format(path))
-
-
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -152,7 +109,7 @@ def _sha256(path: Path) -> str:
 def fingerprint(path: Path) -> Optional[Dict]:
     if not path.exists():
         return None
-    _assert_not_link(path)
+    assert_not_link(path)
     value = path.lstat()
     if not stat.S_ISREG(value.st_mode):
         raise FileActionError("目标不是普通文件。")
@@ -168,82 +125,29 @@ def fingerprint(path: Path) -> Optional[Dict]:
     }
 
 
-class WorkspaceGuard:
-    """Restricts file actions to one explicitly granted directory."""
+class NoteGuard(WorkspaceGuard):
+    """Workspace guard narrowed to the note whitelist.
 
-    def __init__(self, root):
-        raw_root = Path(root)
-        if not raw_root.is_absolute():
-            raise FileActionError("工作目录必须是绝对路径。")
-        text = str(raw_root)
-        if text.startswith(("\\\\", "//")):
-            raise FileActionError("不允许授权网络共享目录。")
-        if raw_root == Path(raw_root.anchor):
-            raise FileActionError("不能授权磁盘根目录。")
-        if not raw_root.exists() or not raw_root.is_dir():
-            raise FileActionError("授权目录不存在或不是文件夹。")
-        for part in (raw_root, *raw_root.parents):
-            _assert_not_link(part)
-        self.root = raw_root.resolve()
+    The suffix rule lives in the subclass so a generic file executor cannot pick up
+    the note whitelist by reusing the shared guard, and cannot drop it by forgetting
+    to call a checker.
+    """
 
     def resolve(self, relative_path: str) -> Path:
-        normalized = relative_path.replace("\\", "/")
-        pure = PureWindowsPath(normalized)
-        if pure.is_absolute() or pure.drive:
-            raise FileActionError("文件路径必须相对于授权目录。")
-        parts = normalized.split("/")
-        if not parts or len(parts) > 8:
-            raise FileActionError("文件路径层级过多。")
-        for part in parts:
-            if (
-                part in ("", ".", "..")
-                or part.rstrip(" .") != part
-                or part.casefold() in BLOCKED_NAMES
-                or part.casefold().startswith(".env")
-                or any(char in part for char in ':< >"|?*'.replace(" ", ""))
-                or any(ord(char) < 32 for char in part)
-                or (
-                    hasattr(PureWindowsPath(part), "is_reserved")
-                    and PureWindowsPath(part).is_reserved()
-                )
-            ):
-                raise FileActionError("文件路径包含越界或不允许的名称。")
-        target = self.root.joinpath(*parts)
-        current = self.root
-        for part in parts[:-1]:
-            current = current / part
-            if current.exists():
-                _assert_not_link(current)
-                if not current.is_dir():
-                    raise FileActionError("父路径不是文件夹。")
-        parent = target.parent
-        while parent != self.root:
-            if parent.exists():
-                _assert_not_link(parent)
-            parent = parent.parent
-        try:
-            common = os.path.commonpath(
-                [str(self.root), str(target.resolve(strict=False))]
-            )
-        except ValueError as error:
-            raise FileActionError("文件路径超出授权目录。") from error
-        if os.path.normcase(common) != os.path.normcase(str(self.root)):
-            raise FileActionError("文件路径超出授权目录。")
+        target = super().resolve(relative_path)
         if target.suffix.casefold() not in ALLOWED_NOTE_SUFFIXES:
             raise FileActionError("第一版仅允许写入 .md 或 .txt 笔记。")
-        if target.exists():
-            _assert_not_link(target)
         return target
 
     def ensure_notes_directory(self) -> Path:
         notes = self.root / "notes"
         if notes.exists():
-            _assert_not_link(notes)
+            assert_not_link(notes)
             if not notes.is_dir():
                 raise FileActionError("notes 路径不是文件夹。")
         else:
             notes.mkdir()
-            _assert_not_link(notes)
+            assert_not_link(notes)
         return notes
 
 
@@ -287,7 +191,7 @@ class NoteActionService:
         workspace = self.store.get_workspace()
         if not workspace:
             raise FileActionError("请先选择一个授权工作目录。")
-        guard = WorkspaceGuard(workspace)
+        guard = NoteGuard(workspace)
         relative_path = safe_note_filename(query)
         target = guard.resolve(relative_path)
         expected = fingerprint(target)
@@ -335,7 +239,7 @@ class NoteActionService:
             normalized_arguments=arguments,
             expected_state={
                 "target": expected,
-                "workspace": workspace_identity(guard.root),
+                "workspace": resource_identity(guard.root),
                 "expires_at": expires_at,
             },
             risk=RiskLevel.FS_WRITE,
@@ -370,11 +274,11 @@ class NoteActionService:
         if not root:
             value["error"] = "提案缺少工作区快照。"
             return value
-        if not workspace_identity_valid(snapshot):
+        if not resource_identity_valid(snapshot):
             value["error"] = "工作目录身份已变化，原确认可能失效。"
             return value
         try:
-            guard = WorkspaceGuard(root)
+            guard = NoteGuard(root)
             target = guard.resolve(value["relative_path"])
             before = ""
             if target.exists():
@@ -419,9 +323,9 @@ class NoteActionService:
         workspace_snapshot = proposal.expected_state.get("workspace")
         if not workspace_snapshot:
             raise FileActionError("提案缺少工作区快照，请重新生成。")
-        if not workspace_identity_valid(workspace_snapshot):
+        if not resource_identity_valid(workspace_snapshot):
             raise FileActionError("工作目录身份已变化，已拒绝执行。")
-        guard = WorkspaceGuard(workspace_snapshot["root"])
+        guard = NoteGuard(workspace_snapshot["root"])
         relative_path = proposal.normalized_arguments["relative_path"]
         if not str(relative_path).replace("\\", "/").startswith("notes/"):
             raise FileActionError("第一版只允许把笔记写入 notes 子目录。")
@@ -525,9 +429,9 @@ class NoteActionService:
         workspace_snapshot = receipt.result.get("workspace")
         if not workspace_snapshot:
             raise FileActionError("回执缺少工作区快照，无法安全撤销。")
-        if not workspace_identity_valid(workspace_snapshot):
+        if not resource_identity_valid(workspace_snapshot):
             raise FileActionError("工作目录身份已变化，无法安全撤销。")
-        guard = WorkspaceGuard(workspace_snapshot["root"])
+        guard = NoteGuard(workspace_snapshot["root"])
         target = guard.resolve(receipt.result["relative_path"])
         recorded_target = receipt.result.get("target_path")
         if recorded_target and os.path.normcase(str(target)) != os.path.normcase(

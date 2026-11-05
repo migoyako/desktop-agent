@@ -117,12 +117,20 @@ class OverflowAndReachabilityTests(unittest.TestCase):
     def test_table_cards_scroll(self):
         self.assertIn("overflow-x: auto", rule_block(asset("console.css"), ".table-card"))
 
-    def test_overlay_bubble_stays_above_the_avatar(self):
+    def test_overlay_pet_fills_height_and_bubble_stays_clear(self):
         overlay = asset("overlay.css")
         block = rule_block(overlay, ".bubble")
-        self.assertIn("var(--pet-size)", block)
         self.assertIn("max-height", block)
-        self.assertIn("var(--pet-size)", rule_block(overlay, ".pet"))
+        self.assertIn("top: var(--sp-lg)", block)
+        pet = rule_block(overlay, ".pet")
+        self.assertIn(
+            "height: calc(100% - var(--pet-top) - var(--pet-bottom))",
+            pet,
+        )
+        self.assertIn(
+            "width: calc(100% - var(--pet-right) - var(--pet-right))",
+            pet,
+        )
 
     def test_stage_canvas_fills_the_pet_box(self):
         block = rule_block(asset("overlay.css"), ".pet canvas")
@@ -437,7 +445,9 @@ class KeyedTranscriptTests(unittest.TestCase):
         self.assertIn("function chatSlots()", script)
         self.assertIn("if (!list) {", script)
         self.assertIn("syncMessages(slots.list, data.messages)", script)
-        self.assertIn("syncApprovals(slots.approvals, data.approvals)", script)
+        self.assertIn("syncApprovals(slots.approvals, approvalViews(data))", script)
+        # S04f 的已执行/已拒绝卡片走同一条 reconcile，不另开一套 DOM。
+        self.assertIn("data.remote_cards", script)
         css = asset("app.css")
         slots = rule_block(
             css, "#msgList,\n#approvalList,\n#toolStack,\n#streamSlot"
@@ -565,20 +575,21 @@ class MessageActionTests(unittest.TestCase):
     def test_remember_reuses_the_memory_console_endpoint(self):
         script = asset("app.js")
         body = script[
-            script.index("async function rememberMessage("):script.index("function openSources(")
+            script.index("async function rememberMessage("):script.index("function openInspector(tab) {")
         ]
         self.assertIn('post("/api/console/memory", { action: "remember", message_id: messageId })', body)
         self.assertIn("已保存为长期记忆", body)
 
     def test_source_jumps_to_the_evidence_tab(self):
         script = asset("app.js")
-        body = script[
-            script.index("function openSources("):script.index("async function switchMode(")
+        opener = script[
+            script.index("function openInspector(tab) {"):script.index("async function switchMode(")
         ]
-        self.assertIn('state.tab = "来源"', body)
-        self.assertIn("state.inspectorOpen = true", body)
-        self.assertIn("layout()", body)
-        self.assertIn("renderInspector()", body)
+        self.assertIn('state.tab = tab', opener)
+        self.assertIn("state.inspectorOpen = true", opener)
+        self.assertIn("layout()", opener)
+        self.assertIn("renderInspector()", opener)
+        self.assertIn('action.dataset.msgAct === "source") openInspector("来源")', script)
 
     def test_actions_rebuild_when_the_projection_changes(self):
         script = asset("app.js")
@@ -678,7 +689,7 @@ class OverlayCapabilityTests(unittest.TestCase):
     def test_collapsed_state_is_visual_and_persisted(self):
         css = asset("overlay.css")
         self.assertIn("body.collapsed .overlay", css)
-        self.assertIn("--pet-size: 56px", rule_block(css, "body.collapsed .overlay"))
+        self.assertIn("--ball-size: 56px", rule_block(css, "body.collapsed .overlay"))
         script = asset("overlay.js")
         body = script[
             script.index("function applyCollapsed("):script.index("function apply(")
@@ -742,15 +753,74 @@ class Live2dRuntimeContractTests(unittest.TestCase):
         for selector in ("#pet, #ball, #bubble, #quick, #menu, #close"):
             self.assertIn(selector, script)
 
-    def test_reduce_motion_and_scale_stay_on_the_stage_container(self):
+    def test_gestures_come_from_the_manifest_and_the_hands_stay_out(self):
+        stage = asset("stage.js")
+        for needle in (
+            'const REST_POSE = [["Movement2", 1]];',
+            "const IDLE_GROUP = /idle/i;",
+            "function gesturePool(motions, groups)",
+            "groups.idle_pool",
+            'internal.on("beforeModelUpdate"',
+            "getLoopDuration()",
+            "controller.focus(clamp(x), clamp(y));",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, stage)
+        # The pack's IDLE clip is a six second crying performance; looping it is
+        # what painted tears and sweat over a calm face.
+        self.assertNotIn("startIdle", stage)
+        self.assertNotIn('startMotion("idle"', stage)
+        overlay = asset("overlay.js")
+        for needle in (
+            "window.__companionCursor",
+            "state.stage.setFocus(",
+            "applyMotions(data.motion_events || [])",
+            'api("/api/overlay/motion"',
+            "state.motionSeen.has(event.id)",
+            "motions: pet.motions || [],",
+            "motionGroups: pet.motion_groups || {},",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, overlay)
+        mesh = asset("mesh-stage.js")
+        self.assertIn("setMotion: () => {}", mesh)
+        self.assertIn("setFocus: () => {}", mesh)
+        # One JavaScript round trip per 120ms tick: the tick that finds the cursor
+        # outside the card sends the gaze-only script instead of the hit test.
+        shell = (ASSETS.parent / "shell.py").read_text(encoding="utf-8")
+        self.assertIn("window.__companionCursor(x,y)", shell)
+        self.assertIn("window.__companionHit(x,y)", shell)
+        self.assertIn("def _hit_script(x, y):", shell)
+        self.assertIn("def _cursor_script(x, y):", shell)
+        self.assertIn("self._feed_cursor(local)", shell)
+
+    def test_mask_textures_scale_for_complex_live2d_models(self):
+        stage = asset("stage.js")
+        for needle in (
+            "const MASKS_PER_TEXTURE = 32;",
+            "const SINGLE_TEXTURE_MASK_LIMIT = 36;",
+            "manager.getClippingMaskCount()",
+            "renderer.initialize(core, textures)",
+            "ensureMaskCapacity(model);",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, stage)
+
+    def test_reduce_motion_and_full_height_stay_on_the_stage_container(self):
         stage = asset("stage.js")
         self.assertIn("autoStart: !options.reduceMotion", stage)
         self.assertIn("setReduceMotion", stage)
         overlay = asset("overlay.css")
-        self.assertIn("clamp(120px, calc(132px * var(--scale)), 150px)", overlay)
+        self.assertIn(
+            "height: calc(100% - var(--pet-top) - var(--pet-bottom))",
+            rule_block(overlay, ".pet"),
+        )
         script = asset("overlay.js")
         self.assertIn(".mount(el.pet, options)", script)
         self.assertIn("reduceMotion", script)
+        self.assertIn("ResizeObserver(resizeStage).observe(el.pet)", script)
+        self.assertIn("if (!state.stage || el.pet.hidden) return;", script)
+        self.assertIn("if (!state.collapsed) resizeStage();", script)
 
     def test_settings_explain_why_the_pet_is_disabled(self):
         script = asset("settings.js")
@@ -871,6 +941,164 @@ class BackgroundLayerTests(unittest.TestCase):
         css = asset("settings.css")
         self.assertIn("object-fit: cover", rule_block(css, ".bg-preview"))
         self.assertIn("height: calc(var(--fs-display) * 8)", rule_block(css, ".bg-preview"))
+
+
+class SettingsZoneContractTests(unittest.TestCase):
+    """M15 slice 4: the five remaining zones, and what the page may not fake."""
+
+    ZONES = {
+        "persona": "panelPersona",
+        "rag": "panelRag",
+        "mcp": "panelMcp",
+        "memory": "panelMemory",
+        "advanced": "panelAdvanced",
+    }
+
+    @staticmethod
+    def body(script, header):
+        start = script.index(header)
+        return script[start : script.index("\n  }", start)]
+
+    def test_every_zone_is_a_panel_backed_by_the_settings_view(self):
+        script = asset("settings.js")
+        registry = script[script.index("const PANELS = {") :]
+        registry = registry[: registry.index("\n  };")]
+        for zone, fn in self.ZONES.items():
+            with self.subTest(zone=zone):
+                self.assertIn("{}: {},".format(zone, fn), registry)
+                self.assertIn("function {}() {{".format(fn), script)
+        opener = script[
+            script.index('document.addEventListener("click", async (event) => {') :
+        ]
+        opener = opener[: opener.index("\n    });")]
+        for zone in ("model", "rag", "memory", "advanced"):
+            self.assertIn('"{}"'.format(zone), opener, zone)
+        self.assertIn('if (state.panel === "background" || state.panel === "persona") await refresh();', opener)
+
+    def test_an_unwired_capability_shows_a_disabled_box_with_a_reason(self):
+        script = asset("settings.js")
+        block = self.body(script, "function unwired(label, note) {")
+        self.assertIn('<div class="unwired" aria-disabled="true">', block)
+        self.assertIn('<span class="pill">未接入</span>', block)
+        for control in ("<input", "<select", "<button"):
+            self.assertNotIn(control, block)
+
+    def test_rag_tunes_real_recall_and_marks_the_doc_library_absent(self):
+        script = asset("settings.js")
+        panel = self.body(script, "function panelRag() {")
+        self.assertIn('numberRow("memory_top_k"', panel)
+        self.assertIn('data-setting="memory_score_threshold"', panel)
+        self.assertIn("budgetBlock()", panel)
+        self.assertIn('unwired("上传文档"', panel)
+        self.assertIn('unwired("文档列表"', panel)
+        self.assertNotIn("<table", panel)
+
+    def test_the_mcp_zone_is_a_real_server_list_with_only_masked_secrets(self):
+        # 切片 4 去灰显：面板的每一块都必须是「有后端」的形状，且密钥只以掩码出现（Q2）。
+        script = asset("settings.js")
+        panel = self.body(script, "function panelMcp() {")
+        self.assertIn("mcpServerCard(row)", panel)
+        self.assertIn("data-mcp-add", panel)
+        self.assertIn("data-mcp-reload", panel)
+        self.assertNotIn("unwired(", panel)
+        card = self.body(script, "function mcpServerCard(row) {")
+        self.assertIn("data-mcp-enable=", card)
+        self.assertIn("连接并获取工具", card)
+        self.assertIn("错误文案不会回显令牌原文", card)
+        tools = self.body(script, "function mcpToolList(row) {")
+        self.assertIn("data-mcp-tool=", tools)
+        self.assertIn("未开启的工具不进模型可见清单", tools)
+        sheet = self.body(script, "function mcpSheetMarkup(row) {")
+        self.assertIn("config/mcp_keys.json", sheet)
+        opener = self.body(script, "async function openMcpSheet(existingId) {")
+        self.assertIn("delete record._secrets;", opener)
+        self.assertIn('action: "credentials"', opener)
+        removal = self.body(script, "async function removeMcpServer(serverId) {")
+        self.assertIn("CompanionDialog.confirm(", removal)
+        self.assertIn("danger: true", removal)
+
+    def test_the_remote_call_card_keeps_the_three_board_states_and_no_real_undo(self):
+        # S04f：待确认、已执行回执、被档位拒绝共用一张卡；「撤销」只是解释（K3）。
+        script = asset("app.js")
+        self.assertIn('external: "外部调用"', script)
+        card = self.body(script, "function approvalHtml(view) {")
+        self.assertIn("待确认外部调用", card)
+        self.assertIn("允许这次调用", card)
+        self.assertIn('["服务器", remoteServer(preview)]', card)
+        self.assertIn("argumentLines(preview.arguments)", card)
+        self.assertIn("回执已写入审计日志，导出时不含凭据。", card)
+        self.assertIn("外部调用不提供撤销，点击只会说明原因。", card)
+        self.assertIn('data-undo="${escapeHtml(undoId)}" aria-disabled="true"', card)
+        self.assertIn("view.warning", card)
+        # 已执行/已拒绝走同一条 reconcile，不另开一套 DOM。
+        self.assertIn("function approvalViews(data) {", script)
+        undo = self.body(script, "async function undoReceipt(receiptId) {")
+        self.assertIn('post("/api/receipts/undo", { receipt_id: receiptId })', undo)
+        css = asset("app.css")
+        self.assertIn("border-color: var(--border)", rule_block(css, ".approval.settled"))
+        self.assertIn(
+            "border-color: var(--border-strong)", rule_block(css, ".approval.denied")
+        )
+
+    def test_clearing_memory_is_the_one_destructive_button_and_asks_first(self):
+        script = asset("settings.js")
+        panel = self.body(script, "function panelMemory() {")
+        self.assertIn('switchRow(\n        "memory_enabled"', panel)
+        self.assertIn('class="danger-zone"', panel)
+        self.assertIn('data-purge-memories ${count ? "" : "disabled"}', panel)
+        purge = self.body(script, "async function purgeMemories() {")
+        self.assertIn("CompanionDialog.confirm(", purge)
+        self.assertIn("danger: true", purge)
+        self.assertIn('post("/api/console/memory", { action: "purge_all" })', purge)
+        self.assertIn("await refresh();", purge)
+
+    def test_avatar_import_is_a_file_picker_that_only_touches_the_slot(self):
+        script = asset("settings.js")
+        panel = self.body(script, "function panelPersona() {")
+        self.assertIn('type="file" id="avatarFile" accept=".png,.jpg,.jpeg,.webp"', panel)
+        self.assertIn("data-avatar-import", panel)
+        self.assertIn("你选的原始图片不动", script)
+        importer = self.body(script, "async function importAvatarFile() {")
+        self.assertIn("if (file.size > 8 * 1024 * 1024)", importer)
+        self.assertIn("reader.readAsDataURL(file);", importer)
+        self.assertIn('post("/api/asset/avatar", { filename: file.name, data: dataUrl })', importer)
+        self.assertIn('input.value = "";', importer)
+        self.assertNotIn("background", importer)
+
+    def test_the_advanced_zone_shows_options_diagnoses_and_no_invented_log(self):
+        script = asset("settings.js")
+        panel = self.body(script, "function panelAdvanced() {")
+        self.assertIn("(permissions.tiers || [])", panel)
+        self.assertIn('selectRow("tool_permission"', panel)
+        for field in ("diag.data_dir", "diag.schema_version", "diag.locked_by", "diag.backups"):
+            self.assertIn(field, panel)
+        self.assertIn("python doctor.py", panel)
+        self.assertIn("程序目前没有写日志文件", panel)
+        self.assertNotIn("日志文件", panel.replace("程序目前没有写日志文件", ""))
+
+    def test_the_server_owns_the_labels_for_formats_and_tiers(self):
+        script = asset("settings.js")
+        for helper in ("function outputFormats() {", "function permissionTiers() {"):
+            with self.subTest(helper=helper):
+                body = self.body(script, helper)
+                self.assertIn("|| []", body)
+                self.assertNotIn("保守", body)
+                self.assertNotIn("信任", body)
+
+    def test_the_new_zone_blocks_size_themselves_from_tokens(self):
+        css = asset("settings.css")
+        self.assertIn("border: 1px dashed var(--border-strong)", rule_block(css, ".unwired"))
+        self.assertIn("gap: var(--sp-md)", rule_block(css, ".unwired-head"))
+        self.assertIn("border: 1px solid var(--danger)", rule_block(css, ".danger-zone"))
+        self.assertIn("color: var(--danger)", rule_block(css, ".danger-zone .ghost"))
+        self.assertIn(
+            "min-height: var(--ctl-segment)",
+            rule_block(css, ".field.file::file-selector-button"),
+        )
+        self.assertIn("grid-template-columns: auto 1fr", rule_block(css, ".diag-grid"))
+        self.assertIn("overflow-wrap: anywhere", rule_block(css, ".diag-path"))
+        self.assertIn("overflow-wrap: anywhere", rule_block(css, ".panel .hint"))
+        self.assertIn("font-size: var(--fs-body)", rule_block(css, ".group > summary"))
 
 
 if __name__ == "__main__":

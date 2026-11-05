@@ -217,7 +217,7 @@ class CompanionStoreTest(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-        self.assertEqual(version, 9)
+        self.assertEqual(version, 13)
         self.assertTrue({"title", "pinned_at", "unread"} <= columns)
         self.assertIn("session_drafts", tables)
         store.ensure_session("chat_a", AgentMode.CHAT)

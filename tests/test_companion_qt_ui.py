@@ -876,7 +876,7 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
         self.app.processEvents()
 
         info = dialog.info.toPlainText()
-        self.assertIn("蕾米埃尔·丹", info)
+        self.assertIn("DeepSeek 娘", info)
         self.assertIn("世界书", info)
 
         dialog.address.setText("搭档")
@@ -1288,6 +1288,9 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
     def test_context_pill_renders_the_projection_numbers(self):
         if CompanionWindow is None:
             self.skipTest("PySide6 unavailable")
+        runtime = self.window.runtime
+        runtime.max_context_chars = 4000
+        runtime.settings = {"max_tokens": 1000}
         self.window.runtime.last_context = SimpleNamespace(
             budget_chars=4000, used_chars=1500, compressed=True
         )
@@ -1301,6 +1304,16 @@ class CompanionQtUiSmokeTest(unittest.TestCase):
             "上下文：" + self.window.context_pill.toolTip(),
         )
 
+        # The width is the window in force now, not the one the last prompt was
+        # trimmed against, so saving a bigger 上下文窗口 moves the reading at once.
+        runtime.max_context_chars = 30000
+        self.window.refresh_composer_hint()
+        self.assertEqual(self.window.context_pill.text(), "上下文 5%")
+        self.assertIn("上下文 1500 / 30000 字符", self.window.context_pill.toolTip())
+
+        # 待命 means there is nothing to measure: neither the live window nor the
+        # prompt that was last assembled carries a budget.
+        runtime.max_context_chars = 0
         self.window.runtime.last_context = SimpleNamespace(
             budget_chars=0, used_chars=0, compressed=False
         )

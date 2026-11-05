@@ -50,6 +50,11 @@
         input.setAttribute("aria-label", message || "输入内容");
         dialog.appendChild(input);
       }
+      // A caller-built body (the 模型服务接入 sheet) keeps the scrim, the
+      // Escape/Tab/focus-restore contract and the theme in one place.
+      if (options.content) {
+        dialog.appendChild(options.content);
+      }
 
       const actions = node("div", "dialog-actions");
       const cancel = node("button", "ghost dialog-cancel", options.cancelText || "取消");
@@ -101,6 +106,9 @@
           return;
         }
         if (event.key !== "Enter") return;
+        // A form sheet owns Enter: intercepting it here would turn Enter on a
+        // focused 取消 into an accept, and would save before the list is fetched.
+        if (kind === "form") return;
         // An IME confirmation also fires Enter; treating it as submit would
         // swallow the last composed characters.
         if (event.isComposing || event.keyCode === 229) return;
@@ -116,7 +124,8 @@
       });
       document.addEventListener("keydown", onKey, true);
       document.body.appendChild(scrim);
-      (input || cancel).focus();
+      const first = options.content ? focusables(options.content)[0] : null;
+      (input || first || cancel).focus();
       if (input) input.select();
     });
   }
@@ -127,6 +136,12 @@
     },
     prompt: function (message, defaultValue, options) {
       return show("prompt", message, options, defaultValue);
+    },
+    // Caller-built body (the 模型服务接入 sheet); same scrim, Escape, focus
+    // trap and focus restore as confirm/prompt so dialogs do not fork twice.
+    form: function (message, content, options) {
+      const config = Object.assign({}, options || {}, { content: content });
+      return show("form", message, config, null);
     },
   };
 })();

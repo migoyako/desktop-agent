@@ -21,6 +21,7 @@ from agent_framework.companion.maintenance import (
     lock_info,
     purge_all,
     purge_memory,
+    purge_memories,
     purge_session,
     restore_backup,
     verify_backup,
@@ -361,6 +362,100 @@ class PurgeTest(MaintenanceTestBase):
             [],
         )
         self.assertFalse(overwrite_backup.exists())
+
+
+class PurgeMemoriesTest(MaintenanceTestBase):
+    """「清空记忆」：未受保护的都走掉，受保护的（及其祖先）留下并被数出来。"""
+
+    def test_unprotected_all_gone_and_protected_survive(self):
+        self.store.add_memory("main", "fact", "一条", None, 0.8, 0.6, status="confirmed")
+        self.store.add_memory("main", "fact", "另一条", None, 0.8, 0.6, status="confirmed")
+        kept = self.store.add_memory(
+            "main", "preference", "要保留的偏好", None, 0.9, 0.9,
+            status="confirmed", protected=True,
+        )
+
+        result = purge_memories(self.store)
+
+        self.assertEqual(result["deleted"], 2)
+        self.assertEqual(result["remaining"], 1)
+        self.assertEqual(result["protected"], 1)
+        self.assertEqual(
+            [memory.memory_id for memory in self.store.list_memories("main")], [kept]
+        )
+
+    def test_protected_child_keeps_its_parent(self):
+        parent = self.store.add_memory(
+            "main", "preference", "偏好奶茶", None, 0.9, 0.8, status="confirmed"
+        )
+        child = self.store.add_memory(
+            "main",
+            "summary",
+            "偏好含糖饮料",
+            None,
+            0.7,
+            0.6,
+            status="confirmed",
+            derived_from=[parent],
+            protected=True,
+        )
+        self.store.add_memory("main", "fact", "无关记忆", None, 0.5, 0.5, status="confirmed")
+
+        result = purge_memories(self.store)
+
+        # parent is unprotected but is an ancestor of a protected memory: purging it
+        # through purge_memory would cascade to the protected child, so it must stay.
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(
+            {memory.memory_id for memory in self.store.list_memories("main")},
+            {parent, child},
+        )
+        self.assertEqual(result["remaining"], 2)
+
+    def test_scope_is_limited_to_the_session(self):
+        self.store.ensure_session("other", AgentMode.WORK)
+        self.store.add_memory("main", "fact", "主会话", None, 0.8, 0.6, status="confirmed")
+        self.store.add_memory("other", "fact", "另一会话", None, 0.8, 0.6, status="confirmed")
+
+        result = purge_memories(self.store, session_id="main")
+
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(result["remaining"], 0)
+        self.assertEqual(len(self.store.list_memories("other")), 1)
+
+    def test_recall_logs_lose_the_deleted_ids(self):
+        gone = self.store.add_memory(
+            "main", "fact", "会被清空", None, 0.8, 0.6, status="confirmed"
+        )
+        kept = self.store.add_memory(
+            "main", "fact", "受保护", None, 0.8, 0.6, status="confirmed", protected=True
+        )
+        recall_id = self.store.log_recall("main", "hash-1", [gone, kept], [0.9, 0.4], 2.0)
+
+        purge_memories(self.store)
+
+        rows = {
+            row["recall_id"]: row
+            for row in self.store.list_recall_logs("main", limit=10)
+        }
+        self.assertIn(recall_id, rows)
+        self.assertEqual(json.loads(rows[recall_id]["fact_ids"]), [kept])
+
+    def test_empty_store_is_a_no_op(self):
+        self.assertEqual(
+            purge_memories(self.store), {"deleted": 0, "remaining": 0, "protected": 0}
+        )
+
+    def test_limit_stops_the_walk(self):
+        for index in range(4):
+            self.store.add_memory(
+                "main", "fact", "记忆 {}".format(index), None, 0.8, 0.6, status="confirmed"
+            )
+
+        result = purge_memories(self.store, limit=2)
+
+        self.assertEqual(result["deleted"], 2)
+        self.assertEqual(result["remaining"], 2)
 
 
 class MigrationSnapshotTest(MaintenanceTestBase):

@@ -16,6 +16,7 @@ import urllib.request
 from pathlib import Path
 
 from agent_framework.companion.app import create_application_service
+from agent_framework.companion.documents import source_items
 from agent_framework.companion.models import AgentMode
 from agent_framework.companion.runtime import CompanionRuntime
 from agent_framework.companion.search import SearchService
@@ -61,6 +62,7 @@ class KeyedTranscriptBrowserTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
+        self.root = root
         store = CompanionStore(root / "companion.db")
         runtime = CompanionRuntime(
             store=store,
@@ -355,6 +357,77 @@ class KeyedTranscriptBrowserTests(unittest.TestCase):
             "document.querySelector('#inspectorBody').textContent.includes('测试来源')",
             "来源面板已打开",
         )
+
+    def test_a_document_source_opens_to_its_chunk_and_its_original_file(self):
+        runtime = self.adapter.runtime
+        runtime.documents.ingest(
+            "deploy.md",
+            (
+                "# 部署手册\n## 前置检查\n部署前先确认数据库备份已经完成。\n"
+                "## 回滚步骤\n回滚执行 rollback.sh，并把版本号写回上一个标签。\n"
+            ).encode("utf-8"),
+            persona_id="",
+        )
+        self.seed_turn()
+        hits = runtime.documents.search("回滚 版本号 标签", limit=5, persona_id=None)
+        runtime.last_doc_sources = source_items(hits)
+        runtime.last_tool_sources = [
+            {"title": "测试来源", "url": "https://example.com", "snippet": "网页摘录"}
+        ]
+
+        page = self.open_page()
+        # Clicking the tab before the first bootstrap lands is a click on a
+        # button nobody has wired yet, so wait for the transcript to render.
+        self.wait_for(
+            page,
+            "document.querySelectorAll('#msgList [data-mid]').length === 2",
+            "首轮消息已渲染",
+        )
+        page.click('[data-tab="来源"]')
+        self.wait_for(
+            page,
+            "document.querySelectorAll('.source-card .source-toggle').length === {}".format(
+                len(runtime.last_doc_sources) + 1
+            ),
+            "来源条目已渲染",
+        )
+
+        self.assertEqual(0, page.locator(".source-detail").count())
+        doc = page.locator(".source-toggle", has_text="deploy.md · 第 3 块")
+        self.assertEqual(1, doc.count())
+        self.assertEqual("本机文档", doc.locator(".kind").inner_text())
+
+        doc.click()
+        page.wait_for_selector(".source-detail")
+        self.assertEqual("true", doc.get_attribute("aria-expanded"))
+
+        card = page.locator(".source-item", has_text="deploy.md · 第 3 块")
+        text = card.inner_text()
+        self.assertIn("块号：第 3 块", text)
+        self.assertIn("小节：部署手册 > 回滚步骤", text)
+        self.assertIn("摘录：", text)
+        self.assertIn("rollback.sh", text)
+        path = [
+            line.split("：", 1)[1].strip()
+            for line in text.splitlines()
+            if line.startswith("原文：")
+        ][0]
+        # 定位 has to mean the real file, in this test's own data directory.
+        self.assertTrue((self.root / path).is_file(), path)
+        self.assertIn("rollback.sh", (self.root / path).read_text(encoding="utf-8"))
+
+        web = page.locator(".source-toggle", has_text="测试来源")
+        self.assertEqual("网页", web.locator(".kind").inner_text())
+        web.click()
+        self.assertIn(
+            "地址：https://example.com", web.locator("xpath=../div").inner_text()
+        )
+
+        doc.click()
+        page.wait_for_function(
+            "() => !document.body.textContent.includes('块号：第 3 块')"
+        )
+        self.assertEqual("false", doc.get_attribute("aria-expanded"))
 
     # -- HTTP -----------------------------------------------------------
 

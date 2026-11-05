@@ -31,7 +31,7 @@ PAGES = (
     ("main", "/", (".msg", ((1152, 648), (1024, 576)))),
     ("settings", "/settings", (".nav button", ((680, 560),))),
     ("console", "/console", (".tabs button", ((1040, 720),))),
-    ("overlay", "/overlay", (".pet", ((300, 250),))),
+    ("overlay", "/overlay", (".pet", ((363, 648),))),
 )
 CONTROLS = {
     "main": ".win-actions [data-cmd]",

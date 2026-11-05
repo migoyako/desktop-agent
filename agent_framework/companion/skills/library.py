@@ -23,13 +23,13 @@ EFFECT_RISK = {
     "read": RiskLevel.SAFE,
     "network": RiskLevel.NETWORK,
     "write": RiskLevel.FS_WRITE,
-    "external": RiskLevel.INPUT_CONTROL,
+    "external": RiskLevel.EXTERNAL,
 }
 EFFECT_CEILING = {
     "read": RiskLevel.FS_READ,
     "network": RiskLevel.NETWORK,
     "write": RiskLevel.FS_WRITE,
-    "external": RiskLevel.INPUT_CONTROL,
+    "external": RiskLevel.EXTERNAL,
 }
 RISK_ORDER = (
     RiskLevel.SAFE,
@@ -38,6 +38,7 @@ RISK_ORDER = (
     RiskLevel.FS_WRITE,
     RiskLevel.SHELL,
     RiskLevel.INPUT_CONTROL,
+    RiskLevel.EXTERNAL,
 )
 
 

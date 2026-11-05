@@ -999,7 +999,7 @@ class PersonaDialog(QDialog):
 
         form = QFormLayout()
         self.address = QLineEdit()
-        self.address.setPlaceholderText("例如：搭档、共犯、名字")
+        self.address.setPlaceholderText("例如：搭档、鱼片老板、名字")
         self.relationship = QTextEdit()
         self.relationship.setFixedHeight(70)
         self.relationship.setPlaceholderText("你希望她如何理解你们的关系")

@@ -494,18 +494,31 @@
   }
 
   function bindDrag() {
-    let grab = null;
+    // Same contract as the main window: the OS caption loop owns the move.
+    // A page-level mousemove stops when the cursor leaves the WebView and the
+    // old screenX-clientX grab translated the window by its own origin.
     el.head.addEventListener("mousedown", (event) => {
       if (!state.host || event.button !== 0) return;
       if (event.target.closest("button, input")) return;
-      grab = { x: event.screenX - event.clientX, y: event.screenY - event.clientY };
-    });
-    window.addEventListener("mousemove", (event) => {
-      if (!grab || !state.host) return;
-      state.host.moveWindow(event.screenX - grab.x, event.screenY - grab.y);
-    });
-    window.addEventListener("mouseup", () => {
-      grab = null;
+      event.preventDefault();
+      if (typeof state.host.beginWindowDrag === "function") {
+        state.host.beginWindowDrag();
+        return;
+      }
+      const grab = { x: event.clientX, y: event.clientY };
+      const move = (moveEvent) => {
+        state.host.moveWindow(moveEvent.screenX - grab.x, moveEvent.screenY - grab.y);
+      };
+      const stop = () => {
+        document.body.style.userSelect = "";
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", stop);
+        window.removeEventListener("blur", stop);
+      };
+      document.body.style.userSelect = "none";
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", stop);
+      window.addEventListener("blur", stop);
     });
   }
 

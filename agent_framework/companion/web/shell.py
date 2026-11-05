@@ -29,7 +29,9 @@ MAIN_SIZE = (1152, 648)
 MIN_SIZE = (1024, 576)
 SETTINGS_SIZE = (680, 560)
 CONSOLE_SIZE = (1040, 720)
-OVERLAY_SIZE = (300, 250)
+OVERLAY_WIDTH_RATIO = 0.56
+OVERLAY_MIN_WIDTH = 320
+OVERLAY_MAX_WIDTH = 760
 FULLSCREEN_POLL_MS = 3000
 HIT_POLL_MS = 120
 RESIZE_BORDER = 8
@@ -73,6 +75,23 @@ def fit_aspect(width, height=None):
         width = MIN_SIZE[0]
     width = max(MIN_SIZE[0], width)
     return width, max(MIN_SIZE[1], int(round(width * ASPECT_H / ASPECT_W)))
+
+
+def overlay_size_for(height):
+    """Match the pet window's height to the main app window.
+
+    Live2D models vary in width, so keep enough horizontal room for a tall
+    figure while preserving a compact card when the main window is resized.
+    """
+    try:
+        height = max(1, int(round(float(height))))
+    except (TypeError, ValueError):
+        height = MAIN_SIZE[1]
+    width = max(
+        OVERLAY_MIN_WIDTH,
+        min(OVERLAY_MAX_WIDTH, int(round(height * OVERLAY_WIDTH_RATIO))),
+    )
+    return width, height
 
 
 def normalized_geometry(geometry, screens):
@@ -223,6 +242,30 @@ def _left_button_down():
     user32.GetAsyncKeyState.restype = ctypes.c_short
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     return bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+
+
+def _hit_script(x, y):
+    """The per-tick page query: is this pixel the figure, and here is the cursor.
+
+    Built by concatenation because the body is full of JavaScript braces; a
+    ``format`` call on it raises KeyError inside the timer slot, and an
+    unhandled exception in a Qt slot takes the whole process with it.
+    """
+    return (
+        "(function(x,y){"
+        "var hit=window.__companionHit?window.__companionHit(x,y):false;"
+        "if(window.__companionCursor){try{window.__companionCursor(x,y);}catch(error){}}"
+        "return !!hit;})(" + str(int(x)) + "," + str(int(y)) + ")"
+    )
+
+
+def _cursor_script(x, y):
+    return (
+        "(function(x,y){"
+        "if(window.__companionCursor){"
+        "try{window.__companionCursor(x,y);return true;}catch(error){}}"
+        "return false;})(" + str(int(x)) + "," + str(int(y)) + ")"
+    )
 
 
 def _send_caption_drag(hwnd):
@@ -407,6 +450,8 @@ class BaseWindow(QWidget):
 
 
 class MainWindow(BaseWindow):
+    resized = Signal(int)
+
     def __init__(self, owner, adapter, url):
         super().__init__(
             owner,
@@ -571,6 +616,7 @@ class MainWindow(BaseWindow):
         super().resizeEvent(event)
         if hasattr(self, "_save_timer"):
             self._save_timer.start()
+        self.resized.emit(self.height())
 
     def hide_to_tray(self):
         self.hide()
@@ -587,25 +633,39 @@ class MainWindow(BaseWindow):
 
 class OverlayWindow(BaseWindow):
     def __init__(self, owner, adapter, url):
+        initial_size = overlay_size_for(owner.main.height())
         super().__init__(
             owner,
             adapter,
             url,
-            OVERLAY_SIZE,
+            initial_size,
             "桌面形象",
             transparent=True,
         )
-        self.setFixedSize(*OVERLAY_SIZE)
+        self.setFixedSize(*initial_size)
+        owner.main.resized.connect(self.fit_to_main_height)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(350)
         self._save_timer.timeout.connect(self._save_position)
         self._click_through = None
         self._hit_seq = 0
+        self._last_cursor = None
         self._hit_timer = QTimer(self)
         self._hit_timer.setInterval(HIT_POLL_MS)
         self._hit_timer.timeout.connect(self._poll_hit)
         self._restore_position()
+
+    def fit_to_main_height(self, height):
+        """Keep the pet card exactly as tall as the main application window."""
+        size = overlay_size_for(height)
+        if (self.width(), self.height()) == size:
+            return
+        self.setFixedSize(*size)
+        x, y = clamp_position(self.x(), self.y(), *size, _screens())
+        self.move(x, y)
+        if hasattr(self, "_save_timer"):
+            self._save_timer.start()
 
     # A translucent window swallows every click inside its rectangle, so the
     # empty pixels must be made click-through and only the page's hit region
@@ -629,18 +689,30 @@ class OverlayWindow(BaseWindow):
             return
         local = self.mapFromGlobal(QCursor.pos())
         if not self.rect().contains(local):
+            if self._click_through:
+                self._hit_seq += 1
             self._apply_click_through(True)
+            self._feed_cursor(local)
             return
+        self._last_cursor = local
         self._hit_test(local)
+
+    def _feed_cursor(self, local):
+        # The figure keeps turning toward a cursor outside the card; the page
+        # clamps the focus, so out-of-window pixels only mean the head rests at
+        # its extreme. Unmoved cursor: no JavaScript round trip.
+        if local == self._last_cursor:
+            return
+        self._last_cursor = local
+        self.view.page().runJavaScript(
+            _cursor_script(local.x(), local.y()), lambda _hit: None
+        )
 
     def _hit_test(self, local):
         self._hit_seq += 1
         seq = self._hit_seq
         self.view.page().runJavaScript(
-            "window.__companionHit ? window.__companionHit({}, {}) : false".format(
-                local.x(), local.y()
-            ),
-            lambda hit: self._on_hit(seq, hit),
+            _hit_script(local.x(), local.y()), lambda hit: self._on_hit(seq, hit)
         )
 
     def _on_hit(self, seq, hit):
@@ -661,12 +733,15 @@ class OverlayWindow(BaseWindow):
         screens = _screens()
         position = self.adapter.ui_state.overlay_position()
         if position:
-            x, y = clamp_position(position[0], position[1], *OVERLAY_SIZE, screens)
+            x, y = clamp_position(
+                position[0], position[1], self.width(), self.height(), screens
+            )
         else:
             x, y = clamp_position(
-                screens[0][0] + screens[0][2] - OVERLAY_SIZE[0] - 32,
-                screens[0][1] + screens[0][3] - OVERLAY_SIZE[1] - 48,
-                *OVERLAY_SIZE,
+                screens[0][0] + screens[0][2] - self.width() - 32,
+                screens[0][1] + screens[0][3] - self.height() - 48,
+                self.width(),
+                self.height(),
                 screens,
             )
         self.move(x, y)
@@ -889,7 +964,9 @@ class Shell(QObject):
         window.activateWindow()
 
     def move_overlay(self, x, y):
-        x, y = clamp_position(x, y, *OVERLAY_SIZE, _screens())
+        x, y = clamp_position(
+            x, y, self.overlay.width(), self.overlay.height(), _screens()
+        )
         self.overlay.move(x, y)
 
     def snap_overlay(self):

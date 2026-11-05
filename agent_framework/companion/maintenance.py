@@ -13,6 +13,7 @@ import tempfile
 from datetime import datetime
 import zipfile
 
+from .documents import DOC_DIR
 from .models import utc_now
 
 
@@ -50,6 +51,12 @@ EXPORT_TABLES = (
     "work_tasks",
     "work_receipts",
     "skill_audit",
+    "app_settings",
+    "documents",
+    "doc_chunks",
+    "mcp_servers",
+    "access_grants",
+    "grant_leases",
 )
 
 EXPECTED_INDEXES = (
@@ -70,6 +77,13 @@ EXPECTED_INDEXES = (
     "idx_work_tasks_session",
     "idx_work_receipts_session",
     "idx_skill_audit_session",
+    "idx_documents_persona",
+    "idx_doc_chunks_document",
+    "idx_mcp_servers_enabled",
+    "idx_access_grants_path",
+    "idx_access_grants_status",
+    "idx_grant_leases_task",
+    "idx_grant_leases_active",
 )
 
 # Child rows before parents so foreign keys stay valid during a session purge.
@@ -99,6 +113,11 @@ PURGE_SESSION_STEPS = (
 )
 
 PURGE_ALL_TABLES = (
+    "doc_chunks",
+    "documents",
+    "mcp_servers",
+    "grant_leases",
+    "access_grants",
     "memory_relations",
     "memory_evidence",
     "memory_candidates",
@@ -238,6 +257,9 @@ def integrity_report(database_path, expected_version=None):
         "fts_present": False,
         "fts_rows": None,
         "memory_rows": None,
+        "doc_fts_present": False,
+        "doc_fts_rows": None,
+        "doc_chunk_rows": None,
         "missing_indexes": [],
         "counts": {},
         "size_bytes": path.stat().st_size if path.exists() else 0,
@@ -283,12 +305,18 @@ def integrity_report(database_path, expected_version=None):
                 "work_receipts",
                 "recall_log",
                 "skill_audit",
+                "documents",
+                "doc_chunks",
+                "mcp_servers",
             )
             if name in names
         }
         report["fts_present"] = "memory_fts" in names
         report["fts_rows"] = _count(connection, "memory_fts")
         report["memory_rows"] = _count(connection, "memories")
+        report["doc_fts_present"] = "doc_fts" in names
+        report["doc_fts_rows"] = _count(connection, "doc_fts")
+        report["doc_chunk_rows"] = _count(connection, "doc_chunks")
     finally:
         connection.close()
 
@@ -307,6 +335,10 @@ def integrity_report(database_path, expected_version=None):
         and (
             not report["fts_present"]
             or report["fts_rows"] == report["memory_rows"]
+        )
+        and (
+            not report["doc_fts_present"]
+            or report["doc_fts_rows"] == report["doc_chunk_rows"]
         )
     )
     return report
@@ -815,6 +847,57 @@ def purge_memory(store, memory_id):
     }
 
 
+def purge_memories(store, session_id=None, limit=5000):
+    """Delete memories one leaf at a time, honouring the 保护 flag.
+
+    Picking only unprotected leaves keeps this on the audited single-memory
+    cascade in ``purge_memory`` and, crucially, never lets a parent purge reach a
+    protected child through its tree. Whatever is protected — or is an ancestor
+    of something protected — is reported back as ``remaining``.
+    """
+    rounds = 0
+    deleted = 0
+    scope = (session_id,) if session_id else ()
+    leaf_where = " AND m.session_id = ?" if session_id else ""
+    count_where = " WHERE session_id = ?" if session_id else ""
+    while rounds < max(1, int(limit)):
+        rounds += 1
+        with store._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT m.memory_id FROM memories m
+                WHERE m.protected = 0
+                  AND NOT EXISTS (
+                    SELECT 1 FROM memory_relations r WHERE r.parent_memory_id = m.memory_id
+                  ){}
+                ORDER BY m.memory_id LIMIT 1
+                """.format(leaf_where),
+                scope,
+            ).fetchone()
+        if row is None:
+            break
+        result = purge_memory(store, str(row[0]))
+        if not int(result.get("deleted") or 0):
+            # Would otherwise spin: report what is left instead of looping.
+            break
+        deleted += int(result.get("deleted") or 0)
+    with store._connection() as connection:
+        remaining = connection.execute(
+            "SELECT COUNT(*) FROM memories{}".format(count_where), scope
+        ).fetchone()[0]
+        protected = connection.execute(
+            "SELECT COUNT(*) FROM memories WHERE protected = 1{}".format(
+                " AND session_id = ?" if session_id else ""
+            ),
+            scope,
+        ).fetchone()[0]
+    return {
+        "deleted": deleted,
+        "remaining": int(remaining or 0),
+        "protected": int(protected or 0),
+    }
+
+
 def _purge_tool_results(data_dir, session_id=None):
     directory = Path(data_dir) / TOOL_RESULT_DIR
     if not directory.is_dir():
@@ -838,6 +921,39 @@ def _purge_tool_results(data_dir, session_id=None):
             deleted += 1
         except OSError:
             skipped += 1
+    return {"deleted": deleted, "skipped": skipped}
+
+
+def _purge_docs_dir(data_dir):
+    """Drop every stored document file; the ``docs`` folder itself stays put."""
+    directory = Path(data_dir) / DOC_DIR
+    if not directory.is_dir():
+        return {"deleted": 0, "skipped": 0}
+    deleted = 0
+    skipped = 0
+    for path in sorted(directory.iterdir()):
+        if path.is_dir() and not path.is_symlink():
+            for child in sorted(path.iterdir()):
+                if child.is_symlink() or not child.is_file():
+                    skipped += 1
+                    continue
+                try:
+                    child.unlink()
+                    deleted += 1
+                except OSError:
+                    skipped += 1
+            try:
+                path.rmdir()
+            except OSError:
+                skipped += 1
+        elif path.is_symlink():
+            skipped += 1
+        elif path.is_file():
+            try:
+                path.unlink()
+                deleted += 1
+            except OSError:
+                skipped += 1
     return {"deleted": deleted, "skipped": skipped}
 
 
@@ -904,6 +1020,12 @@ def purge_all(
         except sqlite3.Error:
             fts_count = 0
         counts["memory_fts"] = fts_count or 0
+        doc_fts_count = _count(connection, "doc_fts")
+        try:
+            connection.execute("DELETE FROM doc_fts")
+        except sqlite3.Error:
+            doc_fts_count = 0
+        counts["doc_fts"] = doc_fts_count or 0
         for table in PURGE_ALL_TABLES:
             cursor = connection.execute(
                 "DELETE FROM {}".format(table)
@@ -916,6 +1038,7 @@ def purge_all(
         except sqlite3.Error:
             pass
     tool_results = _purge_tool_results(data_dir)
+    docs = _purge_docs_dir(data_dir)
     removed_files = 0
     if include_backups:
         backups = data_dir / BACKUP_DIR
@@ -946,7 +1069,8 @@ def purge_all(
     return {
         "counts": counts,
         "tool_results": tool_results,
-        "removed_files": removed_files,
+        "docs": docs,
+        "removed_files": removed_files + int(docs["deleted"]),
     }
 
 

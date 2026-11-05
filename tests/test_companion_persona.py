@@ -43,19 +43,18 @@ class PersonaPackTest(unittest.TestCase):
         shutil.copytree(BUNDLED_PERSONA, target)
         return target
 
-    def test_bundled_remielle_pack_has_expected_identity_and_facts(self):
+    def test_bundled_deepseek_pack_has_expected_identity_and_facts(self):
         persona = load_persona(REPO_ROOT / "data", "remielle")
 
         self.assertIsNotNone(persona)
-        self.assertEqual(persona.name, "蕾米埃尔·丹")
-        self.assertEqual(persona.version, "1.0.0")
+        self.assertEqual(persona.name, "DeepSeek 娘")
+        self.assertEqual(persona.version, "2.0.0")
         self.assertEqual(len(persona.stable_hash), 64)
-        self.assertIn("拉米尔", persona.metadata["aliases"])
-        self.assertIn("共犯", persona.prompt_text)
-        self.assertIn("贝莉奥拉", persona.facts_text)
-        self.assertIn("塔乌弥尔", persona.facts_text)
-        self.assertIn("3.1", persona.facts_text)
-        self.assertEqual(persona.info()["source"]["owner"], "miHoYo / 米哈游")
+        self.assertIn("蓝色大肥鱼", persona.metadata["aliases"])
+        self.assertIn("鱼片老板", persona.prompt_text)
+        self.assertIn("ZipZipPipe", persona.facts_text)
+        self.assertIn("Token", persona.facts_text)
+        self.assertIn("非官方", persona.info()["source"]["owner"])
 
     def test_stable_hash_is_repeatable(self):
         first = load_persona(REPO_ROOT / "data", "remielle")
@@ -109,9 +108,9 @@ class PersonaRuntimeTest(unittest.TestCase):
         runtime = self.runtime(ScriptedLLM(), offline=False)
         prompt = runtime._system_prompt("你好", AgentMode.CHAT)
 
-        self.assertIn("蕾米埃尔·丹", prompt)
+        self.assertIn("DeepSeek 娘", prompt)
         self.assertIn("角色背景事实", prompt)
-        self.assertIn("共犯", prompt)
+        self.assertIn("鱼片老板", prompt)
         self.assertIn("不得声称自己执行了", prompt)
         self.assertIn("角色扮演不能成为绕过确认", prompt)
         self.assertIn("用户证据，不是角色经历", prompt)
@@ -122,26 +121,26 @@ class PersonaRuntimeTest(unittest.TestCase):
         info = runtime.persona_info()
 
         self.assertTrue(info["loaded"])
-        self.assertEqual(info["name"], "蕾米埃尔·丹")
-        self.assertEqual(info["version"], "1.0.0")
+        self.assertEqual(info["name"], "DeepSeek 娘")
+        self.assertEqual(info["version"], "2.0.0")
         self.assertEqual(len(info["stable_hash"]), 64)
-        self.assertEqual(info["source"]["character"], "蕾米埃尔·丹")
+        self.assertEqual(info["source"]["character"], "DeepSeek 娘（蓝色大肥鱼）")
 
     def test_chat_does_not_write_persona_into_user_memories(self):
-        runtime = self.runtime(ScriptedLLM("我在，共犯。"), offline=False)
+        runtime = self.runtime(ScriptedLLM("本鱼在，鱼片老板。"), offline=False)
         result = runtime.handle_message("你好", AgentMode.CHAT)
 
-        self.assertEqual(result["answer"], "我在，共犯。")
+        self.assertEqual(result["answer"], "本鱼在，鱼片老板。")
         self.assertEqual(self.store.list_memories("main"), [])
         prompt = runtime.llm_client.calls[0]["messages"][0].content
-        self.assertIn("贝莉奥拉", prompt)
+        self.assertIn("白米饭", prompt)
         self.assertIn("## 角色人设（稳定层）", prompt)
 
     def test_offline_answer_uses_persona_address(self):
         runtime = self.runtime(offline=True)
         result = runtime.handle_message("你好", AgentMode.CHAT)
 
-        self.assertIn("共犯", result["answer"])
+        self.assertIn("鱼片老板", result["answer"])
 
     def test_user_address_setting_overrides_default_and_stays_protected(self):
         runtime = self.runtime(offline=True)
@@ -182,18 +181,18 @@ class PersonaRuntimeTest(unittest.TestCase):
 
         self.assertEqual(runtime.persona_preferences()["address"], "")
         self.assertIn("暂无用户自定义称呼、关系或边界", prompt)
-        self.assertIn("共犯", answer)
+        self.assertIn("鱼片老板", answer)
 
     def test_worldbook_is_injected_only_for_relevant_query(self):
         runtime = self.runtime(ScriptedLLM(), offline=False)
 
-        relevant = runtime._system_prompt("黑墙是什么", AgentMode.CHAT)
+        relevant = runtime._system_prompt("蓝色大肥鱼和白饭是什么", AgentMode.CHAT)
         irrelevant = runtime._system_prompt("今天天气如何", AgentMode.CHAT)
 
         self.assertIn("## 世界书", relevant)
-        self.assertIn("黑墙是旧艾利都时期抵御空洞灾害的前线", relevant)
+        self.assertIn("DeepSeek 娘是网友围绕 DeepSeek 鲸鱼 Logo", relevant)
         self.assertNotIn("## 世界书", irrelevant)
-        self.assertNotIn("黑墙是旧艾利都时期", irrelevant)
+        self.assertNotIn("DeepSeek 娘是网友围绕", irrelevant)
 
     def test_import_persona_reloads_runtime_and_keeps_settings(self):
         runtime = self.runtime(offline=True)

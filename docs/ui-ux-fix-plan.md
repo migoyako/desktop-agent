@@ -2,7 +2,7 @@
 
 - 日期：2026-10-31
 - 范围：默认 Web 界面（`--ui web`）与承载它的 QtWebEngine 壳层；Qt/Tk 兼容入口不在本次范围
-- 状态：**S1–S4 已实施（2026-10-31），S4 收口复查 2026-11-01**。S1 交付主窗原生拖动、浮窗偏移修正与会话菜单点外关闭；S2 交付页内确认/输入对话框，替换全部 9 处 `window.confirm/prompt`（QtWebEngine 不实现原生对话框）；S3 把 composer 与搜索框的焦点反馈收回到圆角容器；S4 让壳层内容填满窗口、补原生四边/四角缩放、主窗锁定 16:9（默认 1152×648、最小 1024×576）并把旧几何迁移到新基线。收口复查补了页面 8px 边沿带的两处误伤（带内 `button/input/textarea/a` 必须照常可点；只 `preventDefault`，不 `stopPropagation`，否则会吞掉关闭菜单的那一下按压）并顺带修掉 `doctor.py` 在 GBK 控制台中被第三方报错字符中断的缺陷。
+- 状态：**S1–S4 已实施（2026-10-31），S4 收口复查 2026-11-01**。S1 交付主窗原生拖动、浮窗偏移修正与会话菜单点外关闭；**2026-11-01 复报补修：设置/管理台窗（`settings.js`/`console.js`）漏出 S1，`#winHead` 拖动仍是旧窗口原点偏移，现与主窗同模式委派 `beginWindowDrag()`，静态契约用例遍历全部页面脚本防再漏**；S2 交付页内确认/输入对话框，替换全部 9 处 `window.confirm/prompt`（QtWebEngine 不实现原生对话框）；S3 把 composer 与搜索框的焦点反馈收回到圆角容器；S4 让壳层内容填满窗口、补原生四边/四角缩放、主窗锁定 16:9（默认 1152×648、最小 1024×576）并把旧几何迁移到新基线。收口复查补了页面 8px 边沿带的两处误伤（带内 `button/input/textarea/a` 必须照常可点；只 `preventDefault`，不 `stopPropagation`，否则会吞掉关闭菜单的那一下按压）并顺带修掉 `doctor.py` 在 GBK 控制台中被第三方报错字符中断的缺陷。
 
 ## 0. 摘要
 
@@ -28,7 +28,7 @@
 
 ### U1 拖动窗口时窗口跳动
 
-**命中代码**：`web/assets/app.js:1562-1578`（主窗）、`web/assets/overlay.js:412-432`（浮窗，同样问题）。
+**命中代码**：`web/assets/app.js:1562-1578`（主窗）、`web/assets/overlay.js:412-432`（浮窗，同样问题）；S1 收口后复查发现 `web/assets/settings.js` 与 `web/assets/console.js` 的 `bindDrag()` 也各自复制了同一公式（行号随后续切片漂移），因此设置窗与管理台窗起手同样跳——2026-11-01 一并修复。
 
 ```js
 grab = { x: event.screenX - event.clientX, y: event.screenY - event.clientY };
@@ -118,6 +118,7 @@ layout = QVBoxLayout(container)   # 布局挂在 container 上，窗口本身没
    grab = { x: event.clientX, y: event.clientY };
    state.host.moveOverlay(event.screenX - grab.x, event.screenY - grab.y);
    ```
+   设置/管理台窗：与主窗同为 `BaseWindow`，`#winHead` 拖动走同一套委派（有 `beginWindowDrag` 槽即交给系统标题栏循环，旧壳层降级同样用 `clientX/clientY` 抓取）——此项在 S1 首次交付时漏网，2026-11-01 补齐并纳入静态契约遍历。
 3. **删除**主窗旧的 `mousemove/mouseup` 拖动实现，避免两条路径同时移动窗口。
 4. 次要项：顶栏双击可映射到 `toggleMaximize()`（可选，不属于本次必需）。
 
@@ -192,7 +193,7 @@ layout = QVBoxLayout(container)   # 布局挂在 container 上，窗口本身没
 
 | 切片 | 内容 | 主要文件 | 测试 |
 | --- | --- | --- | --- |
-| S1（P0，约 0.5 天） | 主窗原生拖动 + 浮窗偏移修正；右键菜单点外关闭 | `web/assets/app.js`、`web/assets/overlay.js`、`web/shell.py` | **已完成（2026-10-31）**：静态契约（抓取偏移使用 `clientX/clientY`、菜单关闭含 `menu.contains`、壳层含 `WM_NCLBUTTONDOWN`）+ 真实 Chromium（主窗委派且不触发 `moveWindow`、菜单 `mousedown` 存活并置顶、点外/Esc 关闭、浮窗首帧位移、旧壳层兜底）；全量 649 → 658 |
+| S1（P0，约 0.5 天） | 主窗原生拖动 + 浮窗偏移修正；右键菜单点外关闭 | `web/assets/app.js`、`web/assets/overlay.js`、`web/shell.py` | **已完成（2026-10-31）**：静态契约（抓取偏移使用 `clientX/clientY`、菜单关闭含 `menu.contains`、壳层含 `WM_NCLBUTTONDOWN`）+ 真实 Chromium（主窗委派且不触发 `moveWindow`、菜单 `mousedown` 存活并置顶、点外/Esc 关闭、浮窗首帧位移、旧壳层兜底）；全量 649 → 658。**2026-11-01 复报补修**：`settings.js`/`console.js` 的 `bindDrag()` 漏出本轮、仍是旧公式导致设置窗起手跳动，已同模式委派 `beginWindowDrag()`（降级用 `clientX/clientY`）；静态契约遍历全部页面脚本 + 真实 Chromium `/settings`、`/console` 委派与降级各 1 用例 |
 | S2（P0，约 1 天） | `dialog.js` 页内对话框；替换 9 处 `confirm/prompt`；三个页面引入 | `web/assets/dialog.js`（新）、`app.js`、`console.js`、`index/settings/console.html`、`tokens.css` | **已完成（2026-10-31）**：`CompanionDialog.confirm/prompt`（`role=dialog`、`aria-modal`、默认焦点取消/输入框、Esc/遮罩取消、Enter 确认、IME 组字保护、Tab 焦点环、关闭还原焦点），共享样式进 `tokens.css`，三个页面在页面脚本前加载；真实 Chromium 覆盖删除确认/取消、Esc、遮罩、重命名 IME 与输入预填，静态断言全部 JS 零 `window.confirm/prompt`；全量 658 → 666 |
 | S3（P1，约 0.5 天） | composer / 搜索框焦点反馈归容器；更新焦点测试 | `web/assets/app.css`、`tests/test_companion_web_style.py` | **已完成（2026-10-31）**：`.composer textarea` 与 `.rail-search input` 的 `:focus-visible` 只清自身 outline，`.composer:focus-within`（accent 边框 + `0 0 0 2px accent-soft` 环）与 `.rail-search:focus-within` 成为唯一可见环；风格测试从“全局禁止 outline:none”改为**定向白名单**并断言容器环，新增真实 Chromium 3 条（点击输入框/搜索框无内框且容器有环、Tab 到发送按钮仍有全局环）；全量 666 → 670 |
 | S4（P1，约 1–1.5 天） | 壳层布局填充、原生边缘缩放、`WM_SIZING` 16:9、几何迁移、设置/管理台固定尺寸 | `web/shell.py`、`web/layout_audit.py`、`tests/*`、`README.md`、`docs/*` | **已完成（2026-10-31）**：`BaseWindow` 的 `QVBoxLayout` 直接挂在顶层窗口、WebView `Expanding/Expanding` 且随窗口 resize，`QSizeGrip` 删除；设置/管理台显式 `setFixedSize`；主窗 `nativeEvent` 处理 `WM_NCHITTEST`（8 逻辑像素 × DPR、8 方向、最大化/全屏除外）与 `WM_SIZING`（宽高按 16:9 重写、按拖动边/角锚定、DPI 换算、最大/全屏除外），非 Windows 由页面边沿委派 `QWindow.startSystemResize`；`fit_aspect`/`normalized_geometry` 纯函数把旧 `[406,184,1000,700]` 迁移为 `1024×576`；`layout_audit` 主界面矩阵改为 1152×648 / 1024×576 + 真实 Chromium 零溢出，新增 Qt 离屏 13 个用例；2026-11-01 收口复查另修页面边沿带两处误伤（带内控件照常可点、不 `stopPropagation`）+1 用例；全量 670 → 684 |

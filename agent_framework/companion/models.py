@@ -57,6 +57,7 @@ class RiskLevel(str, Enum):
     SHELL = "shell"
     NETWORK = "network"
     INPUT_CONTROL = "input-control"
+    EXTERNAL = "external"
 
 
 class ProposalStatus(str, Enum):
@@ -68,6 +69,14 @@ class ProposalStatus(str, Enum):
     NOT_EXECUTED = "not_executed"
     CANCELLED = "cancelled"
     UNKNOWN = "unknown"
+
+
+# Which code runs a confirmed proposal. "note" is the original filesystem path:
+# workspace snapshot, backup, undo. "mcp" only sends tools/call, so its receipt is
+# never undoable and it must not touch the workspace guard at all.
+EXECUTOR_NOTE = "note"
+EXECUTOR_MCP = "mcp"
+PROPOSAL_EXECUTORS = (EXECUTOR_NOTE, EXECUTOR_MCP)
 
 
 @dataclass
@@ -89,6 +98,7 @@ class ActionProposal:
     status: ProposalStatus = ProposalStatus.AWAITING_CONFIRMATION
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
+    executor: str = EXECUTOR_NOTE
 
 
 @dataclass

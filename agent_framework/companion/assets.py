@@ -1,18 +1,21 @@
 """Read-only view of the user's character assets under ``data/assets/<persona_id>/``.
 
-Nothing here writes to the asset directory: the files themselves are the only
-control surface, so "no file" and "bad file" both mean "no asset" rather than
-falling back to a built-in figure (D58).
+Nothing here writes to the asset directory except one deliberate exception,
+``import_avatar``: an explicit user upload copied into that persona's own
+``avatar.*`` slot. Everything else stays file-presence driven, so "no file" and
+"bad file" both mean "no asset" rather than falling back to a built-in figure
+(D58).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Mapping, Optional, Tuple
 
 from .persona import PERSONA_ID
 
@@ -25,6 +28,8 @@ MAX_LIVE2D_FILE_BYTES = 32 * 1024 * 1024
 MAX_LIVE2D_TOTAL_BYTES = 96 * 1024 * 1024
 LIVE2D_ENTRY = Path("live2d") / "model3.json"
 LIVE2D_ROOT = Path("live2d")
+LIVE2D_MODEL_SUFFIX = ".model3.json"
+MAX_LIVE2D_MODELS = 64
 MESH_ENTRY = Path("avatar.mavatar")
 MAX_MESH_BYTES = 128 * 1024 * 1024
 MAX_MESH_TOTAL_BYTES = 512 * 1024 * 1024
@@ -71,6 +76,9 @@ class Live2dEntry:
     valid: bool
     reason: str = ""
     expressions: Tuple[str, ...] = ()
+    motions: Tuple[str, ...] = ()
+    motion_groups: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
+    model_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -101,17 +109,21 @@ def asset_root(data_dir, persona_id) -> Optional[Path]:
     return root
 
 
+def _head_signature(head, kind: str) -> bool:
+    if kind == "png":
+        return head.startswith(b"\x89PNG\r\n\x1a\n")
+    if kind == "jpg":
+        return head.startswith(b"\xff\xd8\xff")
+    return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+
+
 def _signature_ok(path: Path, kind: str) -> bool:
     try:
         with path.open("rb") as handle:
             head = handle.read(16)
     except OSError:
         return False
-    if kind == "png":
-        return head.startswith(b"\x89PNG\r\n\x1a\n")
-    if kind == "jpg":
-        return head.startswith(b"\xff\xd8\xff")
-    return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+    return _head_signature(head, kind)
 
 
 def _image(root: Path, names, limit: int) -> Optional[ImageAsset]:
@@ -145,6 +157,65 @@ def _background(root: Path) -> Optional[ImageAsset]:
     return _image(root, BACKGROUND_NAMES, MAX_BACKGROUND_BYTES)
 
 
+class AssetImportError(ValueError):
+    """The uploaded file cannot become this persona's avatar."""
+
+
+def import_avatar(data_dir, persona_id, filename, payload) -> Dict:
+    """Store an uploaded picture as ``avatar.<kind>`` in the persona's own slot.
+
+    The only write this module performs: the source file is never touched, and
+    nothing outside the three ``avatar.*`` names in this slot is removed.
+    """
+    text_id = str(persona_id or "")
+    if not PERSONA_ID.fullmatch(text_id):
+        raise AssetImportError("人设 ID 不合法，找不到素材槽位。")
+    root = Path(data_dir) / "assets" / text_id
+    if root.parent.is_symlink() or root.is_symlink():
+        raise AssetImportError("素材目录不能是符号链接。")
+    kind = IMAGE_SUFFIXES.get(Path(str(filename or "")).suffix.lower())
+    if kind is None:
+        raise AssetImportError("头像只支持 .png、.jpg 与 .webp。")
+    data = bytes(payload or b"")
+    if not data:
+        raise AssetImportError("没有读到文件内容。")
+    if len(data) > MAX_AVATAR_BYTES:
+        raise AssetImportError(
+            "头像超过 {:.0f} MiB，请压缩后再导入。".format(MAX_AVATAR_BYTES / 1048576)
+        )
+    if not _head_signature(data[:16], kind):
+        raise AssetImportError("文件内容与扩展名不符，看起来不是有效图片。")
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / "avatar.{}".format(kind)
+    # A half-written avatar still resolves as an image slot, so the swap is atomic.
+    temp = root / "avatar.{}.tmp".format(kind)
+    try:
+        temp.write_bytes(data)
+        os.replace(temp, target)
+    except OSError as error:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise AssetImportError("写入头像失败：{}".format(error))
+    removed = []
+    for name in AVATAR_NAMES:
+        if name == target.name:
+            continue
+        stale = root / name
+        if stale.is_symlink() or not stale.is_file():
+            continue
+        try:
+            stale.unlink()
+            removed.append(name)
+        except OSError:
+            removed.append(name)
+    asset = _avatar(root)
+    if asset is None:
+        raise AssetImportError("头像已写入但读不出来，请检查文件是否完整。")
+    return {"asset": asset, "removed": removed, "persona_id": text_id}
+
+
 def _reference(parent: Path, value, suffixes) -> Optional[Path]:
     """A model3.json reference confined to ``parent``; None if missing/unsafe."""
     if not isinstance(value, str) or not value.strip() or "\x00" in value:
@@ -157,7 +228,10 @@ def _reference(parent: Path, value, suffixes) -> Optional[Path]:
         target.relative_to(parent.resolve())
     except (OSError, ValueError):
         return None
-    if target.suffix.lower() not in suffixes:
+    # Name-tail match, not Path.suffix: Cubism clip files end in
+    # ".motion3.json" and only the last dot would be considered.
+    lowered = target.name.lower()
+    if not any(lowered.endswith(item) for item in suffixes):
         return None
     return target
 
@@ -176,78 +250,189 @@ def _expression_names(references: dict) -> Tuple[str, ...]:
     return tuple(names)
 
 
-def _live2d(root: Path) -> Optional[Live2dEntry]:
-    path = root / LIVE2D_ENTRY
-    if path.is_symlink() or not path.is_file():
-        return None
+def _motion_groups(parent: Path, references: dict) -> Tuple[str, ...]:
+    """Group names that actually hold at least one clip file inside ``parent``.
+
+    ``idle`` is included: the stage needs to tell content gestures apart from
+    the standby group, and a manifest that only declares ``idle`` must still
+    count as having motions.
+    """
+    items = references.get("Motions")
+    names = []
+    if not isinstance(items, dict):
+        return ()
+    for name, clips in items.items():
+        if not isinstance(name, str) or not name.strip() or name.strip() in names:
+            continue
+        if not isinstance(clips, list):
+            continue
+        usable = any(
+            isinstance(clip, dict)
+            and _reference(parent, clip.get("File"), {".motion3.json"}) is not None
+            for clip in clips
+        )
+        if usable:
+            names.append(name.strip())
+    return tuple(names)
+
+
+def _motion_group_map(payload: dict, known: Tuple[str, ...]) -> Dict[str, Tuple[str, ...]]:
+    """Cubism ``Groups`` entries with Target=="Motion", keyed by group name.
+
+    Only names that resolve to real motion groups survive, so a stale label in
+    the manifest cannot point the stage at a clip that no longer exists.
+    """
+    items = payload.get("Groups")
+    result: Dict[str, Tuple[str, ...]] = {}
+    if not isinstance(items, list):
+        return result
+    lookup = {name.lower(): name for name in known}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("Target") or "").lower() != "motion":
+            continue
+        label = item.get("Name")
+        if not isinstance(label, str) or not label.strip():
+            continue
+        ids = item.get("Ids")
+        if not isinstance(ids, list):
+            continue
+        names = []
+        for value in ids:
+            resolved = lookup.get(str(value or "").strip().lower())
+            if resolved and resolved not in names:
+                names.append(resolved)
+        if names:
+            result[label.strip()] = tuple(names)
+    return result
+
+
+def _live2d_candidates(root: Path) -> Tuple[Tuple[Path, str], ...]:
+    """Model manifests below ``live2d/`` in a stable, path-safe order.
+
+    The legacy root entry stays exclusive when present. Otherwise Cubism packs
+    commonly arrive inside their own directory, with names such as
+    ``DeepSeek/character.model3.json``.
+    """
+    live_root = root / LIVE2D_ROOT
+    if live_root.is_symlink() or not live_root.is_dir():
+        return ()
+    exact = live_root / "model3.json"
+    if not exact.is_symlink() and exact.is_file():
+        return ((exact, "model3.json"),)
+
+    found = []
+    for current, dirs, files in os.walk(live_root, followlinks=False):
+        directory = Path(current)
+        dirs[:] = sorted(
+            name
+            for name in dirs
+            if not (directory / name).is_symlink()
+        )
+        for name in sorted(files):
+            lowered = name.lower()
+            if lowered != "model3.json" and not lowered.endswith(LIVE2D_MODEL_SUFFIX):
+                continue
+            path = directory / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                relative = path.relative_to(live_root).as_posix()
+                path.resolve().relative_to(live_root.resolve())
+            except (OSError, ValueError):
+                continue
+            found.append((path, relative))
+
+    found.sort(key=lambda item: (len(item[1].split("/")), item[1].casefold()))
+    return tuple(found[:MAX_LIVE2D_MODELS])
+
+
+def _live2d_entry(
+    path: Path, relative: str
+) -> Live2dEntry:
+    def invalid(reason: str, size: int = 0) -> Live2dEntry:
+        return Live2dEntry(
+            path,
+            path.parent,
+            size,
+            False,
+            reason,
+            model_path=relative,
+        )
+
     try:
         size = path.stat().st_size
     except OSError:
-        return Live2dEntry(path, path.parent, 0, False, "model3.json 不可读。")
+        return invalid("model3.json 不可读。")
     if size <= 0 or size > MAX_LIVE2D_BYTES:
-        return Live2dEntry(
-            path, path.parent, size, False, "model3.json 为空或超过 1 MB 上限。"
-        )
+        return invalid("model3.json 为空或超过 1 MB 上限。", size)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return Live2dEntry(path, path.parent, size, False, "model3.json 不是合法 JSON。")
+        return invalid("model3.json 不是合法 JSON。", size)
     if not isinstance(payload, dict):
-        return Live2dEntry(
-            path, path.parent, size, False, "model3.json 顶层必须是对象。"
-        )
+        return invalid("model3.json 顶层必须是对象。", size)
     references = payload.get("FileReferences")
     if not isinstance(references, dict):
-        return Live2dEntry(
-            path, path.parent, size, False, "model3.json 缺少 FileReferences。"
-        )
+        return invalid("model3.json 缺少 FileReferences。", size)
     moc = references.get("Moc")
     moc_path = _reference(path.parent, moc, {".moc3"})
     if moc_path is None:
-        return Live2dEntry(
-            path, path.parent, size, False, "FileReferences.Moc 缺失、越界或不是 .moc3 文件。"
+        return invalid(
+            "FileReferences.Moc 缺失、越界或不是 .moc3 文件。", size
         )
     try:
         with moc_path.open("rb") as handle:
             magic = handle.read(4)
         if magic != b"MOC3":
-            return Live2dEntry(path, path.parent, size, False, ".moc3 文件头无效。")
+            return invalid(".moc3 文件头无效。", size)
         total = size + moc_path.stat().st_size
     except OSError:
-        return Live2dEntry(path, path.parent, size, False, "模型文件不可读。")
+        return invalid("模型文件不可读。", size)
     if moc_path.stat().st_size > MAX_LIVE2D_FILE_BYTES:
-        return Live2dEntry(
-            path, path.parent, size, False, "单个模型文件超过 32 MB 上限。"
-        )
+        return invalid("单个模型文件超过 32 MB 上限。", size)
     textures = references.get("Textures")
     if not isinstance(textures, list) or not textures:
-        return Live2dEntry(
-            path, path.parent, size, False, "model3.json 缺少 FileReferences.Textures。"
-        )
+        return invalid("model3.json 缺少 FileReferences.Textures。", size)
     for item in textures:
         texture = _reference(path.parent, item, IMAGE_SUFFIXES)
         if texture is None:
-            return Live2dEntry(
-                path, path.parent, size, False, "贴图引用缺失、越界或类型不受支持。"
-            )
+            return invalid("贴图引用缺失、越界或类型不受支持。", size)
         if not _signature_ok(texture, IMAGE_SUFFIXES[texture.suffix.lower()]):
-            return Live2dEntry(path, path.parent, size, False, "贴图格式无效。")
+            return invalid("贴图格式无效。", size)
         try:
             file_size = texture.stat().st_size
         except OSError:
-            return Live2dEntry(path, path.parent, size, False, "贴图不可读。")
+            return invalid("贴图不可读。", size)
         if file_size > MAX_LIVE2D_FILE_BYTES:
-            return Live2dEntry(
-                path, path.parent, size, False, "单个贴图超过 32 MB 上限。"
-            )
+            return invalid("单个贴图超过 32 MB 上限。", size)
         total += file_size
     if total > MAX_LIVE2D_TOTAL_BYTES:
-        return Live2dEntry(
-            path, path.parent, size, False, "模型素材总大小超过 96 MB 上限。"
-        )
+        return invalid("模型素材总大小超过 96 MB 上限。", size)
+    motions = _motion_groups(path.parent, references)
     return Live2dEntry(
-        path, path.parent, size, True, "", _expression_names(references)
+        path,
+        path.parent,
+        size,
+        True,
+        "",
+        _expression_names(references),
+        motions,
+        _motion_group_map(payload, motions),
+        relative,
     )
+
+
+def _live2d(root: Path) -> Optional[Live2dEntry]:
+    first_invalid = None
+    for path, relative in _live2d_candidates(root):
+        entry = _live2d_entry(path, relative)
+        if entry.valid:
+            return entry
+        if first_invalid is None:
+            first_invalid = entry
+    return first_invalid
 
 
 def _mesh_name_ok(name: str) -> bool:
@@ -505,6 +690,11 @@ def public_view(assets: CharacterAssets) -> dict:
                 "valid": live2d.valid,
                 "reason": live2d.reason,
                 "expressions": list(live2d.expressions),
+                "motions": list(live2d.motions),
+                "motion_groups": {
+                    key: list(value) for key, value in live2d.motion_groups.items()
+                },
+                "model_path": live2d.model_path,
                 "stamp": stamp,
             }
         ),
@@ -535,10 +725,10 @@ def character_assets_check(
         avatar.kind, avatar.size
     )
     if live2d is None:
-        live2d_detail = "missing: 缺少 live2d/model3.json"
+        live2d_detail = "missing: 缺少 live2d/model3.json（也支持 live2d/*.model3.json）"
     elif live2d.valid:
-        live2d_detail = "ok({}B, {} expressions)".format(
-            live2d.size, len(live2d.expressions)
+        live2d_detail = "ok({}, {}B, {} expressions, {} motions)".format(
+            live2d.model_path, live2d.size, len(live2d.expressions), len(live2d.motions)
         )
     else:
         live2d_detail = "invalid: {}".format(live2d.reason)

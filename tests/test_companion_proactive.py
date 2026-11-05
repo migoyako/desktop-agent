@@ -501,7 +501,7 @@ class ProactiveMigrationTest(ProactiveBase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-        self.assertEqual(SCHEMA_VERSION, 9)
+        self.assertEqual(SCHEMA_VERSION, 13)
         self.assertEqual(version, SCHEMA_VERSION)
         self.assertIn("reminders", tables)
         self.assertIn("proactive_state", tables)

@@ -7,11 +7,13 @@ venv/
 
 # Local secrets
 config/keys.json
+config/mcp_keys.json
 
 # Local companion data (persona packs are project assets and stay tracked)
 data/*
 !data/personas/
 !data/personas/**
+data/personas/_backups/
 
 # Character art is user-supplied and licensed elsewhere: track the slot
 # documentation only, never the files dropped into it.

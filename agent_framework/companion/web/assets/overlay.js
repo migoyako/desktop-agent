@@ -18,6 +18,8 @@
     // Ids already shown once: a refresh that lands before the read callback
     // must not re-queue the same message.
     seen: new Set(),
+    // Gesture ids already dispatched to the stage, for the same reason.
+    motionSeen: new Set(),
     current: null,
     kind: "",
     timer: 0,
@@ -28,6 +30,7 @@
     stageToken: 0,
     stageSource: "",
     stageScale: 0,
+    resizeFrame: 0,
     stageFailed: false,
     petAvailable: false,
     desired: { mood: "", reduceMotion: false },
@@ -82,6 +85,7 @@
         body: JSON.stringify({ overlay_collapsed: state.collapsed }),
       }).catch(() => {});
     }
+    if (!state.collapsed) resizeStage();
   }
 
   function apply(data) {
@@ -98,6 +102,7 @@
     applyCollapsed(Boolean(data.collapsed), false);
     el.status.textContent = (data.status && data.status.label) || "待机";
     applyProactive(data.proactive || { enabled: false, unread: [] });
+    applyMotions(data.motion_events || []);
     renderBubble();
     renderMenuState();
   }
@@ -199,6 +204,24 @@
     hideBubble();
   }
 
+  // -- content-driven gestures -----------------------------------------
+
+  function applyMotions(events) {
+    if (!state.stage) return;
+    for (const event of events || []) {
+      if (!event || !event.id || !event.name) continue;
+      if (state.motionSeen.has(event.id)) continue;
+      state.motionSeen.add(event.id);
+      state.stage.setMotion(event.name);
+      // Dispatching counts as delivered: a gesture replayed after a page
+      // reload would be a surprise motion with no message behind it.
+      api("/api/overlay/motion", {
+        method: "POST",
+        body: JSON.stringify({ event_id: event.id }),
+      }).catch(() => {});
+    }
+  }
+
   // -- pet stage (Live2D or .mavatar) ----------------------------------
 
   function reportRuntime(ok, reason) {
@@ -222,6 +245,16 @@
     state.stagePending = false;
     state.stageSource = "";
     state.stageScale = 0;
+  }
+
+  function resizeStage() {
+    cancelAnimationFrame(state.resizeFrame);
+    state.resizeFrame = requestAnimationFrame(() => {
+      state.resizeFrame = 0;
+      if (!state.stage || el.pet.hidden) return;
+      if (!el.pet.clientWidth || !el.pet.clientHeight) return;
+      state.stage.resize();
+    });
   }
 
   function stageModule(renderer) {
@@ -290,6 +323,8 @@
     const options = {
       mood: state.desired.mood,
       expressions: pet.expressions || [],
+      motions: pet.motions || [],
+      motionGroups: pet.motion_groups || {},
       reduceMotion: state.desired.reduceMotion,
       onError: (message) => {
         if (generation !== state.stageToken) return;
@@ -404,6 +439,23 @@
     const target = document.elementFromPoint(x, y);
     if (!target) return false;
     return Boolean(target.closest("#pet, #ball, #bubble, #quick, #menu, #close"));
+  };
+
+  // Same window-local CSS pixels, fed on the same poll: the eyes and head turn
+  // toward the cursor. Collapsed or motion-reduced states have nothing to
+  // animate, so the round trip stays free.
+  window.__companionCursor = function (x, y) {
+    if (!state.stage || state.collapsed) return false;
+    if (state.last && state.last.reduce_motion) return false;
+    const box = el.pet.getBoundingClientRect();
+    if (!box.width || !box.height) return false;
+    const halfWidth = Math.max(40, box.width / 2);
+    const halfHeight = Math.max(40, box.height / 2);
+    state.stage.setFocus(
+      (x - (box.left + box.width / 2)) / halfWidth,
+      (y - (box.top + box.height / 2)) / halfHeight
+    );
+    return true;
   };
 
   // -- wiring ---------------------------------------------------------
@@ -537,6 +589,10 @@
   bind();
   connectHost();
   connectEvents();
+  window.addEventListener("resize", resizeStage);
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(resizeStage).observe(el.pet);
+  }
   window.addEventListener("beforeunload", () => {
     if (state.stage) state.stage.destroy();
     state.stage = null;

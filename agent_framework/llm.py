@@ -136,12 +136,27 @@ class RemoteLLMClient(LLMClient):
             timeout=60,
         )
 
+    def _apply_sampling(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Only narrow the request when the user actually moved a slider.
+
+        Upstreams differ on whether they accept top_p at all, so the default
+        1.0 keeps the payload byte-identical to the pre-settings request.
+        """
+        max_tokens = int(getattr(self.config, "max_tokens", 0) or 0)
+        if max_tokens > 0:
+            request["max_tokens"] = max_tokens
+        top_p = float(getattr(self.config, "top_p", 1.0) or 1.0)
+        if 0 < top_p < 1:
+            request["top_p"] = round(top_p, 4)
+        return request
+
     def chat(self, messages, tools=None) -> LLMResponse:
         request: Dict[str, Any] = {
             "model": self.config.model,
             "messages": [message.to_api_dict() for message in messages],
             "temperature": self.config.temperature,
         }
+        self._apply_sampling(request)
         if tools:
             request["tools"] = tools
             request["tool_choice"] = "auto"
@@ -173,6 +188,7 @@ class RemoteLLMClient(LLMClient):
             "temperature": self.config.temperature,
             "stream": True,
         }
+        self._apply_sampling(request)
         if tools:
             request["tools"] = tools
             request["tool_choice"] = "auto"

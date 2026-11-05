@@ -948,6 +948,21 @@ body.compact .who .state {
   font-size: var(--fs-meta);
 }
 
+/* S04f 的另两态已经处理完，边框回到中性；被档位拒绝的那张用强调边框。 */
+.approval.settled {
+  border-color: var(--border);
+}
+
+.approval.denied {
+  border-color: var(--border-strong);
+}
+
+/* 「撤销」看着是禁用态，但点下去要给一句原因，所以留着可点击语义。 */
+.approval .ghost[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: default;
+}
+
 /* ---------- composer ---------- */
 
 .composer-wrap {
@@ -1437,6 +1452,41 @@ body.reduce-motion *::after {
 
 .section-card .line + .line {
   margin-top: var(--sp-xs);
+}
+
+/* 来源条目：一条一行，点开才展开出处。列宽不写死，长路径靠断词而不是横向滚动。 */
+.source-card .source-item + .source-item {
+  margin-top: var(--sp-sm);
+}
+
+.source-card .source-toggle {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--sp-sm);
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.source-card .source-toggle .kind {
+  flex: none;
+  color: var(--muted);
+  font-size: var(--fs-caption);
+}
+
+.source-card .source-detail {
+  margin-top: var(--sp-xs);
+  padding-left: var(--sp-md);
+  border-left: 1px solid var(--border);
+}
+
+.source-card .source-detail .line {
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .task-card .task-head {

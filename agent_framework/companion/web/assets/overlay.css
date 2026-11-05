@@ -18,11 +18,11 @@ body {
   position: relative;
   width: 100vw;
   height: 100vh;
-  /* The stage container follows --scale but is capped so the bubble keeps
-     room inside the fixed 300x250 window. Model internals never scale. */
-  --pet-size: clamp(120px, calc(132px * var(--scale)), 150px);
+  /* The native shell keeps this card as tall as the main application window. */
+  --pet-top: 4px;
   --pet-right: 14px;
-  --pet-bottom: 26px;
+  --pet-bottom: 24px;
+  --ball-size: 56px;
   --tail: 10px;
 }
 
@@ -32,8 +32,8 @@ body {
   bottom: var(--pet-bottom);
   display: flex;
   align-items: flex-end;
-  width: var(--pet-size);
-  height: var(--pet-size);
+  width: calc(100% - var(--pet-right) - var(--pet-right));
+  height: calc(100% - var(--pet-top) - var(--pet-bottom));
   cursor: grab;
   filter: var(--pet-shadow);
 }
@@ -55,8 +55,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: var(--pet-size);
-  height: var(--pet-size);
+  width: var(--ball-size);
+  height: var(--ball-size);
   padding: 0;
   border: 1px solid var(--accent);
   border-radius: 50%;
@@ -80,18 +80,21 @@ body {
 }
 
 body.collapsed .overlay {
-  --pet-size: 56px;
+  --ball-size: 56px;
   --pet-bottom: 18px;
 }
 
 .quick {
   position: absolute;
-  right: calc(var(--pet-right) + var(--pet-size) + var(--sp-sm));
-  bottom: var(--pet-bottom);
+  z-index: 4;
+  left: var(--pet-right);
+  top: 50%;
+  bottom: auto;
   display: flex;
   flex-direction: column;
   gap: var(--sp-xs);
   opacity: 0;
+  transform: translateY(-50%);
   /* Invisible buttons must not swallow clicks meant for the pet. */
   pointer-events: none;
   transition: opacity 0.15s ease;
@@ -162,10 +165,13 @@ body.collapsed .overlay {
 
 .bubble {
   position: absolute;
-  right: var(--pet-right);
-  bottom: calc(var(--pet-bottom) + var(--pet-size) + var(--sp-xs));
+  left: var(--pet-right);
+  top: var(--sp-lg);
+  right: auto;
+  bottom: auto;
+  z-index: 5;
   max-width: min(240px, calc(100% - var(--sp-lg)));
-  max-height: calc(100% - var(--pet-bottom) - var(--pet-size) - var(--sp-lg));
+  max-height: 38%;
   display: none;
   flex-direction: column;
   gap: var(--sp-xs);
@@ -185,8 +191,8 @@ body.collapsed .overlay {
 .bubble::after {
   content: "";
   position: absolute;
-  right: calc(var(--pet-size) * 0.3);
-  bottom: calc(var(--tail) / -1.7);
+  right: calc(var(--tail) / -1.7);
+  bottom: var(--sp-lg);
   width: var(--tail);
   height: var(--tail);
   border-right: 1px solid var(--accent);
@@ -212,9 +218,9 @@ body.collapsed .overlay {
 
 .status {
   position: absolute;
+  left: var(--pet-right);
   right: var(--pet-right);
   bottom: var(--sp-xs);
-  width: var(--pet-size);
   text-align: center;
   color: var(--muted);
   font-size: var(--fs-caption);
@@ -266,8 +272,8 @@ body.browser {
 }
 
 body.browser .overlay {
-  width: 300px;
-  height: 250px;
+  width: min(calc(100vw - 32px), 363px);
+  height: min(calc(100vh - 32px), 648px);
   border: 1px solid var(--border);
   border-radius: 14px;
   background: var(--workspace);

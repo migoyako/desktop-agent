@@ -119,7 +119,7 @@ class ContextLayerTest(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-        self.assertEqual(SCHEMA_VERSION, 9)
+        self.assertEqual(SCHEMA_VERSION, 13)
         self.assertEqual(version, SCHEMA_VERSION)
         self.assertIn("context_checkpoints", tables)
         self.assertIn("reminders", tables)

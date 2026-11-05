@@ -7,8 +7,8 @@ from enum import Enum
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..file_actions import workspace_identity
 from ..models import ActionProposal, AgentMode, new_id, utc_now
+from ..path_safety import resource_identity
 
 
 class ApplicationError(RuntimeError):
@@ -81,7 +81,7 @@ class WorkspaceSnapshot:
     def capture(cls, root) -> Optional["WorkspaceSnapshot"]:
         if not root:
             return None
-        value = workspace_identity(root)
+        value = resource_identity(root)
         return cls(
             root=str(value["root"]),
             device=str(value["device"]),
@@ -211,6 +211,13 @@ class ApplicationEvent:
         return value
 
 
+def _preview_map(value) -> Dict[str, Any]:
+    """A dict the approval card can render as-is; anything else is no shape."""
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): item for key, item in value.items()}
+
+
 @dataclass(frozen=True)
 class ApprovalPreview:
     """Read-only description of the change a confirmation would make."""
@@ -224,6 +231,11 @@ class ApprovalPreview:
     truncated: bool = False
     omitted_lines: int = 0
     error: str = ""
+    # Remote calls have no diff. These two carry the endpoint the confirmation is
+    # bound to and the arguments that would go out, so the card can show exactly
+    # what is being approved.
+    server: Dict[str, Any] = field(default_factory=dict)
+    arguments: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_value(cls, value) -> "ApprovalPreview":
@@ -242,6 +254,8 @@ class ApprovalPreview:
             truncated=bool(value.get("truncated")),
             omitted_lines=int(value.get("omitted_lines") or 0),
             error=str(value.get("error") or ""),
+            server=_preview_map(value.get("server")),
+            arguments=_preview_map(value.get("arguments")),
         )
 
     def as_dict(self) -> Dict[str, Any]:
@@ -255,6 +269,8 @@ class ApprovalPreview:
             "truncated": self.truncated,
             "omitted_lines": self.omitted_lines,
             "error": self.error,
+            "server": dict(self.server),
+            "arguments": dict(self.arguments),
         }
 
 
@@ -376,18 +392,57 @@ class ProjectionSection:
 
 
 @dataclass(frozen=True)
+class SourceView:
+    """One entry of the 来源 channel: a web hit or a hit in the local library.
+
+    Both kinds travel as numbers and strings, never as runtime objects, so an
+    adapter can render and locate them without parsing display text.
+    """
+
+    source_kind: str
+    title: str
+    url: str = ""
+    snippet: str = ""
+    heading: str = ""
+    path: str = ""
+    document_id: str = ""
+    chunk_id: str = ""
+    ordinal: int = 0
+
+
+@dataclass(frozen=True)
+class ContextSegment:
+    """One band of the context budget bar, in the unit the UI measures in.
+
+    ``tokens`` is the estimate the user reads; ``chars`` is what the prompt
+    assembler actually trimmed against. Both travel so no adapter converts and
+    gets a different rounding than the server.
+    """
+
+    key: str
+    label: str
+    tokens: int
+    chars: int
+
+
+@dataclass(frozen=True)
 class ContextView:
     """Context window usage as numbers; adapters must not parse display text for them."""
 
     context_used: int
     context_limit: int
     compressed: bool = False
+    segments: Tuple[ContextSegment, ...] = ()
 
     @property
     def percent(self) -> Optional[int]:
         if self.context_limit <= 0:
             return None
         return min(100, int(round(100.0 * self.context_used / self.context_limit)))
+
+    @property
+    def used_tokens(self) -> int:
+        return sum(item.tokens for item in self.segments if item.key != "free")
 
 
 @dataclass(frozen=True)
@@ -399,6 +454,7 @@ class UiProjection:
     run: Optional[RunView] = None
     approvals: Tuple[ApprovalView, ...] = ()
     inspector: Tuple[ProjectionSection, ...] = ()
+    sources: Tuple[SourceView, ...] = ()
     context: Optional[ContextView] = None
     message_actions: MessageActions = field(default_factory=MessageActions)
 

@@ -89,7 +89,8 @@ class CompanionTool:
 class CompanionToolRegistry:
     """Filters tools by mode and enforces the confirmation invariant."""
 
-    def __init__(self, tools=None):
+    def __init__(self, tools=None, policy_tier=None):
+        self.policy_tier = policy_tier
         self._tools: Dict[str, CompanionTool] = {}
         for tool in tools or []:
             self.register(tool)
@@ -110,7 +111,7 @@ class CompanionToolRegistry:
         return [
             self._tools[name]
             for name in self.names()
-            if decide_tool_policy(mode, self._tools[name].risk) != DENY
+            if decide_tool_policy(mode, self._tools[name].risk, self.policy_tier) != DENY
         ]
 
     def as_openai_tools(self, mode) -> List[Dict[str, Any]]:
@@ -123,10 +124,10 @@ class CompanionToolRegistry:
                 "未知工具：{}".format(name),
                 "unknown_tool",
             )
-        decision = decide_tool_policy(mode, tool.risk)
+        decision = decide_tool_policy(mode, tool.risk, self.policy_tier)
         if decision == DENY:
             return ToolResult.failure(
-                "当前模式不允许使用工具：{}".format(name),
+                "当前模式或权限档位不允许使用工具：{}".format(name),
                 "mode_denied",
             )
         if not isinstance(arguments, dict):

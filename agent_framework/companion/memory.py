@@ -385,10 +385,11 @@ class MemoryService:
 
     FTS_CANDIDATE_LIMIT = 30
 
-    def recall(self, session_id: str, query: str, limit: int = 5):
+    def recall(self, session_id: str, query: str, limit: int = 5, min_score: float = 0.0):
         started = time.perf_counter()
+        floor = max(0.0, float(min_score or 0.0))
         tombstones = self.store.list_memory_tombstones(session_id)
-        ranked = self._recall_via_fts(session_id, query, limit, tombstones)
+        ranked = self._recall_via_fts(session_id, query, limit, tombstones, floor)
         source = "fts"
         if ranked is None:
             ranked = self._recall_via_keywords(
@@ -396,6 +397,7 @@ class MemoryService:
                 query,
                 limit,
                 tombstones,
+                floor,
             )
             source = "keyword"
         self.last_recall_source = source
@@ -410,7 +412,7 @@ class MemoryService:
         self.last_recall_memories = [memory for _, memory, _ in ranked]
         return ranked
 
-    def _recall_via_fts(self, session_id, query, limit, tombstones):
+    def _recall_via_fts(self, session_id, query, limit, tombstones, min_score=0.0):
         """FTS5/BM25 检索候选，再用单一衰减公式重排。
 
         单字中文查询走关键词兜底：索引只保留 2/3-gram，单词素无法命中。
@@ -445,12 +447,12 @@ class MemoryService:
                 memory.created_at,
             )
             score = recall_score(query, memory.content, activation)
-            if score > 0:
+            if score > min_score:
                 ranked.append((score, memory, activation))
         ranked.sort(key=lambda item: item[0], reverse=True)
         return ranked[: max(1, min(limit, 20))]
 
-    def _recall_via_keywords(self, session_id, query, limit, tombstones):
+    def _recall_via_keywords(self, session_id, query, limit, tombstones, min_score=0.0):
         """原关键词重叠召回，作为 FTS 不可用时的降级路径。"""
         memories = self.store.list_memories(
             session_id,
@@ -467,14 +469,14 @@ class MemoryService:
                 memory.created_at,
             )
             score = recall_score(query, memory.content, activation)
-            if score > 0:
+            if score > min_score:
                 ranked.append((score, memory, activation))
         ranked.sort(key=lambda item: item[0], reverse=True)
         return ranked[: max(1, min(limit, 20))]
 
-    def context_lines(self, session_id: str, query: str, limit: int = 5):
+    def context_lines(self, session_id: str, query: str, limit: int = 5, min_score: float = 0.0):
         lines = []
-        for _, memory, _ in self.recall(session_id, query, limit):
+        for _, memory, _ in self.recall(session_id, query, limit, min_score):
             source = (
                 "#{}".format(memory.source_message_id)
                 if memory.source_message_id is not None

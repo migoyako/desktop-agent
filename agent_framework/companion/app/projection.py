@@ -4,8 +4,15 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
+from ..tokens import chars_to_tokens, tokens_to_chars
 from ..work import STATE_LABELS
-from .contracts import ContextView, ProjectionSection, RunStage
+from .contracts import (
+    ContextSegment,
+    ContextView,
+    ProjectionSection,
+    RunStage,
+    SourceView,
+)
 
 
 def clip(text, limit=120) -> str:
@@ -48,19 +55,123 @@ def stage_for_event(kind, payload=None, saw_error=False) -> str:
 _UNSET = object()
 
 
+_SEGMENT_LABELS = {
+    "system": "系统提示",
+    "recall": "记忆召回",
+    "docs": "文档检索",
+    "history": "历史对话",
+    "reply": "回复预留",
+    "free": "空闲",
+}
+
+
+def _segment(key: str, chars: int) -> ContextSegment:
+    rounded = max(0, int(chars or 0))
+    return ContextSegment(
+        key=key,
+        label=_SEGMENT_LABELS[key],
+        tokens=chars_to_tokens(rounded),
+        chars=rounded,
+    )
+
+
+def _reply_reserve(runtime) -> int:
+    """The ``max_tokens`` the model may answer with, in the char budget."""
+    settings = getattr(runtime, "settings", None) or {}
+    return tokens_to_chars(int(settings.get("max_tokens") or 0))
+
+
 def build_context_view(runtime) -> Optional[ContextView]:
     """One derivation of context usage; the inspector text and the numbers share it."""
     build = getattr(runtime, "last_context", None)
     if build is None:
         return None
-    limit = int(getattr(build, "budget_chars", 0) or 0)
+    # The bands are the last prompt as it was actually assembled, but the width
+    # is the window in force *now* — saving a new context window in settings has
+    # to move the free band immediately instead of after the next turn.
+    limit = int(getattr(runtime, "max_context_chars", 0) or 0) or int(
+        getattr(build, "budget_chars", 0) or 0
+    )
     if limit <= 0:
         return None
+    used = int(getattr(build, "used_chars", 0) or 0)
+    history = min(int(getattr(build, "history_chars", 0) or 0), used)
+    layers = getattr(build, "layers", None)
+    recall = int(layers.get("memory") or 0) if isinstance(layers, dict) else 0
+    # The document band is a named layer too: leaving it unnamed would draw the
+    # library's own bytes into the system band and understate retrieval.
+    docs = min(
+        int(layers.get("docs") or 0) if isinstance(layers, dict) else 0,
+        max(0, used - history - recall),
+    )
+    # Whatever the layer table did not itemise (join separators, dropped turns)
+    # stays in the system band so the occupied bands add up to ``used``.
+    system = max(0, used - history - recall - docs)
+    segments = [
+        segment
+        for segment in (
+            _segment("system", system),
+            _segment("recall", recall),
+            _segment("docs", docs),
+            _segment("history", history),
+        )
+        if segment.chars > 0
+    ]
+    reserve = min(_reply_reserve(runtime), max(0, limit - used))
+    if reserve > 0:
+        segments.append(_segment("reply", reserve))
+    segments.append(_segment("free", limit - used - reserve))
     return ContextView(
-        context_used=int(getattr(build, "used_chars", 0) or 0),
+        context_used=used,
         context_limit=limit,
         compressed=bool(getattr(build, "compressed", False)),
+        segments=tuple(segments),
     )
+
+
+SOURCE_TITLE_CLIP = 140
+SOURCE_SNIPPET_CLIP = 240
+
+
+def build_sources(runtime) -> Tuple[SourceView, ...]:
+    """One 来源 channel for two kinds of provenance: the local library first.
+
+    The library is stable material the user uploaded; web hits only exist after
+    a search ran, so they follow. Adapters render this tuple instead of reading
+    the runtime attributes.
+    """
+    docs = []
+    for item in getattr(runtime, "last_doc_sources", None) or ():
+        if not isinstance(item, dict):
+            continue
+        docs.append(
+            SourceView(
+                source_kind="document",
+                title=clip(item.get("title"), SOURCE_TITLE_CLIP),
+                snippet=clip(item.get("snippet"), SOURCE_SNIPPET_CLIP),
+                heading=clip(item.get("heading"), 80),
+                path=str(item.get("path") or ""),
+                document_id=str(item.get("document_id") or ""),
+                chunk_id=str(item.get("chunk_id") or ""),
+                ordinal=int(item.get("ordinal") or 0),
+            )
+        )
+    web = []
+    for item in getattr(runtime, "last_tool_sources", None) or ():
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("url") or "")
+        if not (title or item.get("url")):
+            continue
+        web.append(
+            SourceView(
+                source_kind="web",
+                title=clip(title, SOURCE_TITLE_CLIP),
+                url=str(item.get("url") or ""),
+                snippet=clip(item.get("snippet"), SOURCE_SNIPPET_CLIP),
+            )
+        )
+    return tuple(docs + web)
 
 
 def build_inspector_sections(
@@ -140,14 +251,14 @@ def build_inspector_sections(
     if file_lines:
         sections.append(ProjectionSection("文件", tuple(file_lines[:6])))
 
-    sources = getattr(runtime, "last_tool_sources", None) or []
+    sources = build_sources(runtime)
     if sources:
         source_lines = []
         for index, item in enumerate(sources[:6], start=1):
-            title = clip(item.get("title") or item.get("url"), 50)
-            source_lines.append("{}．{}".format(index, title))
-            if item.get("url"):
-                source_lines.append("   {}".format(clip(item["url"], 100)))
+            source_lines.append("{}．{}".format(index, clip(item.title, 50)))
+            tail = item.url or item.path
+            if tail:
+                source_lines.append("   {}".format(clip(tail, 100)))
         sections.append(ProjectionSection("来源", tuple(source_lines)))
 
     proactive = _call(runtime, "proactive_status")

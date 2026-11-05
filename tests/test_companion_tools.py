@@ -551,5 +551,170 @@ class CompanionToolTest(unittest.TestCase):
         self.assertIn("超时", result.content)
 
 
+class PermissionTierRegistryTest(unittest.TestCase):
+    """The 高级 panel's tier has to reach the registry, not just the settings row."""
+
+    def build(self, tier):
+        self.ran = []
+
+        def handler(name):
+            def run(arguments):
+                self.ran.append(name)
+                # 直接执行、不生成提案：ASK 决策必须拒绝这个结果，ALLOW 才放行。
+                return ToolResult.success("已执行 {}".format(name))
+
+            return run
+
+        registry = CompanionToolRegistry(policy_tier=tier)
+        for name, risk in (
+            ("write_note", RiskLevel.FS_WRITE),
+            ("run_command", RiskLevel.SHELL),
+            ("type_into_app", RiskLevel.INPUT_CONTROL),
+            ("read_file", RiskLevel.FS_READ),
+        ):
+            registry.register(
+                CompanionTool(
+                    name=name,
+                    description=name,
+                    parameters={"type": "object", "properties": {}},
+                    risk=risk,
+                    handler=handler(name),
+                )
+            )
+        return registry
+
+    def test_strict_removes_the_dangerous_tools_from_the_list(self):
+        registry = self.build("strict")
+        names = [tool.name for tool in registry.available(AgentMode.EXECUTE)]
+        self.assertIn("write_note", names)
+        self.assertNotIn("run_command", names)
+        self.assertNotIn("type_into_app", names)
+        result = registry.execute("run_command", {}, AgentMode.EXECUTE)
+        self.assertFalse(result.ok)
+        self.assertEqual("mode_denied", result.code)
+        # 被拒绝的工具连处理函数都不该跑到，这是档位唯一真正生效的地方。
+        self.assertEqual([], self.ran)
+
+    def test_relaxed_runs_writes_but_still_asks_for_the_rest(self):
+        registry = self.build("relaxed")
+        done = registry.execute("write_note", {}, AgentMode.EXECUTE)
+        self.assertTrue(done.ok)
+
+        for name in ("run_command", "type_into_app"):
+            with self.subTest(name=name):
+                asked = registry.execute(name, {}, AgentMode.EXECUTE)
+                self.assertFalse(asked.ok)
+                self.assertEqual("confirmation_missing", asked.code)
+
+    def test_balanced_keeps_every_confirmation_where_it_was(self):
+        registry = self.build("balanced")
+        for name in ("write_note", "run_command", "type_into_app"):
+            with self.subTest(name=name):
+                result = registry.execute(name, {}, AgentMode.EXECUTE)
+                self.assertFalse(result.ok)
+                self.assertEqual("confirmation_missing", result.code)
+
+    def test_no_tier_opens_a_tool_the_mode_already_closed(self):
+        for tier in ("strict", "balanced", "relaxed"):
+            registry = self.build(tier)
+            with self.subTest(tier=tier):
+                # 陪伴模式里这四个工具全部关着：档位不能把它们放出来。
+                self.assertEqual([], [tool.name for tool in registry.available(AgentMode.CHAT)])
+                denied = registry.execute("write_note", {}, AgentMode.CHAT)
+                self.assertFalse(denied.ok)
+                self.assertEqual("mode_denied", denied.code)
+
+    def test_an_unknown_tier_is_the_shipped_matrix(self):
+        for tier in (None, "", "信任"):
+            registry = self.build(tier)
+            with self.subTest(tier=tier):
+                self.assertEqual(
+                    [tool.name for tool in registry.available(AgentMode.EXECUTE)],
+                    [tool.name for tool in self.build("balanced").available(AgentMode.EXECUTE)],
+                )
+
+
+class PermissionTierTurnTest(unittest.TestCase):
+    """「信任」档的承诺必须在真正的写入回合里成立，而不只在决策表里。"""
+
+    CONTENT = "# 会议摘要\n\n- 讨论了权限档位"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.data = self.root / "data"
+
+    def run_write(self, tier):
+        llm = ScriptedLLM(
+            [
+                LLMResponse(
+                    tool_calls=[
+                        ToolCall(
+                            name="write_note",
+                            arguments={"query": "会议摘要", "content": self.CONTENT},
+                        )
+                    ]
+                )
+            ]
+        )
+        runtime = CompanionRuntime(
+            CompanionStore(self.data / "companion.db"),
+            llm,
+            SearchService(StubSearch()),
+            self.data,
+            offline=False,
+        )
+        runtime.select_workspace(str(self.workspace))
+        runtime.apply_settings({"tool_permission": tier})
+        return runtime, runtime.handle_message("把这段讨论整理成笔记", AgentMode.WORK)
+
+    def assistant_messages(self, runtime):
+        return [row for row in runtime.history() if row.get("role") == "assistant"]
+
+    def test_relaxed_writes_without_a_confirmation_card(self):
+        runtime, result = self.run_write("relaxed")
+
+        self.assertIsNone(result["proposal"])
+        self.assertEqual([], runtime.pending_proposals())
+        files = list(self.workspace.rglob("*.md"))
+        self.assertEqual(1, len(files))
+        self.assertEqual(self.CONTENT, files[0].read_text(encoding="utf-8"))
+        receipts = runtime.latest_receipts(3)
+        self.assertEqual(1, len(receipts))
+        self.assertEqual("completed", receipts[0].status)
+        self.assertIn("回执", result["answer"])
+        # 回执文案由本轮自己落库一次，确认路径不再重复写一条。
+        self.assertEqual(1, len(self.assistant_messages(runtime)))
+        self.assertEqual(result["answer"], self.assistant_messages(runtime)[0]["content"])
+
+    def test_the_auto_write_is_undone_through_the_same_receipt(self):
+        runtime, _ = self.run_write("relaxed")
+        receipt = runtime.latest_receipts(3)[0]
+
+        runtime.undo_receipt(receipt.receipt_id)
+
+        self.assertEqual([], list(self.workspace.rglob("*.md")))
+
+    def test_balanced_and_strict_still_pause_for_the_card(self):
+        for tier in ("balanced", "strict"):
+            with self.subTest(tier=tier):
+                self.temp = tempfile.TemporaryDirectory()
+                self.addCleanup(self.temp.cleanup)
+                self.root = Path(self.temp.name)
+                self.workspace = self.root / "workspace"
+                self.workspace.mkdir()
+                self.data = self.root / "data"
+
+                runtime, result = self.run_write(tier)
+
+                self.assertIsNotNone(result["proposal"])
+                self.assertEqual(1, len(runtime.pending_proposals()))
+                self.assertEqual([], list(self.workspace.rglob("*.md")))
+                self.assertEqual(1, len(self.assistant_messages(runtime)))
+
+
 if __name__ == "__main__":
     unittest.main()

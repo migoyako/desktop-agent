@@ -45,6 +45,16 @@
   --ctl-switch-h: calc(var(--fs-ui) * 1.55);
   --ctl-switch-w: calc(var(--fs-ui) * 2.6);
   --ctl-switch-knob: calc(var(--fs-ui) * 1.08);
+  /* Context budget bands: one fill per named band, derived from the
+     theme's own status colours so a band never means different things in the two
+     themes than the pill next to it already means. */
+  --ctx-system: var(--accent);
+  --ctx-recall: var(--warning);
+  --ctx-docs: var(--accent-soft);
+  --ctx-history: var(--success);
+  --ctx-reply: var(--border-strong);
+  --ctx-free: var(--hover);
+  --ctx-track: calc(var(--fs-ui) * 0.8);
   --radius-sm: 6px;
   --radius-card: 8px;
   --radius-md: 10px;
@@ -298,6 +308,14 @@ a {
   color: var(--danger);
 }
 
+/* One rejected settings key, shown under the control it belongs to. */
+.field-error {
+  color: var(--danger);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  overflow-wrap: anywhere;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;
@@ -397,6 +415,39 @@ textarea.field {
 .switch:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* Slider (S00 控件规范): always paired with a number field, so the coarse
+   gesture and the exact value stay one control. */
+.slider {
+  flex: 1;
+  min-width: calc(var(--fs-ui) * 8);
+  height: var(--ctl-field);
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.slider::-webkit-slider-runnable-track {
+  height: var(--sp-md);
+  border-radius: var(--radius-pill);
+  background: var(--border-strong);
+}
+
+.slider::-webkit-slider-thumb {
+  appearance: none;
+  width: var(--ctl-switch-knob);
+  height: var(--ctl-switch-knob);
+  margin-top: calc((var(--sp-md) - var(--ctl-switch-knob)) / 2);
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* The global :focus-visible ring stays; the thumb only adds a glow so a
+   keyboard user can see which end of the track they are holding. */
+.slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: var(--glow);
 }
 
 .segmented {
@@ -530,7 +581,9 @@ textarea.field {
   overflow-wrap: anywhere;
 }
 
-.dialog .field {
+/* Only the prompt input floats directly in the card; a form sheet brings its
+   own rows and must not inherit this offset on every field. */
+.dialog .dialog-input {
   margin-top: var(--sp-lg);
 }
 
@@ -552,6 +605,107 @@ textarea.field {
 
 .dialog-actions .primary.danger:hover {
   filter: brightness(1.08);
+}
+
+/* Context budget bar (context_bar.js, M15 slice 3): one track, one band per
+   segment, and a legend that repeats every band in words so the reading never
+   depends on colour alone. */
+.ctxbar {
+  display: grid;
+  gap: var(--sp-sm);
+}
+
+.ctxbar-track {
+  display: flex;
+  min-height: var(--ctx-track);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+}
+
+.ctxbar-seg {
+  flex: 0 0 var(--band);
+  min-width: 0;
+  background: var(--ctx-free);
+}
+
+.ctxbar-seg[data-key="system"] {
+  background: var(--ctx-system);
+}
+
+.ctxbar-seg[data-key="recall"] {
+  background: var(--ctx-recall);
+}
+
+.ctxbar-seg[data-key="docs"] {
+  background: var(--ctx-docs);
+}
+
+.ctxbar-seg[data-key="history"] {
+  background: var(--ctx-history);
+}
+
+.ctxbar-seg[data-key="reply"] {
+  background: var(--ctx-reply);
+}
+
+.ctxbar-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-xs) var(--sp-md);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--fs-caption);
+  line-height: var(--lh-meta);
+}
+
+.ctxbar-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-xs);
+  color: var(--muted);
+}
+
+.ctxbar-dot {
+  flex: none;
+  width: calc(var(--fs-caption) * 0.5);
+  height: calc(var(--fs-caption) * 0.5);
+  border-radius: var(--radius-pill);
+  background: var(--ctx-free);
+}
+
+.ctxbar-item[data-key="system"] .ctxbar-dot {
+  background: var(--ctx-system);
+}
+
+.ctxbar-item[data-key="recall"] .ctxbar-dot {
+  background: var(--ctx-recall);
+}
+
+.ctxbar-item[data-key="docs"] .ctxbar-dot {
+  background: var(--ctx-docs);
+}
+
+.ctxbar-item[data-key="history"] .ctxbar-dot {
+  background: var(--ctx-history);
+}
+
+.ctxbar-item[data-key="reply"] .ctxbar-dot {
+  background: var(--ctx-reply);
+}
+
+.ctxbar-name {
+  font-weight: var(--fw-medium);
+}
+
+.ctxbar-value {
+  color: var(--text);
+}
+
+.ctxbar-raw {
+  color: var(--disabled);
 }
 
 @keyframes dialog-fade {

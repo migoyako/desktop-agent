@@ -74,6 +74,7 @@
     railCollapsed: false,
     inspectorDrawer: false,
     filter: "",
+    sourceOpen: {},
     host: null,
     avatarSrc: "",
   };
@@ -143,6 +144,7 @@
     shell: "执行命令",
     network: "联网",
     "input-control": "控制系统",
+    external: "外部调用",
   };
 
   // ---------- transport ----------
@@ -489,10 +491,21 @@
     orderNodes(container, nodes, desired);
   }
 
+  // 回执是后到的：同一张卡可能先从待确认变成已执行，signature 要带上回执号，
+  // 否则节点会停在旧形状上。
+  function approvalSignature(view) {
+    return [
+      view.status,
+      view.expired ? "1" : "0",
+      view.settled ? "s" : "p",
+      (view.receipt || {}).receipt_id || "",
+    ].join("|");
+  }
+
   function approvalNode(view) {
     const node = elementFrom(approvalHtml(view));
     node.dataset.key = "a:" + view.action_id;
-    node.dataset.signature = view.status + "|" + (view.expired ? "1" : "0");
+    node.dataset.signature = approvalSignature(view);
     return node;
   }
 
@@ -501,7 +514,7 @@
     const desired = [];
     for (const view of approvals) {
       const key = "a:" + view.action_id;
-      const signature = view.status + "|" + (view.expired ? "1" : "0");
+      const signature = approvalSignature(view);
       let node = nodes.get(key);
       if (!node || node.dataset.signature !== signature) {
         const fresh = approvalNode(view);
@@ -549,6 +562,18 @@
       <div class="prompts">${mode.prompts.map((text) => `<button data-prompt="${escapeHtml(text)}">${escapeHtml(text)}</button>`).join("")}</div>`;
   }
 
+  // 待确认的提案一旦确认就离开 approvals，聊天流要留住那张回执卡，只能另读
+  // remote_cards。同一个 action_id 只允许出现一次，先排待确认。
+  function approvalViews(data) {
+    const pending = data.approvals || [];
+    const seen = {};
+    for (const view of pending) seen[view.action_id] = true;
+    const settled = (data.remote_cards || []).filter(
+      (view) => !seen[view.action_id]
+    );
+    return pending.concat(settled);
+  }
+
   function renderChat() {
     const data = state.data;
     if (!data) return;
@@ -556,7 +581,7 @@
     const slots = chatSlots();
     renderEmpty(slots.empty, data);
     syncMessages(slots.list, data.messages);
-    syncApprovals(slots.approvals, data.approvals);
+    syncApprovals(slots.approvals, approvalViews(data));
     if (state.stream) {
       ensureStream();
       renderTools();
@@ -567,31 +592,94 @@
     if (stick) requestAnimationFrame(() => scrollBottom());
   }
 
+  // S04f 的三种状态共用一张卡：待确认、已执行回执、被档位直接拒绝。
+  // 外部调用没有 diff：能审的只有「打到哪台机器」和「发出去的参数」。
+  function remoteServer(preview) {
+    const server = (preview || {}).server || {};
+    return [server.label || server.id || "", server.transport || ""]
+      .filter(Boolean)
+      .join(" · ");
+  }
+
+  function argumentLines(value) {
+    const keys = Object.keys(value || {});
+    if (!keys.length) return ["（这次调用不带参数。）"];
+    return keys.map((key) => {
+      let text;
+      try {
+        text = JSON.stringify(value[key]);
+      } catch (error) {
+        text = String(value[key]);
+      }
+      const line = '"' + key + '": ' + (text === undefined ? "null" : text);
+      return line.length <= 72 ? line : line.slice(0, 72) + "…（已截断）";
+    });
+  }
+
   function approvalHtml(view) {
     const preview = view.preview || {};
     const status = view.status;
     const awaiting = status === "awaiting_confirmation" && !view.expired;
-    const chips = [
-      `<span class="pill accent">${status === "completed" ? "已执行" : "待确认写入"}</span>`,
-      `<span class="pill ${view.expired ? "danger" : ""}">${view.expired ? "已过期" : STATUS_LABELS[status] || status}</span>`,
-    ];
+    const remote = view.risk === "external";
+    const settled = Boolean(view.settled);
+    const receipt = view.receipt || null;
+    const done = settled && status === "completed";
+    const denied = settled && status === "not_executed";
+    const undoId = done && receipt && receipt.receipt_id ? receipt.receipt_id : "";
+    const chips = [];
+    if (done) {
+      chips.push('<span class="pill accent">已执行</span>', '<span class="pill">已完成</span>');
+    } else if (denied) {
+      chips.push(
+        '<span class="pill danger">已拒绝</span>',
+        `<span class="pill">档位：${escapeHtml((state.data || {}).permission_label || "")}</span>`
+      );
+    } else {
+      chips.push(
+        `<span class="pill accent">${
+          awaiting ? (remote ? "待确认外部调用" : "待确认写入") : "已执行"
+        }</span>`,
+        `<span class="pill ${view.expired ? "danger" : ""}">${
+          view.expired ? "已过期" : STATUS_LABELS[status] || status
+        }</span>`
+      );
+    }
     const risk = RISK_LABELS[view.risk] || view.risk || "";
     const rows = [
       ["目标", view.target_summary || preview.relative_path || ""],
       ["风险", risk],
-      ["工作区", view.workspace || preview.workspace || ""],
-      ["可撤销", view.reversible ? "有备份" : "不可撤销"],
-      ["模式", view.mode === "work" ? "工作" : "陪伴"],
-      ["有效期", (view.expires_at || "").replace("T", " ").slice(0, 16)],
+      remote
+        ? ["服务器", remoteServer(preview)]
+        : ["工作区", view.workspace || preview.workspace || ""],
     ];
-    const diffLines = (preview.diff || [])
-      .slice(0, 40)
-      .map(([kind, text]) => {
-        const cls = kind === "add" ? "add" : kind === "del" ? "del" : "ctx";
-        const sign = kind === "add" ? "+" : kind === "del" ? "-" : " ";
-        return `<div class="${cls}">${escapeHtml(sign + " " + text)}</div>`;
-      })
-      .join("");
+    if (receipt) {
+      rows.push([
+        "回执",
+        [RECEIPT_LABELS[receipt.status] || receipt.status, receipt.summary]
+          .filter(Boolean)
+          .join(" · "),
+      ]);
+    }
+    if (!denied) rows.push(["可撤销", view.reversible ? "有备份" : "不可撤销"]);
+    if (!done) rows.push(["模式", view.mode === "work" ? "工作" : "陪伴"]);
+    if (!settled) {
+      rows.push(["有效期", (view.expires_at || "").replace("T", " ").slice(0, 16)]);
+    }
+    const diffLines = remote
+      ? ""
+      : (preview.diff || [])
+          .slice(0, 40)
+          .map(([kind, text]) => {
+            const cls = kind === "add" ? "add" : kind === "del" ? "del" : "ctx";
+            const sign = kind === "add" ? "+" : kind === "del" ? "-" : " ";
+            return `<div class="${cls}">${escapeHtml(sign + " " + text)}</div>`;
+          })
+          .join("");
+    const args = remote
+      ? `<div class="diff">${argumentLines(preview.arguments)
+          .map((line) => `<div class="ctx">${escapeHtml(line)}</div>`)
+          .join("")}</div>`
+      : "";
     const changeLabel =
       preview.change === "create"
         ? "新建文件"
@@ -600,11 +688,27 @@
         : preview.change === "unavailable"
         ? "改动预览不可用"
         : preview.change || "";
+    const foot = done
+      ? '<div class="hint">回执已写入审计日志，导出时不含凭据。</div>'
+      : denied
+      ? `<div class="hint">${escapeHtml((receipt && receipt.error) || "这条外部调用没有出网。")}</div>`
+      : view.warning
+      ? `<div class="hint">${escapeHtml(view.warning)}</div>`
+      : "";
     const actions = awaiting
-      ? `<button class="primary" data-approve="${escapeHtml(view.action_id)}">允许这次写入</button>
+      ? `<button class="primary" data-approve="${escapeHtml(view.action_id)}">${
+          remote ? "允许这次调用" : "允许这次写入"
+        }</button>
          <button class="ghost" data-cancel-approval="${escapeHtml(view.action_id)}">取消</button>`
-      : `<span class="hint">${view.expired ? "提案已过期，请重新生成。" : "这条动作已经处理。"}</span>`;
-    return `<div class="approval" data-approval="${escapeHtml(view.action_id)}">
+      : undoId
+      ? `<button class="ghost" data-undo="${escapeHtml(undoId)}" aria-disabled="true">撤销</button>
+         <span class="hint">外部调用不提供撤销，点击只会说明原因。</span>`
+      : `<span class="hint">${
+          view.expired ? "提案已过期，请重新生成。" : settled ? "" : "这条动作已经处理。"
+        }</span>`;
+    return `<div class="approval${settled ? (denied ? " denied" : " settled") : ""}" data-approval="${escapeHtml(
+      view.action_id
+    )}">
       <div class="chips">${chips.join("")}</div>
       <div class="meta">${rows
         .map(
@@ -612,9 +716,16 @@
             `<div class="row"><label>${label}</label><b title="${escapeHtml(value)}">${escapeHtml(value || "—")}</b></div>`
         )
         .join("")}</div>
-      <div class="plan">${escapeHtml(view.plan || "")}</div>
-      <div class="diff-line"><span>${changeLabel}</span><span class="add">+${preview.added || 0}</span><span class="del">-${preview.removed || 0}</span><span>行</span></div>
-      ${diffLines ? `<div class="diff">${diffLines}</div>` : ""}
+      ${remote ? "" : `<div class="plan">${escapeHtml(view.plan || "")}</div>`}
+      ${
+        remote
+          ? args
+          : `<div class="diff-line"><span>${changeLabel}</span><span class="add">+${
+              preview.added || 0
+            }</span><span class="del">-${preview.removed || 0}</span><span>行</span></div>
+      ${diffLines ? `<div class="diff">${diffLines}</div>` : ""}`
+      }
+      ${foot}
       <div class="actions">${actions}</div>
     </div>`;
   }
@@ -672,11 +783,72 @@
     </div>`;
   }
 
+  function contextBarHtml(section) {
+    // The bands are the same ContextView the composer gauge reads; drawing them
+    // here keeps the inspector and the settings panels on one derivation.
+    if (section.title !== "上下文" || !window.CompanionContextBar) return "";
+    return window.CompanionContextBar.markup(state.data ? state.data.context : null);
+  }
+
+  function sourceKey(item, index) {
+    if (item.source_kind === "document") {
+      return "doc:" + (item.chunk_id || item.document_id + ":" + item.ordinal);
+    }
+    return "web:" + (item.url || index);
+  }
+
+  function sourceDetailLines(item) {
+    const lines = [];
+    if (item.source_kind === "document") {
+      lines.push("块号：第 " + (Number(item.ordinal) + 1) + " 块");
+      if (item.heading) lines.push("小节：" + item.heading);
+      if (item.path) lines.push("原文：" + item.path);
+    } else if (item.url) {
+      lines.push("地址：" + item.url);
+    }
+    if (item.snippet) lines.push("摘录：" + item.snippet);
+    return lines;
+  }
+
+  function sourcesCardHtml() {
+    const items = (state.data && state.data.sources) || [];
+    if (!items.length) return "";
+    const rows = items
+      .map((item, index) => {
+        const key = sourceKey(item, index);
+        const open = !!state.sourceOpen[key];
+        const label = item.source_kind === "document" ? "本机文档" : "网页";
+        const detail = open
+          ? `<div class="source-detail">${sourceDetailLines(item)
+              .map((line) => `<div class="line">${escapeHtml(line)}</div>`)
+              .join("")}</div>`
+          : "";
+        return (
+          `<div class="source-item">` +
+          `<button class="line source-toggle" type="button" data-source-toggle="${escapeHtml(key)}"` +
+          ` aria-expanded="${open ? "true" : "false"}" title="展开这一条的出处与摘录">` +
+          `${index + 1}．${escapeHtml(item.title)}<span class="kind">${label}</span></button>` +
+          detail +
+          `</div>`
+        );
+      })
+      .join("");
+    return `<div class="section-card source-card">
+      <div class="section-title">来源</div>
+      ${rows}
+    </div>`;
+  }
+
   function renderInspector() {
     const data = state.data;
     const wanted = TAB_MAP[state.tab] || [];
-    const sections = (data.inspector || []).filter((section) => wanted.includes(section.title));
-    const cards = state.tab === "任务" ? taskCards() + proactiveCard() : "";
+    const sourceCard = state.tab === "来源" ? sourcesCardHtml() : "";
+    // The structured list replaces the text lines so one entry is never drawn twice.
+    const sections = (data.inspector || []).filter(
+      (section) => wanted.includes(section.title) && !(sourceCard && section.title === "来源")
+    );
+    const cards =
+      state.tab === "任务" ? taskCards() + proactiveCard() : sourceCard;
     if (!sections.length && !cards) {
       el.inspectorBody.innerHTML = '<div class="empty-note">这一栏暂时没有内容</div>';
     } else {
@@ -686,7 +858,10 @@
           .map(
             (section) => `<div class="section-card">
             <div class="section-title">${escapeHtml(section.title)}</div>
-            ${section.lines.map((line) => `<div class="line">${escapeHtml(line)}</div>`).join("") || '<div class="line muted">—</div>'}
+            ${contextBarHtml(section)}
+            ${(section.lines || [])
+              .map((line) => `<div class="line">${escapeHtml(line)}</div>`)
+              .join("") || '<div class="line muted">—</div>'}
           </div>`
           )
           .join("");
@@ -1171,8 +1346,10 @@
     toast(payload.created ? "已保存为长期记忆" : "这条内容已经在记忆里");
   }
 
-  function openSources() {
-    state.tab = "来源";
+  function openInspector(tab) {
+    // Under the inline breakpoint the inspector only exists as a drawer, so a
+    // caller that sets inspectorOpen alone is invisible at 150%/200% font scale.
+    state.tab = tab;
     state.inspectorOpen = true;
     if (responsiveWidth() < 940) state.inspectorDrawer = true;
     layout();
@@ -1266,6 +1443,10 @@
   async function cancelApproval(actionId) {
     await guard(post("/api/approvals/cancel", { action_id: actionId }));
     await refresh();
+  }
+
+  async function undoReceipt(receiptId) {
+    await guard(post("/api/receipts/undo", { receipt_id: receiptId }));
   }
 
   async function taskAction(action, taskId) {
@@ -1486,7 +1667,7 @@
         const messageId = Number(action.dataset.actMid);
         if (action.dataset.msgAct === "regenerate") regenerateMessage(messageId);
         else if (action.dataset.msgAct === "remember") rememberMessage(messageId);
-        else if (action.dataset.msgAct === "source") openSources();
+        else if (action.dataset.msgAct === "source") openInspector("来源");
         return;
       }
       const copy = event.target.closest("[data-copy]");
@@ -1511,9 +1692,24 @@
         return;
       }
       const cancel = event.target.closest("[data-cancel-approval]");
-      if (cancel) cancelApproval(cancel.dataset.cancelApproval);
+      if (cancel) {
+        cancelApproval(cancel.dataset.cancelApproval);
+        return;
+      }
+      // 外部调用的「撤销」按画板长得像禁用了，但仍可点：点下去只是让存储把
+      // 「为什么撤不回」说一遍（K3），页面不自己编这句原因。
+      const undo = event.target.closest("[data-undo]");
+      if (undo) undoReceipt(undo.dataset.undo);
     });
     el.inspectorBody.onclick = (event) => {
+      const source = event.target.closest("[data-source-toggle]");
+      if (source) {
+        const key = source.dataset.sourceToggle;
+        if (state.sourceOpen[key]) delete state.sourceOpen[key];
+        else state.sourceOpen[key] = true;
+        renderInspector();
+        return;
+      }
       const read = event.target.closest("[data-proactive-read]");
       if (read) {
         markProactiveRead(read.dataset.proactiveRead);
@@ -1534,10 +1730,7 @@
         const approval = $("[data-approval]");
         if (approval) approval.scrollIntoView({ block: "center", behavior: "smooth" });
       } else if (pill.dataset.pill === "context") {
-        state.tab = "上下文";
-        state.inspectorOpen = true;
-        layout();
-        renderInspector();
+        openInspector("上下文");
       }
     };
     for (const button of document.querySelectorAll("[data-cmd]")) {

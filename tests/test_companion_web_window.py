@@ -104,6 +104,20 @@ class WindowContractTests(unittest.TestCase):
         self.assertIn('window.addEventListener("scroll", dismiss, true)', block)
         self.assertNotIn("setTimeout(() => {", block)
 
+    def test_tool_windows_delegate_the_drag_too(self):
+        # The settings and console shells reuse BaseWindow, so the header drag
+        # must hand over to the OS caption loop instead of moving by the window
+        # origin like the pre-S1 main window did.
+        for name in ("settings.js", "console.js"):
+            with self.subTest(name):
+                source = asset(name)
+                self.assertNotIn("screenX - event.clientX", source)
+                drag = self.section(name, "function bindDrag()", "function connectHost()")
+                self.assertIn('typeof state.host.beginWindowDrag === "function"', drag)
+                self.assertIn("state.host.beginWindowDrag()", drag)
+                self.assertIn("x: event.clientX", drag)
+                self.assertIn("moveEvent.screenX - grab.x", drag)
+
     def test_shell_exposes_a_native_caption_drag(self):
         source = SHELL.read_text(encoding="utf-8")
         self.assertIn("def _send_caption_drag(hwnd)", source)
@@ -168,7 +182,7 @@ class WindowBrowserTests(unittest.TestCase):
         self.store.add_message("main", "user", "第一条历史消息", AgentMode.CHAT)
         return self.store.list_sessions()[0]["id"]
 
-    def open_page(self, host_stub=HOST_STUB):
+    def open_page(self, host_stub=HOST_STUB, path="/"):
         page = self.context.new_page()
         page.add_init_script(host_stub)
         page.route(
@@ -181,7 +195,7 @@ class WindowBrowserTests(unittest.TestCase):
         )
         self.page = page
         page.goto(
-            "http://{}/?t={}".format(self.adapter.address, self.adapter.token),
+            "http://{}{}?t={}".format(self.adapter.address, path, self.adapter.token),
             wait_until="load",
         )
         return page
@@ -198,19 +212,20 @@ class WindowBrowserTests(unittest.TestCase):
                 pass
         self.fail("condition not met: " + description)
 
-    def start_topbar_drag(self, page):
+    def start_topbar_drag(self, page, selector="#topbar"):
         page.evaluate(
-            """() => {
+            """(selector) => {
               const fire = (target, type, x, y, sx, sy) => target.dispatchEvent(
                 new MouseEvent(type, {
                   bubbles: true, button: 0,
                   clientX: x, clientY: y, screenX: sx, screenY: sy,
                 })
               );
-              fire(document.querySelector('#topbar'), 'mousedown', 500, 20, 1200, 200);
+              fire(document.querySelector(selector), 'mousedown', 500, 20, 1200, 200);
               fire(window, 'mousemove', 560, 50, 1260, 230);
               fire(window, 'mouseup', 560, 50, 1260, 230);
-            }"""
+            }""",
+            selector,
         )
 
     # -- cases ----------------------------------------------------------
@@ -227,6 +242,18 @@ class WindowBrowserTests(unittest.TestCase):
                )"""
         )
         self.assertEqual(["drag"], page.evaluate("window.__hostCalls"))
+
+    def test_tool_window_heads_delegate_to_the_shell(self):
+        for path in ("/settings", "/console"):
+            with self.subTest(path):
+                self.seed_session()
+                page = self.open_page(path=path)
+                self.wait_for(
+                    "document.querySelector('#winHead') && !document.body.classList.contains('browser')",
+                    "{} 页壳层通道就绪".format(path),
+                )
+                self.start_topbar_drag(page, "#winHead")
+                self.assertEqual(["drag"], page.evaluate("window.__hostCalls"))
 
     def test_legacy_shell_falls_back_to_the_corrected_pointer_offset(self):
         self.seed_session()
@@ -248,6 +275,20 @@ class WindowBrowserTests(unittest.TestCase):
         # Window origin 700,180 + delta 60,30. The old window-origin grab
         # would have sent 560,200 instead.
         self.assertEqual(["move:760,210"], page.evaluate("window.__hostCalls"))
+
+    def test_tool_windows_legacy_fallback_uses_the_pointer_offset(self):
+        for path in ("/settings", "/console"):
+            with self.subTest(path):
+                self.seed_session()
+                page = self.open_page(LEGACY_HOST_STUB, path)
+                self.wait_for(
+                    "document.querySelector('#winHead') && !document.body.classList.contains('browser')",
+                    "{} 页壳层通道就绪".format(path),
+                )
+                self.start_topbar_drag(page, "#winHead")
+                # mousedown clientX 500 is the grab, so the move is
+                # 1260-500,230-20 instead of the old window-origin jump.
+                self.assertEqual(["move:760,210"], page.evaluate("window.__hostCalls"))
 
     def test_session_menu_survives_mousedown_and_pins(self):
         session_id = self.seed_session()

@@ -21,6 +21,7 @@ from agent_framework.companion.web.shell import (  # noqa: E402
     WMSZ_TOPRIGHT,
     fit_aspect,
     normalized_geometry,
+    overlay_size_for,
     resize_edges,
 )
 
@@ -28,13 +29,14 @@ try:
     from PySide6.QtCore import QSize, Qt
     from PySide6.QtWidgets import QApplication
 
-    from agent_framework.companion.web.shell import BaseWindow, MainWindow
+    from agent_framework.companion.web.shell import BaseWindow, MainWindow, OverlayWindow
 except ImportError:
     QApplication = None
     QSize = None
     Qt = None
     BaseWindow = None
     MainWindow = None
+    OverlayWindow = None
 
 SHELL = (
     Path(__file__).resolve().parent.parent
@@ -55,6 +57,11 @@ class ShellGeometryTests(unittest.TestCase):
         self.assertEqual((1152, 648), fit_aspect(1152, 648))
         self.assertEqual((1600, 900), fit_aspect(1600, 600))
         self.assertEqual((1024, 576), fit_aspect(1000, 700))
+
+    def test_overlay_height_tracks_the_main_window(self):
+        self.assertEqual((363, 648), overlay_size_for(648))
+        self.assertEqual((448, 800), overlay_size_for(800))
+        self.assertEqual(900, overlay_size_for(900)[1])
 
     def test_saved_geometry_migrates_to_the_minimum(self):
         self.assertEqual(
@@ -113,6 +120,12 @@ class _State:
     def set_window_geometry(self, x, y, width, height):
         self.saved = (x, y, width, height)
 
+    def overlay_position(self):
+        return None
+
+    def set_overlay_position(self, x, y):
+        self.overlay_saved = (x, y)
+
     def theme(self):
         return "charcoal-pink"
 
@@ -168,6 +181,27 @@ class ShellWindowTests(unittest.TestCase):
     def test_no_size_grip_is_installed(self):
         window = self.make_main()
         self.assertFalse(hasattr(window, "grip"))
+
+    def test_overlay_follows_main_window_height(self):
+        main = self.make_main()
+        owner = _Owner()
+        owner.main = main
+        overlay = OverlayWindow(owner, _Adapter(), "about:blank")
+        overlay.show()
+        self.app.processEvents()
+        self.addCleanup(self.close_window, overlay)
+
+        self.assertEqual(main.height(), overlay.height())
+        self.assertEqual(overlay_size_for(main.height()), (
+            overlay.width(), overlay.height()
+        ))
+
+        main.resize(1600, 900)
+        self.app.processEvents()
+        self.assertEqual(900, overlay.height())
+        self.assertEqual(overlay_size_for(900), (
+            overlay.width(), overlay.height()
+        ))
 
     def test_tool_windows_stay_fixed_but_fill_their_size(self):
         window = BaseWindow(_Owner(), _Adapter(), "about:blank", (680, 560), "设置")

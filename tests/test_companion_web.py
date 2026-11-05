@@ -20,6 +20,7 @@ from agent_framework.companion.models import TaskCard, WorkTask, new_id
 from agent_framework.companion.runtime import CompanionRuntime
 from agent_framework.companion.search import SearchService
 from agent_framework.companion.store import CompanionStore
+from agent_framework.companion import tokens as token_tools
 from agent_framework.companion.web import WebAdapter
 from agent_framework.llm import OfflineLLMClient
 
@@ -49,6 +50,7 @@ class WebAdapterTests(unittest.TestCase):
             offline=True,
         )
         runtime.select_workspace(str(root))
+        self.runtime = runtime
         self.service = create_application_service(runtime)
         self.adapter = WebAdapter(self.service, data_dir=root).start()
         self.base = "http://" + self.adapter.address
@@ -252,6 +254,57 @@ class WebAdapterTests(unittest.TestCase):
             )
         self.assertEqual(403, caught.exception.code)
 
+    def test_nested_live2d_model_serves_its_sibling_resources(self):
+        folder = self.root / "assets" / "remielle" / "live2d" / "DeepSeek"
+        texture = folder / "大肥鱼.4096" / "texture_00.png"
+        texture.parent.mkdir(parents=True)
+        texture.write_bytes(PNG_1PX)
+        (folder / "大肥鱼.moc3").write_bytes(b"MOC3" + b"\x00" * 12)
+        model = folder / "大肥鱼.model3.json"
+        model.write_text(
+            json.dumps(
+                {
+                    "FileReferences": {
+                        "Moc": "大肥鱼.moc3",
+                        "Textures": ["大肥鱼.4096/texture_00.png"],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        _, payload = self.request("/api/bootstrap")
+        live2d = payload["assets"]["live2d"]
+        self.assertTrue(live2d["available"])
+        self.assertEqual("DeepSeek/大肥鱼.model3.json", live2d["model_path"])
+        self.assertIn(
+            quote("DeepSeek/大肥鱼.model3.json", safe="/"),
+            live2d["model_url"],
+        )
+        _, overlay = self.request("/api/overlay")
+        self.assertEqual("live2d", overlay["pet"]["renderer"])
+        self.assertTrue(overlay["pet"]["available"])
+
+        with urllib.request.urlopen(
+            self.base + live2d["model_url"], timeout=10
+        ) as response:
+            served = json.loads(response.read().decode("utf-8"))
+        self.assertEqual("大肥鱼.moc3", served["FileReferences"]["Moc"])
+
+        token = self.adapter.token
+        for relative, expected in (
+            ("DeepSeek/大肥鱼.moc3", b"MOC3" + b"\x00" * 12),
+            ("DeepSeek/大肥鱼.4096/texture_00.png", PNG_1PX),
+        ):
+            with self.subTest(relative=relative):
+                path = "/api/live2d/{}/{}".format(
+                    token,
+                    quote(relative, safe="/"),
+                )
+                with urllib.request.urlopen(self.base + path, timeout=10) as response:
+                    self.assertEqual(200, response.status)
+                    self.assertEqual(expected, response.read())
+
     def mesh_archive(self):
         folder = self.root / "assets" / "remielle"
         folder.mkdir(parents=True, exist_ok=True)
@@ -355,6 +408,42 @@ class WebAdapterTests(unittest.TestCase):
         self.assertTrue(bootstrap["assets"]["live2d"]["available"])
         status, _ = self.request("/api/overlay/runtime", {"ok": "yes"})
         self.assertEqual(400, status)
+
+    def test_overlay_moves_gestures_and_acks_them(self):
+        entry = self.live2d_model()
+        (entry / "Animation").mkdir()
+        for name in ("idle", "point_finger"):
+            (entry / "Animation" / (name + ".motion3.json")).write_bytes(b"{}")
+        manifest = json.loads((entry / "model3.json").read_text(encoding="utf-8"))
+        manifest["FileReferences"]["Motions"] = {
+            "idle": [{"File": "Animation/idle.motion3.json"}],
+            "point_finger": [{"File": "Animation/point_finger.motion3.json"}],
+        }
+        manifest["Groups"] = [
+            {"Target": "Motion", "Name": "idle_pool", "Ids": ["point_finger"]}
+        ]
+        (entry / "model3.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        _, overlay = self.request("/api/overlay")
+        self.assertEqual(["idle", "point_finger"], overlay["pet"]["motions"])
+        self.assertEqual(
+            {"idle_pool": ["point_finger"]}, overlay["pet"]["motion_groups"]
+        )
+        self.assertEqual([], overlay["motion_events"])
+
+        self.runtime.motion_events.push(["point_finger", "hold_grass"])
+        _, overlay = self.request("/api/overlay")
+        events = overlay["motion_events"]
+        self.assertEqual(["point_finger", "hold_grass"], [row["name"] for row in events])
+        status, payload = self.request("/api/overlay/motion", {"event_id": events[0]["id"]})
+        self.assertEqual(200, status)
+        self.assertEqual(1, payload["removed"])
+        _, overlay = self.request("/api/overlay")
+        self.assertEqual(
+            ["hold_grass"], [row["name"] for row in overlay["motion_events"]]
+        )
+        status, _ = self.request("/api/overlay/motion", {"event_id": "abc"})
+        self.assertEqual(200, status)
 
     def test_bootstrap_carries_proactive_events_for_the_main_window(self):
         self.service.runtime.store.add_proactive_event(
@@ -664,17 +753,30 @@ class WebAdapterTests(unittest.TestCase):
         bootstrap = self.wait_for(lambda data: data["context"])
 
         context = bootstrap["context"]
+        # The bands are the last prompt as assembled, the width is the window in
+        # force now, so saving a new 上下文窗口 moves the free band at once.
         self.assertEqual(1500, context["context_used"])
-        self.assertEqual(4000, context["context_limit"])
+        self.assertEqual(self.adapter.runtime.max_context_chars, context["context_limit"])
         self.assertTrue(context["compressed"])
         self.assertNotIn("percent", context)
+        self.assertEqual(
+            context["context_limit"],
+            sum(item["chars"] for item in context["segments"]),
+        )
+        for item in context["segments"]:
+            self.assertEqual(token_tools.chars_to_tokens(item["chars"]), item["tokens"], item["key"])
+        keys = [item["key"] for item in context["segments"]]
+        self.assertEqual(keys[-1], "free")
+        self.assertIn("history", keys)
         lines = "\n".join(
             line
             for section in bootstrap["inspector"]
             if section["title"] == "上下文"
             for line in section["lines"]
         )
-        self.assertIn("用量：1500 / 4000 字符", lines)
+        self.assertIn(
+            "用量：1500 / {} 字符".format(context["context_limit"]), lines
+        )
 
     def test_context_gauge_stays_hidden_until_a_prompt_is_built(self):
         status, _ = self.request("/api/turn", {"text": "你好", "mode": "chat"})

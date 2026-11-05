@@ -11,7 +11,9 @@ from pathlib import Path
 from agent_framework.companion.assets import (
     MAX_AVATAR_BYTES,
     MAX_BACKGROUND_BYTES,
+    AssetImportError,
     character_assets_check,
+    import_avatar,
     public_view,
     scan_assets,
 )
@@ -58,6 +60,7 @@ class AssetTests(unittest.TestCase):
         )
         if moc:
             self.write("live2d/" + moc, b"MOC3" + b"\x00" * 12)
+        return self.root / "live2d"
 
     def test_missing_directory_means_no_assets(self):
         assets = scan_assets(self.data, "remielle")
@@ -149,11 +152,100 @@ class AssetTests(unittest.TestCase):
         entry = scan_assets(self.data, "remielle").live2d
         self.assertTrue(entry.valid)
         self.assertEqual(("calm",), entry.expressions)
+        self.assertEqual("model3.json", entry.model_path)
         view = public_view(scan_assets(self.data, "remielle"))["live2d"]
         self.assertTrue(view["valid"])
         self.assertEqual("", view["reason"])
         self.assertEqual(["calm"], view["expressions"])
+        self.assertEqual([], view["motions"])
+        self.assertEqual({}, view["motion_groups"])
+        self.assertEqual("model3.json", view["model_path"])
         self.assertIsInstance(view["stamp"], int)
+
+    def test_nested_cubism_model_is_discovered_from_its_own_directory(self):
+        folder = self.root / "live2d" / "DeepSeek"
+        texture = folder / "character.4096" / "texture_00.png"
+        texture.parent.mkdir(parents=True)
+        texture.write_bytes(PNG)
+        (folder / "character.moc3").write_bytes(b"MOC3" + b"\x00" * 12)
+        (folder / "character.model3.json").write_text(
+            json.dumps(
+                {
+                    "FileReferences": {
+                        "Moc": "character.moc3",
+                        "Textures": ["character.4096/texture_00.png"],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        entry = scan_assets(self.data, "remielle").live2d
+
+        self.assertTrue(entry.valid)
+        self.assertEqual("DeepSeek/character.model3.json", entry.model_path)
+        self.assertEqual(
+            entry.model_path,
+            public_view(scan_assets(self.data, "remielle"))["live2d"]["model_path"],
+        )
+
+    def test_root_model_remains_exclusive_when_present(self):
+        self.live2d()
+        nested = self.root / "live2d" / "nested"
+        nested.mkdir()
+        (nested / "other.model3.json").write_text("{}", encoding="utf-8")
+
+        entry = scan_assets(self.data, "remielle").live2d
+
+        self.assertTrue(entry.valid)
+        self.assertEqual("model3.json", entry.model_path)
+
+    def test_live2d_motion_groups_need_a_real_clip_file(self):
+        self.live2d(
+            payload={
+                "FileReferences": {
+                    "Moc": "model.moc3",
+                    "Textures": ["textures/texture_00.png"],
+                    "Motions": {
+                        "idle": [{"File": "Animation/IDLE.motion3.json"}],
+                        "point_finger": [{"File": "Animation/point.motion3.json"}],
+                        "wrong_suffix": [{"File": "Animation/clip.motion3"}],
+                        "missing_file": [{"File": "Animation/gone.motion3.json"}],
+                        "empty": [],
+                        "bad": "not-a-list",
+                        "escaping": [{"File": "../outside.motion3.json"}],
+                    },
+                },
+                "Groups": [
+                    {"Target": "Parameter", "Name": "EyeBlink", "Ids": ["ParamEyeROpen"]},
+                    {
+                        "Target": "Motion",
+                        "Name": "idle_pool",
+                        "Ids": ["point_finger", "missing_file", "point_finger"],
+                    },
+                    {"Target": "Motion", "Name": "action_pool", "Ids": ["point_finger"]},
+                    {"Target": "Motion", "Name": "nothing", "Ids": []},
+                    {"Name": "no_target", "Ids": ["idle"]},
+                ],
+            }
+        )
+        self.write("live2d/Animation/IDLE.motion3.json", b"{}")
+        self.write("live2d/Animation/point.motion3.json", b"{}")
+        self.write("live2d/Animation/clip.motion3", b"{}")
+        self.write("outside.motion3.json", b"{}")
+        entry = scan_assets(self.data, "remielle").live2d
+        self.assertTrue(entry.valid)
+        self.assertEqual(("idle", "point_finger"), entry.motions)
+        self.assertEqual(
+            {"idle_pool": ("point_finger",), "action_pool": ("point_finger",)},
+            dict(entry.motion_groups),
+        )
+        view = public_view(scan_assets(self.data, "remielle"))["live2d"]
+        self.assertEqual(["idle", "point_finger"], view["motions"])
+        self.assertEqual(
+            {"idle_pool": ["point_finger"], "action_pool": ["point_finger"]},
+            view["motion_groups"],
+        )
 
     def test_live2d_corrupt_moc_and_missing_texture_are_invalid(self):
         self.live2d()
@@ -361,6 +453,102 @@ class AssetTests(unittest.TestCase):
         self.assertIn("avatar=none", character_assets_check(
             self.data, "remielle", True
         )[1])
+
+
+class AvatarImportTests(unittest.TestCase):
+    """M15 slice 4: the one write this module is allowed to make."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.data = Path(self.temp.name)
+        self.root = self.data / "assets" / "remielle"
+        self.source = self.root.parent.parent / "Downloads"
+        self.source.mkdir(parents=True)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_written_into_the_slot_and_the_source_is_left_alone(self):
+        original = self.source / "我的照片.png"
+        original.write_bytes(PNG)
+
+        result = import_avatar(self.data, "remielle", "我的照片.png", PNG)
+
+        self.assertEqual("png", result["asset"].kind)
+        self.assertEqual([], result["removed"])
+        self.assertEqual((self.root / "avatar.png").read_bytes(), PNG)
+        self.assertEqual(original.read_bytes(), PNG)
+        self.assertEqual([original.name], [p.name for p in self.source.iterdir()])
+        self.assertEqual([], list(self.root.glob("*.tmp")))
+
+    def test_the_stale_sibling_kind_is_removed(self):
+        self.root.mkdir(parents=True)
+        (self.root / "avatar.webp").write_bytes(WEBP)
+        (self.root / "background.png").write_bytes(PNG)
+        (self.root / "avatar.mavatar").write_bytes(b"keep me")
+
+        result = import_avatar(self.data, "remielle", "photo.jpg", JPEG)
+
+        self.assertEqual(["avatar.webp"], result["removed"])
+        self.assertTrue((self.root / "avatar.jpg").is_file())
+        # Only the three avatar.* names are ever touched.
+        self.assertTrue((self.root / "background.png").is_file())
+        self.assertTrue((self.root / "avatar.mavatar").is_file())
+        self.assertEqual("jpg", scan_assets(self.data, "remielle").avatar.kind)
+
+    def test_reimport_replaces_the_same_kind(self):
+        import_avatar(self.data, "remielle", "a.png", PNG)
+        other = PNG + b"\x00" * 8
+
+        result = import_avatar(self.data, "remielle", "b.png", other)
+
+        self.assertEqual([], result["removed"])
+        self.assertEqual(other, (self.root / "avatar.png").read_bytes())
+        self.assertEqual(["avatar.png"], [p.name for p in self.root.iterdir()])
+
+    def test_bad_input_is_refused_before_anything_is_written(self):
+        cases = [
+            ("avatar.gif", PNG, "只支持"),
+            ("avatar.png", JPEG, "扩展名不符"),
+            ("avatar.jpg", PNG, "扩展名不符"),
+            ("avatar.png", b"", "没有读到"),
+            ("avatar.png", PNG + b"\x00" * MAX_AVATAR_BYTES, "超过"),
+            ("photo.txt", PNG, "只支持"),
+        ]
+        for filename, payload, needle in cases:
+            with self.subTest(filename=filename):
+                with self.assertRaises(AssetImportError) as raised:
+                    import_avatar(self.data, "remielle", filename, payload)
+                self.assertIn(needle, str(raised.exception))
+        self.assertFalse(self.root.exists())
+
+    def test_a_foreign_persona_id_cannot_pick_a_slot(self):
+        for persona_id in ("", "..", "../remielle", "Remielle", "a/b", "remielle/x"):
+            with self.subTest(persona_id=persona_id):
+                with self.assertRaises(AssetImportError):
+                    import_avatar(self.data, persona_id, "photo.png", PNG)
+
+    def test_a_symlinked_slot_is_refused(self):
+        target = self.data / "elsewhere"
+        target.mkdir()
+        self.root.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(target, self.root, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation needs extra privileges")
+        with self.assertRaises(AssetImportError):
+            import_avatar(self.data, "remielle", "photo.png", PNG)
+        self.assertEqual([], list(target.iterdir()))
+
+    def test_the_viewed_avatar_changes_after_import(self):
+        before = public_view(scan_assets(self.data, "remielle"))["avatar"]
+        import_avatar(self.data, "remielle", "photo.webp", WEBP)
+
+        after = public_view(scan_assets(self.data, "remielle"))["avatar"]
+
+        self.assertIsNone(before)
+        self.assertEqual("webp", after["kind"])
+        self.assertEqual(len(WEBP), after["size"])
 
 
 if __name__ == "__main__":

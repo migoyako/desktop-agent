@@ -217,6 +217,7 @@ body {
   color: var(--muted);
   font-size: var(--fs-meta);
   line-height: var(--lh-body);
+  overflow-wrap: anywhere;
 }
 
 .form-row {
@@ -397,6 +398,373 @@ body {
   color: var(--muted);
   font-size: var(--fs-meta);
   line-height: var(--lh-meta);
+}
+
+/* A settings row plus the one line of error text it was rejected with. */
+.form-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-xs);
+}
+
+/* 未接入的能力（RAG 上传与文档列表、人设包）：控件位置留着，但用虚线框和
+   「未接入」文字标签明说这里还没有功能，而不是放一排假按钮。 */
+.unwired {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-sm);
+  padding: var(--sp-md) var(--sp-lg);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-card);
+  background: var(--page);
+}
+
+.unwired-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-md);
+  font-size: var(--fs-ui);
+  font-weight: var(--fw-semibold);
+}
+
+.unwired .hint {
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+
+/* MCP 服务器面板（S04d）：概览条与服务器卡片同一种卡片壳，行高沿用控件令牌。 */
+.mcp-bar,
+.mcp-server {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-md);
+  padding: var(--sp-md) var(--sp-lg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+}
+
+.mcp-bar {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-md);
+}
+
+/* 200% 字号下按钮排不下就整排换行：这三列的最低宽度按字宽算，
+   不写死像素，也不让文字被 nowrap 的按钮挤出面板。 */
+.mcp-bar .text,
+.mcp-row .text,
+.mcp-tool .text {
+  flex: 1;
+  min-width: calc(var(--fs-ui) * 12);
+}
+
+.mcp-bar .name {
+  font-size: var(--fs-ui);
+  font-weight: var(--fw-semibold);
+}
+
+.mcp-bar .desc,
+.mcp-row .desc,
+.mcp-tool .desc {
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  overflow-wrap: anywhere;
+}
+
+.mcp-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-lg);
+  flex-wrap: wrap;
+}
+
+.mcp-row .name {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-sm);
+  flex-wrap: wrap;
+  font-size: var(--fs-ui);
+}
+
+.mcp-tools-count,
+.mcp-bar .ghost,
+.mcp-bar .primary,
+.mcp-actions .ghost,
+.mcp-tools-head .ghost {
+  flex: none;
+}
+
+.mcp-tools-count {
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  white-space: nowrap;
+}
+
+.mcp-actions {
+  display: flex;
+  gap: var(--sp-sm);
+  flex-wrap: wrap;
+}
+
+/* S04e：逐工具开关展开在卡片内部，靠上边框和标题行与卡片本体分开。 */
+.mcp-tools {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-sm);
+  padding-top: var(--sp-md);
+  border-top: 1px solid var(--border);
+}
+
+.mcp-tools-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-sm);
+  flex-wrap: wrap;
+}
+
+.mcp-tools-head .name {
+  font-size: var(--fs-ui);
+  font-weight: var(--fw-semibold);
+}
+
+.sp {
+  flex: 1;
+  min-width: 0;
+}
+
+.mcp-tool {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-md);
+  flex-wrap: wrap;
+}
+
+.mcp-tool .name {
+  font-size: var(--fs-ui);
+  overflow-wrap: anywhere;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* S04c 的凭据行：界面永远只显示名称与掩码，输入框只收新值（Q2）。 */
+.mcp-cred-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-sm);
+  flex: 1;
+  min-width: 0;
+}
+
+.mcp-cred {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-sm);
+  flex-wrap: wrap;
+}
+
+.mcp-cred .name {
+  flex: none;
+  max-width: 40%;
+  overflow-wrap: anywhere;
+  font-size: var(--fs-ui);
+}
+
+.mcp-cred .field {
+  flex: 1;
+  min-width: calc(var(--fs-ui) * 9);
+}
+
+.mcp-cred .ghost {
+  flex: none;
+}
+
+.masked {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  overflow-wrap: anywhere;
+}
+
+/* 头像导入：文件选择框与提交按钮同排，输入框占据剩余宽度。 */
+.import-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-md);
+  flex-wrap: wrap;
+}
+
+.import-row .primary {
+  flex: none;
+}
+
+.field.file {
+  flex: 1;
+  min-width: calc(var(--fs-ui) * 12);
+  color: var(--muted);
+  font-size: var(--fs-meta);
+}
+
+.field.file::file-selector-button {
+  min-height: var(--ctl-segment);
+  margin-right: var(--sp-md);
+  padding: 0 var(--sp-lg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--fs-meta);
+}
+
+/* 清空记忆：与开关行同样的排布，但边框与按钮明确是破坏性动作。 */
+.danger-zone {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-lg);
+  padding: var(--sp-md) var(--sp-lg);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-card);
+}
+
+.danger-zone .text {
+  flex: 1;
+  min-width: 0;
+}
+
+.danger-zone .name {
+  font-size: var(--fs-ui);
+}
+
+.danger-zone .desc {
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+}
+
+.danger-zone .ghost {
+  border-color: var(--danger);
+  color: var(--danger);
+  flex: none;
+}
+
+/* 高级区的折叠分组：默认只展开「权限与确认」，诊断收起以省出纵向空间。 */
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-md);
+  padding: var(--sp-md) var(--sp-lg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--page);
+}
+
+.group > summary {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semibold);
+  cursor: pointer;
+}
+
+/* 诊断：路径要能整段选中复制，因此左列固定、右列换行。 */
+.diag-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sp-xs) var(--sp-lg);
+  font-size: var(--fs-meta);
+}
+
+.diag-grid .k {
+  color: var(--muted);
+}
+
+.diag-path,
+.group code {
+  font-family: var(--font-mono);
+}
+
+.diag-path {
+  overflow-wrap: anywhere;
+}
+
+/* 上下文预算条（S02/S03 共用组件）：卡片只负责留白与标题，色带与图例在 tokens.css。 */
+.budget-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-sm);
+  padding: var(--sp-md) var(--sp-lg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
+}
+
+.budget-title {
+  font-size: var(--fs-meta);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-meta);
+  color: var(--text);
+}
+
+/* Number fields sit beside a slider or a unit, so they must not stretch. */
+.field.number {
+  flex: none;
+  width: calc(var(--fs-ui) * 8.5);
+  min-width: calc(var(--fs-ui) * 5);
+  text-align: right;
+}
+
+/* 模型服务接入（S02b）：dialog.js 只给遮罩与按钮，行距归这张表。 */
+.sheet {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-lg);
+  margin-top: var(--sp-lg);
+}
+
+.sheet .hint {
+  color: var(--muted);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-body);
+}
+
+.model-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-sm);
+  /* Upstream catalogs run to hundreds of ids; the card itself must keep the
+     保存 button reachable without a page-long scroll. */
+  max-height: calc(var(--ctl-row) * 8);
+  overflow-y: auto;
+}
+
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-sm);
+  padding: var(--sp-xs) var(--sp-sm);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.model-row.on {
+  border-color: var(--accent);
+  background: var(--selected);
+}
+
+.model-pick {
+  flex: 1;
+  min-width: 0;
+  min-height: var(--ctl-segment);
+  color: var(--text);
+  font-size: var(--fs-ui);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .link-row {
