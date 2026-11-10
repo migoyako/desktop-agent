@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
 import json
+import os
 import sqlite3
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -36,7 +38,14 @@ from .models import (
 )
 from .textseg import fts_match_query, fts_segment
 from .redaction import redact_text
-from .path_safety import path_key, resource_identity
+from .path_safety import (
+    MAX_PATH_DEPTH,
+    app_ref,
+    app_target_key,
+    path_key,
+    relative_path_key,
+    resource_identity,
+)
 from . import settings as app_settings
 
 
@@ -176,7 +185,7 @@ CREATE TABLE IF NOT EXISTS workspace_grants (
 """
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 17
 
 MEMORY_FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
@@ -549,6 +558,7 @@ CREATE TABLE IF NOT EXISTS access_grants (
     source TEXT NOT NULL DEFAULT 'grant',
     sensitivity_override INTEGER NOT NULL DEFAULT 0,
     legacy_workspace INTEGER NOT NULL DEFAULT 0,
+    workspace_selected INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_used_at TEXT NOT NULL DEFAULT '',
@@ -561,6 +571,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_access_grants_path
 
 CREATE INDEX IF NOT EXISTS idx_access_grants_status
     ON access_grants(status, resource_kind);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_access_grants_workspace_selected
+    ON access_grants(resource_kind)
+    WHERE resource_kind = 'directory'
+      AND workspace_selected = 1
+      AND status = 'active';
 
 CREATE TABLE IF NOT EXISTS grant_leases (
     lease_id TEXT PRIMARY KEY,
@@ -589,6 +605,206 @@ CREATE INDEX IF NOT EXISTS idx_grant_leases_active
 # 旧 workspace_grants 只有一行，它的授权面就是"在这目录里写笔记"。提升时按
 # P1 的三档勾选补齐读/写/搜索，但不给删除和外发——那两项从来没有被用户授予过。
 LEGACY_WORKSPACE_CAPABILITIES = ("fs-read", "fs-write", "fs-search")
+
+
+# 桌面执行代理 S2：文件元数据索引。
+#
+# 只存元数据，不存内容（D8-A）：原文进模型上下文是按需读取那一步的事，索引里放正文
+# 会让"搜索返回 5 个候选"变成"把目录内容倒进提示词"。
+# rel_path 永远相对授权目录，且与 WorkspaceGuard 一样受 MAX_PATH_DEPTH 约束——索引里
+# 出现一个 resolve() 拒绝的路径，等于搜到一个读不了的文件。
+# 删除只置 status，行留着：对账时要能说出"这个文件不在了"，而不是假装它从没存在。
+FILE_CATALOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS file_catalog (
+    file_ref TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    rel_key TEXT NOT NULL,
+    parent_key TEXT NOT NULL DEFAULT '',
+    ext TEXT NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    mtime TEXT NOT NULL DEFAULT '',
+    volume_id TEXT NOT NULL DEFAULT '',
+    file_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    indexed_at TEXT NOT NULL,
+    deleted_at TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(grant_id) REFERENCES access_grants(grant_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_catalog_path
+    ON file_catalog(grant_id, rel_key);
+
+CREATE INDEX IF NOT EXISTS idx_file_catalog_name
+    ON file_catalog(name_key, status);
+
+CREATE INDEX IF NOT EXISTS idx_file_catalog_parent
+    ON file_catalog(grant_id, parent_key, status);
+
+CREATE INDEX IF NOT EXISTS idx_file_catalog_grant
+    ON file_catalog(grant_id, status);
+
+CREATE TABLE IF NOT EXISTS file_index_state (
+    grant_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'idle',
+    files_indexed INTEGER NOT NULL DEFAULT 0,
+    files_skipped INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(grant_id) REFERENCES access_grants(grant_id) ON DELETE CASCADE
+);
+"""
+
+# 索引状态描述的是"这一轮扫描走到哪了"，不是文件本身，所以单独一张表、一个目录一行。
+INDEX_IDLE = "idle"
+INDEX_RUNNING = "running"
+INDEX_READY = "ready"
+INDEX_FAILED = "failed"
+INDEX_STALE = "stale"
+INDEX_STATUSES = (INDEX_IDLE, INDEX_RUNNING, INDEX_READY, INDEX_FAILED, INDEX_STALE)
+
+# 三重上限（用户 2026-11-05 决定）：文件数、层级深度、跳过名单。深度上限必须不超过
+# MAX_PATH_DEPTH，否则索引里的文件在读取时会被路径规则拒掉。
+INDEX_MAX_FILES = 20000
+INDEX_MAX_DEPTH = min(6, MAX_PATH_DEPTH)
+INDEX_SKIP_DIRECTORY_NAMES = frozenset(
+    {
+        "node_modules",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".git",
+        ".codex",
+        ".idea",
+        ".vscode",
+        "dist",
+        "build",
+        ".cache",
+    }
+)
+
+# 桌面执行代理 S4：应用目录。
+#
+# 这张表只回答"这台机器上有哪些可启动的东西、它们长什么样"，不回答"允许启动哪个"。
+# 允许与否留在 access_grants 里（resource_kind='app' + app-launch 能力），和目录授权
+# 共用唯一一份真相：清单里再存一个 allowed 布尔位，扫描一次就可能和授权表说不一样的话。
+# app_id 由 target_key 稳定派生，所以重新扫描不会让用户已登记的应用变成"另一个应用"。
+# status 描述的是磁盘现状（文件在不在、身份摘要变没变），不是用户的态度；撤销授权
+# 只动 access_grants，这一行的 status 照样是 ready。
+APP_CATALOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS app_catalog (
+    app_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    aliases TEXT NOT NULL DEFAULT '[]',
+    target_kind TEXT NOT NULL DEFAULT 'exe',
+    target TEXT NOT NULL,
+    target_key TEXT NOT NULL,
+    arguments TEXT NOT NULL DEFAULT '',
+    working_dir TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    source_path TEXT NOT NULL DEFAULT '',
+    publisher TEXT NOT NULL DEFAULT '',
+    signed INTEGER NOT NULL DEFAULT 0,
+    signature_state TEXT NOT NULL DEFAULT '',
+    file_version TEXT NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    mtime TEXT NOT NULL DEFAULT '',
+    volume_id TEXT NOT NULL DEFAULT '',
+    file_id TEXT NOT NULL DEFAULT '',
+    identity_digest TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'ready',
+    last_checked_at TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    discovered_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_app_catalog_target
+    ON app_catalog(target_key);
+
+CREATE INDEX IF NOT EXISTS idx_app_catalog_name
+    ON app_catalog(name_key, status);
+
+CREATE INDEX IF NOT EXISTS idx_app_catalog_status
+    ON app_catalog(status);
+
+-- 同一个可执行文件只该有一条应用授权；目录授权的部分唯一索引不管 app，这里补上。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_access_grants_app_path
+    ON access_grants(resource_kind, path_key)
+    WHERE resource_kind = 'app';
+"""
+
+# 桌面执行代理 S5：应用启动链。
+#
+# 链不复制可执行文件路径。起点和终点都只存 app_catalog 的稳定 app_id，所以应用重新
+# 扫描、登记或身份复核后，这里读到的仍是授权系统里那一行。所有结构化规则保存成 JSON，
+# 本阶段只执行 auto 触发；其余触发方式可以登记，但执行前会明确拒绝。
+LAUNCH_CHAIN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS launch_chains (
+    chain_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL DEFAULT '',
+    starter_app_id TEXT NOT NULL,
+    target_app_id TEXT NOT NULL,
+    trigger_kind TEXT NOT NULL DEFAULT 'auto',
+    trigger_config TEXT NOT NULL DEFAULT '{}',
+    detection_rules TEXT NOT NULL DEFAULT '{}',
+    readiness_rules TEXT NOT NULL DEFAULT '{}',
+    post_launch_adapter TEXT NOT NULL DEFAULT 'none',
+    config_digest TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(starter_app_id) REFERENCES app_catalog(app_id),
+    FOREIGN KEY(target_app_id) REFERENCES app_catalog(app_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_launch_chains_enabled
+    ON launch_chains(enabled, name_key);
+
+CREATE INDEX IF NOT EXISTS idx_launch_chains_starter
+    ON launch_chains(starter_app_id, enabled);
+
+CREATE INDEX IF NOT EXISTS idx_launch_chains_target
+    ON launch_chains(target_app_id, enabled);
+"""
+
+# discovered 只是"扫到了"，还没被复核过；ready/missing/drifted/blocked 都要由一次
+# 真实 stat + 摘要计算得出，不能由扫描顺手写。blocked 留给主动禁用（例如目标其实是
+# 一个包装脚本），当前版本不会产生它。
+APP_READY = "ready"
+APP_MISSING = "missing"
+APP_DRIFTED = "drifted"
+APP_BLOCKED = "blocked"
+APP_STATUSES = (APP_READY, APP_MISSING, APP_DRIFTED, APP_BLOCKED)
+
+# 发现来源：开始菜单快捷方式、App Paths 注册表、系统特殊位置、用户手动登记。
+# 来源只影响这一行怎么来的，不影响它能不能启动——那永远由 access_grants 决定。
+APP_SOURCE_START_MENU = "start_menu"
+APP_SOURCE_APP_PATHS = "app_paths"
+APP_SOURCE_SPECIAL_FOLDER = "special_folder"
+APP_SOURCE_MANUAL = "manual"
+APP_SOURCES = (
+    APP_SOURCE_START_MENU,
+    APP_SOURCE_APP_PATHS,
+    APP_SOURCE_SPECIAL_FOLDER,
+    APP_SOURCE_MANUAL,
+)
+
+# 目标类型：真实可执行文件，或 shell 命名空间（回收站这类只能按 verb 打开的东西）。
+APP_TARGET_EXE = "exe"
+APP_TARGET_SHELL = "shell"
+APP_TARGET_KNOWN_FOLDER = "known_folder"
+APP_TARGET_KINDS = (APP_TARGET_EXE, APP_TARGET_SHELL, APP_TARGET_KNOWN_FOLDER)
+
+# 上限同 S2 的思路：宁可少扫，也不要一次扫描把界面卡住或把目录塞满。
+APP_CATALOG_MAX_ENTRIES = 4000
+APP_CATALOG_NAME_MAX_CHARS = 120
 
 
 def _add_column_if_missing(connection, table, column, definition):
@@ -821,6 +1037,56 @@ def _migrate_v13(connection):
     _promote_legacy_workspace_grant(connection)
 
 
+def _migrate_v14(connection):
+    """桌面执行代理 S2：文件元数据索引表与每目录的索引状态表。"""
+    connection.executescript(FILE_CATALOG_SCHEMA)
+
+
+def _migrate_v15(connection):
+    """桌面执行代理 S4：应用目录表与 app 授权的唯一路径索引。"""
+    connection.executescript(APP_CATALOG_SCHEMA)
+
+
+def _migrate_v16(connection):
+    """桌面执行代理 S5：通用应用启动链与检测规则。"""
+    connection.executescript(LAUNCH_CHAIN_SCHEMA)
+
+
+def _migrate_v17(connection):
+    """Separate a selected workspace from an implicit legacy workspace grant."""
+    _add_column_if_missing(
+        connection,
+        "access_grants",
+        "workspace_selected",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    connection.execute(
+        """
+        UPDATE access_grants
+        SET workspace_selected = CASE
+            WHEN grant_id = (
+                SELECT grant_id FROM access_grants
+                WHERE resource_kind = 'directory'
+                  AND status = 'active'
+                  AND legacy_workspace = 1
+                ORDER BY updated_at DESC, grant_id
+                LIMIT 1
+            ) THEN 1 ELSE 0
+        END
+        WHERE resource_kind = 'directory'
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_access_grants_workspace_selected
+        ON access_grants(resource_kind)
+        WHERE resource_kind = 'directory'
+          AND workspace_selected = 1
+          AND status = 'active'
+        """
+    )
+
+
 def _access_json_list(value) -> str:
     """Store a capability or resource list as JSON, never as a bare string."""
     if value is None:
@@ -853,6 +1119,7 @@ def _access_grant_from_row(row) -> Optional[Dict]:
     value["capabilities"] = json.loads(value.get("capabilities") or "[]")
     value["sensitivity_override"] = bool(value.get("sensitivity_override"))
     value["legacy_workspace"] = bool(value.get("legacy_workspace"))
+    value["workspace_selected"] = bool(value.get("workspace_selected"))
     return value
 
 
@@ -863,6 +1130,52 @@ def _grant_lease_from_row(row) -> Optional[Dict]:
     value["resource_ids"] = json.loads(value.get("resource_ids") or "[]")
     value["max_operations"] = int(value.get("max_operations") or 0)
     value["operations_used"] = int(value.get("operations_used") or 0)
+    return value
+
+
+def _file_catalog_from_row(row) -> Optional[Dict]:
+    if row is None:
+        return None
+    value = dict(row)
+    value["size_bytes"] = int(value.get("size_bytes") or 0)
+    return value
+
+
+def _file_index_state_from_row(row) -> Optional[Dict]:
+    if row is None:
+        return None
+    value = dict(row)
+    value["files_indexed"] = int(value.get("files_indexed") or 0)
+    value["files_skipped"] = int(value.get("files_skipped") or 0)
+    return value
+
+
+def _app_catalog_from_row(row) -> Optional[Dict]:
+    if row is None:
+        return None
+    value = dict(row)
+    value["size_bytes"] = int(value.get("size_bytes") or 0)
+    value["signed"] = bool(value.get("signed"))
+    value["aliases"] = json.loads(value.get("aliases") or "[]")
+    return value
+
+
+def _json_object(value) -> Dict:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _launch_chain_from_row(row) -> Optional[Dict]:
+    if row is None:
+        return None
+    value = dict(row)
+    value["enabled"] = bool(value.get("enabled"))
+    value["trigger_config"] = _json_object(value.get("trigger_config"))
+    value["detection_rules"] = _json_object(value.get("detection_rules"))
+    value["readiness_rules"] = _json_object(value.get("readiness_rules"))
     return value
 
 
@@ -886,7 +1199,15 @@ def _promote_legacy_workspace_grant(connection):
     if legacy is None or not int(legacy["enabled"] or 0):
         return
     already = connection.execute(
-        "SELECT grant_id FROM access_grants WHERE legacy_workspace = 1 LIMIT 1"
+        """
+        SELECT grant_id FROM access_grants
+        WHERE resource_kind = 'directory'
+          AND (
+            legacy_workspace = 1
+            OR (workspace_selected = 1 AND status = 'active')
+          )
+        LIMIT 1
+        """
     ).fetchone()
     if already is None:
         path = str(legacy["path"] or "").strip()
@@ -898,12 +1219,24 @@ def _promote_legacy_workspace_grant(connection):
                 INSERT INTO access_grants(
                     grant_id, resource_kind, path, path_key, volume_id, file_id,
                     capabilities, status, source, legacy_workspace,
+                    workspace_selected,
                     created_at, updated_at
-                ) VALUES (?, 'directory', ?, ?, ?, ?, ?, 'active', 'workspace', 1, ?, ?)
+                ) VALUES (?, 'directory', ?, ?, ?, ?, ?, 'active', 'workspace', 1, 1, ?, ?)
                 ON CONFLICT(resource_kind, path_key)
                     WHERE resource_kind = 'directory' DO UPDATE SET
                     status = 'active',
-                    legacy_workspace = 1,
+                    capabilities = CASE
+                        WHEN access_grants.status = 'active'
+                         AND access_grants.legacy_workspace = 0
+                        THEN access_grants.capabilities
+                        ELSE excluded.capabilities
+                    END,
+                    legacy_workspace = CASE
+                        WHEN access_grants.status = 'active'
+                         AND access_grants.legacy_workspace = 0
+                        THEN 0 ELSE 1
+                    END,
+                    workspace_selected = 1,
                     revoked_at = '',
                     updated_at = excluded.updated_at
                 """,
@@ -1041,6 +1374,18 @@ class CompanionStore:
                 if version < 13:
                     _migrate_v13(connection)
                     version = 13
+                if version < 14:
+                    _migrate_v14(connection)
+                    version = 14
+                if version < 15:
+                    _migrate_v15(connection)
+                    version = 15
+                if version < 16:
+                    _migrate_v16(connection)
+                    version = 16
+                if version < 17:
+                    _migrate_v17(connection)
+                    version = 17
             connection.execute(
                 "PRAGMA user_version = {}".format(int(version))
             )
@@ -1547,7 +1892,7 @@ class CompanionStore:
 
     def update_proposal_status(self, action_id: str, status: ProposalStatus):
         with self._connection() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE action_proposals
                 SET status = ?, updated_at = ?
@@ -1555,6 +1900,7 @@ class CompanionStore:
                 """,
                 (ProposalStatus(status).value, utc_now(), action_id),
             )
+        return cursor.rowcount == 1
 
     def transition_proposal_status(
         self,
@@ -1576,7 +1922,7 @@ class CompanionStore:
                     ProposalStatus(from_status).value,
                 ),
             )
-            return cursor.rowcount == 1
+        return int(cursor.rowcount) == 1
 
     def save_receipt(self, receipt: ActionResult):
         with self._connection() as connection:
@@ -1738,7 +2084,23 @@ class CompanionStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def recover_incomplete_executions(self):
+    def recover_incomplete_executions(
+        self,
+        stale_after_seconds: float = 180.0,
+    ):
+        """Recover only executions that are genuinely stale.
+
+        A live executor can spend a few seconds in tool dispatch or backup
+        checks. Marking every ``running`` row on startup unknown would race the
+        current process, while leaving old rows forever blocks the action. The
+        age check gives live work a bounded grace period and lets restart
+        recovery close interrupted work.
+        """
+        reference = utc_now()
+        try:
+            now = datetime.fromisoformat(str(reference))
+        except ValueError:
+            now = None
         recovered = []
         with self._connection() as connection:
             rows = connection.execute(
@@ -1749,6 +2111,17 @@ class CompanionStore:
             ).fetchall()
         for row in rows:
             action_id = row["action_id"]
+            if now is not None:
+                stamp = row["started_at"] or row["updated_at"]
+                try:
+                    started = datetime.fromisoformat(str(stamp))
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    age = (now - started.astimezone(timezone.utc)).total_seconds()
+                except ValueError:
+                    age = float("inf")
+                if age < max(0.0, float(stale_after_seconds)):
+                    continue
             receipt = self.get_receipt_for_action(action_id)
             if receipt is None:
                 receipt = self.save_receipt_once(
@@ -1802,6 +2175,18 @@ class CompanionStore:
         for row in legacy:
             if self.get_execution(row["action_id"]) is not None:
                 continue
+            if now is not None:
+                try:
+                    updated = datetime.fromisoformat(str(row["updated_at"]))
+                    if updated.tzinfo is None:
+                        updated = updated.replace(tzinfo=timezone.utc)
+                    age = (
+                        now - updated.astimezone(timezone.utc)
+                    ).total_seconds()
+                except ValueError:
+                    age = float("inf")
+                if age < max(0.0, float(stale_after_seconds)):
+                    continue
             receipt = self.get_receipt_for_action(row["action_id"])
             if receipt is None:
                 receipt = self.save_receipt_once(
@@ -3713,42 +4098,133 @@ class CompanionStore:
         )
 
     def set_workspace(self, path: str, sensitivity_override: bool = False):
-        """Compatibility adapter: the workspace is one flagged row in access_grants.
+        """Select a workspace without downgrading an explicit grant.
 
-        The path is stored exactly as the caller wrote it, like the pre-v13 table
-        did; identity columns are computed separately so a moved directory is
-        detectable instead of silently re-resolved.
+        The workspace is a UI selection, not a second authorization source. If the
+        user already configured this directory in the authorization centre, keep
+        its capabilities exactly as configured and only move the selection flag.
+        A directory first selected here still receives the historical
+        read/search/write compatibility grant so note writing remains usable.
         """
-        return self.upsert_directory_grant(
-            path,
-            LEGACY_WORKSPACE_CAPABILITIES,
-            source="workspace",
-            sensitivity_override=bool(sensitivity_override),
-            legacy_workspace=True,
+        current = self.get_selected_workspace_grant()
+        if (
+            current is not None
+            and current["legacy_workspace"]
+            and path_key(current["path"]) != path_key(path)
+        ):
+            # An automatically-created workspace grant must not survive as a
+            # hidden read/write authorization after the user switches away.
+            self.set_access_grant_status(current["grant_id"], "revoked")
+        existing = self.find_directory_grant(path)
+        if existing is None or existing["status"] != "active":
+            return self.upsert_directory_grant(
+                path,
+                LEGACY_WORKSPACE_CAPABILITIES,
+                source="workspace",
+                sensitivity_override=bool(sensitivity_override),
+                legacy_workspace=True,
+                workspace_selected=True,
+            )
+        return self.select_workspace_grant(
+            existing["grant_id"],
+            sensitivity_override=sensitivity_override,
         )
 
     def get_workspace(self) -> Optional[str]:
-        grant = self.get_legacy_workspace_grant()
+        grant = self.get_selected_workspace_grant()
         return grant["path"] if grant else None
 
     def clear_workspace(self):
-        grant = self.get_legacy_workspace_grant()
+        grant = self.get_selected_workspace_grant()
         if grant is None:
             return
-        self.set_access_grant_status(grant["grant_id"], "revoked")
+        if grant["legacy_workspace"]:
+            self.set_access_grant_status(grant["grant_id"], "revoked")
+            return
+        self.clear_workspace_selection(grant["grant_id"])
 
     # -- 授权中心（桌面执行代理 S1）----------------------------------------
 
     def get_legacy_workspace_grant(self) -> Optional[Dict]:
+        """Historical name kept for callers; returns the selected workspace row."""
+        return self.get_selected_workspace_grant()
+
+    def get_selected_workspace_grant(self) -> Optional[Dict]:
         with self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT * FROM access_grants
-                WHERE legacy_workspace = 1 AND status = 'active' AND resource_kind = 'directory'
+                WHERE workspace_selected = 1
+                  AND status = 'active'
+                  AND resource_kind = 'directory'
                 ORDER BY updated_at DESC
                 """
             ).fetchone()
         return _access_grant_from_row(row) if row else None
+
+    def select_workspace_grant(
+        self, grant_id, sensitivity_override=False
+    ) -> Optional[Dict]:
+        """Move the single workspace selection to an existing directory grant."""
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT grant_id FROM access_grants
+                WHERE grant_id = ? AND resource_kind = 'directory'
+                """,
+                (str(grant_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE access_grants
+                SET workspace_selected = 0
+                WHERE resource_kind = 'directory'
+                  AND workspace_selected = 1
+                  AND grant_id != ?
+                """,
+                (str(grant_id),),
+            )
+            connection.execute(
+                """
+                UPDATE access_grants
+                SET workspace_selected = 1,
+                    sensitivity_override = CASE
+                        WHEN ? = 1 THEN 1 ELSE sensitivity_override
+                    END,
+                    updated_at = ?
+                WHERE grant_id = ?
+                """,
+                (
+                    1 if sensitivity_override else 0,
+                    now,
+                    str(grant_id),
+                ),
+            )
+            current = connection.execute(
+                "SELECT * FROM access_grants WHERE grant_id = ?",
+                (str(grant_id),),
+            ).fetchone()
+        return _access_grant_from_row(current)
+
+    def clear_workspace_selection(self, grant_id=None) -> bool:
+        clauses = ["resource_kind = 'directory'", "workspace_selected = 1"]
+        values = []
+        if grant_id is not None:
+            clauses.append("grant_id = ?")
+            values.append(str(grant_id))
+        with self._connection() as connection:
+            changed = connection.execute(
+                """
+                UPDATE access_grants
+                SET workspace_selected = 0, updated_at = ?
+                WHERE {}
+                """.format(" AND ".join(clauses)),
+                tuple([utc_now()] + values),
+            ).rowcount
+        return bool(changed)
 
     def upsert_directory_grant(
         self,
@@ -3757,6 +4233,7 @@ class CompanionStore:
         source="grant",
         sensitivity_override=False,
         legacy_workspace=False,
+        workspace_selected=None,
     ) -> Dict:
         """Insert or replace the one row that stands for this directory.
 
@@ -3767,6 +4244,11 @@ class CompanionStore:
         identity = _directory_identity_or_empty(path)
         caps = _access_json_list(capabilities)
         now = utc_now()
+        selected = (
+            bool(workspace_selected)
+            if workspace_selected is not None
+            else bool(legacy_workspace)
+        )
         with self._connection() as connection:
             row = connection.execute(
                 """
@@ -3775,6 +4257,16 @@ class CompanionStore:
                 """,
                 (key,),
             ).fetchone()
+            if selected:
+                connection.execute(
+                    """
+                    UPDATE access_grants SET workspace_selected = 0
+                    WHERE resource_kind = 'directory'
+                      AND workspace_selected = 1
+                      AND path_key != ?
+                    """,
+                    (key,),
+                )
             if row is None:
                 grant_id = new_id("grant")
                 connection.execute(
@@ -3782,9 +4274,9 @@ class CompanionStore:
                     INSERT INTO access_grants(
                         grant_id, resource_kind, path, path_key,
                         volume_id, file_id, capabilities, status, source,
-                        sensitivity_override, legacy_workspace,
+                        sensitivity_override, legacy_workspace, workspace_selected,
                         created_at, updated_at
-                    ) VALUES (?, 'directory', ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                    ) VALUES (?, 'directory', ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         grant_id,
@@ -3796,6 +4288,7 @@ class CompanionStore:
                         str(source or "grant"),
                         1 if sensitivity_override else 0,
                         1 if legacy_workspace else 0,
+                        1 if selected else 0,
                         now,
                         now,
                     ),
@@ -3807,7 +4300,9 @@ class CompanionStore:
                     UPDATE access_grants
                     SET path = ?, volume_id = ?, file_id = ?, capabilities = ?,
                         status = 'active', source = ?, sensitivity_override = ?,
-                        legacy_workspace = ?, revoked_at = '', updated_at = ?
+                        legacy_workspace = ?,
+                        workspace_selected = COALESCE(?, workspace_selected),
+                        revoked_at = '', updated_at = ?
                     WHERE grant_id = ?
                     """,
                     (
@@ -3818,19 +4313,14 @@ class CompanionStore:
                         str(source or "grant"),
                         1 if sensitivity_override else 0,
                         1 if legacy_workspace else 0,
+                        (
+                            (1 if workspace_selected else 0)
+                            if workspace_selected is not None
+                            else None
+                        ),
                         now,
                         grant_id,
                     ),
-                )
-            if legacy_workspace:
-                # At most one row carries the workspace flag, or get_workspace()
-                # would have two candidates to guess between.
-                connection.execute(
-                    """
-                    UPDATE access_grants SET legacy_workspace = 0
-                    WHERE legacy_workspace = 1 AND grant_id != ?
-                    """,
-                    (grant_id,),
                 )
             current = connection.execute(
                 "SELECT * FROM access_grants WHERE grant_id = ?", (grant_id,)
@@ -3855,31 +4345,131 @@ class CompanionStore:
             ).fetchone()
         return _access_grant_from_row(row) if row else None
 
-    def list_access_grants(self, status=None) -> List[Dict]:
+    def find_app_grant(self, target) -> Optional[Dict]:
+        """按启动目标查那条应用授权；键的口径与 ``find_app_catalog`` 完全一致。
+
+        两边必须用同一个函数：算出不同的键，用户点下的"允许启动"就会挂在一条执行器
+        永远查不到的行上。
+        """
+        needle = app_target_key(target)
+        if not needle:
+            return None
         with self._connection() as connection:
-            if status:
-                rows = connection.execute(
+            row = connection.execute(
+                """
+                SELECT * FROM access_grants
+                WHERE resource_kind = 'app' AND path_key = ?
+                """,
+                (needle,),
+            ).fetchone()
+        return _access_grant_from_row(row) if row else None
+
+    def upsert_app_grant(self, target, capabilities, source="grant") -> Dict:
+        """Insert or replace the one row that stands for this launch target.
+
+        ``target`` 可以是 exe 路径，也可以是 ``shell:`` 这类只能交给 shell 解析的串，
+        所以这里不做目录那套敏感性检查，也存不下卷标识之外的身份——身份摘要留在
+        ``app_catalog`` 那一行，授权表只回答"用户同不同意"。
+        """
+        key = app_target_key(target)
+        if not key:
+            raise ValueError("应用授权需要一个目标路径或 shell 解析名。")
+        identity = _directory_identity_or_empty(target)
+        caps = _access_json_list(capabilities)
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT grant_id FROM access_grants
+                WHERE resource_kind = 'app' AND path_key = ?
+                """,
+                (key,),
+            ).fetchone()
+            if row is None:
+                grant_id = new_id("grant")
+                connection.execute(
                     """
-                    SELECT * FROM access_grants WHERE status = ?
-                    ORDER BY updated_at DESC, path_key
+                    INSERT INTO access_grants(
+                        grant_id, resource_kind, path, path_key,
+                        volume_id, file_id, capabilities, status, source,
+                        created_at, updated_at
+                    ) VALUES (?, 'app', ?, ?, ?, ?, ?, 'active', ?, ?, ?)
                     """,
-                    (status,),
-                ).fetchall()
+                    (
+                        grant_id,
+                        str(target),
+                        key,
+                        identity["device"],
+                        identity["file_id"],
+                        caps,
+                        str(source or "grant"),
+                        now,
+                        now,
+                    ),
+                )
             else:
-                rows = connection.execute(
+                grant_id = row["grant_id"]
+                connection.execute(
                     """
-                    SELECT * FROM access_grants
-                    ORDER BY status, updated_at DESC, path_key
-                    """
-                ).fetchall()
+                    UPDATE access_grants
+                    SET path = ?, volume_id = ?, file_id = ?, capabilities = ?,
+                        status = 'active', source = ?, revoked_at = '', updated_at = ?
+                    WHERE grant_id = ?
+                    """,
+                    (
+                        str(target),
+                        identity["device"],
+                        identity["file_id"],
+                        caps,
+                        str(source or "grant"),
+                        now,
+                        grant_id,
+                    ),
+                )
+            current = connection.execute(
+                "SELECT * FROM access_grants WHERE grant_id = ?", (grant_id,)
+            ).fetchone()
+        return _access_grant_from_row(current)
+
+    def list_access_grants(self, status=None, resource_kind=None) -> List[Dict]:
+        clauses = []
+        values: List[Any] = []
+        if status:
+            clauses.append("status = ?")
+            values.append(str(status))
+        if resource_kind:
+            clauses.append("resource_kind = ?")
+            values.append(str(resource_kind))
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        order = "updated_at DESC, path_key" if status else "status, updated_at DESC, path_key"
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM access_grants {}
+                ORDER BY {}
+                """.format(where, order),
+                tuple(values),
+            ).fetchall()
         return [_access_grant_from_row(row) for row in rows]
 
-    def count_access_grants(self, status="active") -> int:
+    def count_access_grants(self, status="active", resource_kind=None) -> int:
+        """数授权条数。``resource_kind`` 必须能分开两类：目录上限把应用授权也算进去
+        的话，登记十几个小工具就会让人再也授权不了新目录。"""
+        clauses = []
+        values: List[Any] = []
+        if status:
+            clauses.append("status = ?")
+            values.append(str(status))
+        if resource_kind:
+            clauses.append("resource_kind = ?")
+            values.append(str(resource_kind))
         with self._connection() as connection:
             return int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM access_grants WHERE status = ?",
-                    (status,),
+                    "SELECT COUNT(*) FROM access_grants{}".format(
+                        " WHERE " + " AND ".join(clauses) if clauses else ""
+                    ),
+                    tuple(values),
                 ).fetchone()[0]
             )
 
@@ -4089,6 +4679,581 @@ class CompanionStore:
             )
             return int(cursor.rowcount)
 
+
+    # -- 文件元数据索引（桌面执行代理 S2）----------------------------------
+
+    def upsert_file_catalog(self, grant_id, entries: List[Dict]) -> int:
+        """写入一批文件元数据，返回落库条数。
+
+        冲突键是 ``(grant_id, rel_key)``：同一轮扫描重跑、或文件被删除后又建回来，
+        都只更新那一行并把状态改回 active，不会留下两份指向同一路径的候选。
+        """
+        now = utc_now()
+        written = 0
+        with self._connection() as connection:
+            for entry in entries:
+                rel_path = str(entry.get("rel_path") or "").strip("/")
+                if not rel_path:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO file_catalog(
+                        file_ref, grant_id, name, name_key, rel_path, rel_key,
+                        parent_key, ext, size_bytes, mtime, volume_id, file_id,
+                        status, indexed_at, deleted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, '')
+                    ON CONFLICT(grant_id, rel_key) DO UPDATE SET
+                        name = excluded.name,
+                        name_key = excluded.name_key,
+                        rel_path = excluded.rel_path,
+                        parent_key = excluded.parent_key,
+                        ext = excluded.ext,
+                        size_bytes = excluded.size_bytes,
+                        mtime = excluded.mtime,
+                        volume_id = excluded.volume_id,
+                        file_id = excluded.file_id,
+                        status = 'active',
+                        indexed_at = excluded.indexed_at,
+                        deleted_at = ''
+                    """,
+                    (
+                        str(entry.get("file_ref") or new_id("file")),
+                        str(grant_id),
+                        str(entry.get("name") or ""),
+                        relative_path_key(str(entry.get("name") or "")),
+                        rel_path,
+                        relative_path_key(rel_path),
+                        relative_path_key(str(entry.get("parent_key") or "")),
+                        str(entry.get("ext") or "").lower().lstrip("."),
+                        int(entry.get("size_bytes") or 0),
+                        str(entry.get("mtime") or ""),
+                        str(entry.get("volume_id") or ""),
+                        str(entry.get("file_id") or ""),
+                        str(entry.get("indexed_at") or now),
+                    ),
+                )
+                written += 1
+        return written
+
+    def mark_file_catalog_deleted(self, rel_keys: List[str], grant_id=None) -> int:
+        """把已消失的文件移出可搜索集合，行本身留着供对账说明去向。"""
+        keys = [relative_path_key(key) for key in rel_keys if str(key or "").strip()]
+        if not keys:
+            return 0
+        now = utc_now()
+        marks = []
+        values: List[Any] = [now]
+        if grant_id:
+            marks.append("grant_id = ?")
+            values.append(str(grant_id))
+        placeholders = []
+        for key in keys:
+            placeholders.append("?")
+            values.append(key)
+        marks.append("rel_key IN ({})".format(",".join(placeholders)))
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE file_catalog
+                SET status = 'deleted', deleted_at = ?
+                WHERE status = 'active' AND {}
+                """.format(" AND ".join(marks)),
+                tuple(values),
+            )
+            return int(cursor.rowcount)
+
+    def list_file_catalog_keys(self, grant_id, status="active") -> List[str]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT rel_key FROM file_catalog WHERE grant_id = ? AND status = ?",
+                (str(grant_id), status),
+            ).fetchall()
+        return [str(row["rel_key"]) for row in rows]
+
+    def get_file_catalog_entry(self, file_ref) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM file_catalog WHERE file_ref = ?", (str(file_ref),)
+            ).fetchone()
+        return _file_catalog_from_row(row)
+
+    def search_file_catalog(
+        self,
+        grant_ids: List[str],
+        term="",
+        ext="",
+        modified_after="",
+        limit=200,
+    ) -> List[Dict]:
+        """按当前授权目录检索 active 行；撤销的目录不在 grant_ids 里，因此永远不会浮上来。
+
+        LIKE 只做子串匹配，键都是 ``relative_path_key`` 规范化过的小写形式；打分与
+        截断交给上层，SQL 不猜"哪个候选最相关"。
+        """
+        ids = [str(item) for item in grant_ids if str(item or "").strip()]
+        if not ids:
+            return []
+        clauses = ["status = 'active'", "grant_id IN ({})".format(
+            ",".join("?" * len(ids)))]
+        values: List[Any] = list(ids)
+        needle = relative_path_key(str(term or "").strip())
+        if needle:
+            clauses.append("(name_key LIKE ? OR rel_key LIKE ?)")
+            wild = "%{}%".format(needle)
+            values.extend([wild, wild])
+        if str(ext or "").strip():
+            clauses.append("ext = ?")
+            values.append(str(ext).strip().lower().lstrip("."))
+        if str(modified_after or "").strip():
+            clauses.append("mtime >= ?")
+            values.append(str(modified_after).strip())
+        values.append(max(1, int(limit)))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM file_catalog
+                WHERE {}
+                ORDER BY mtime DESC, name_key
+                LIMIT ?
+                """.format(" AND ".join(clauses)),
+                tuple(values),
+            ).fetchall()
+        return [_file_catalog_from_row(row) for row in rows]
+
+    def list_file_catalog_children(self, grant_id, parent_key="", limit=200) -> List[Dict]:
+        """列出授权目录下某一层当前已索引的文件（"列出目录"的索引侧）。"""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM file_catalog
+                WHERE grant_id = ? AND parent_key = ? AND status = 'active'
+                ORDER BY name_key
+                LIMIT ?
+                """,
+                (str(grant_id), relative_path_key(parent_key), max(1, int(limit))),
+            ).fetchall()
+        return [_file_catalog_from_row(row) for row in rows]
+
+    def count_file_catalog(self, grant_id=None, status="active") -> int:
+        with self._connection() as connection:
+            if grant_id:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS n FROM file_catalog"
+                    " WHERE grant_id = ? AND status = ?",
+                    (str(grant_id), status),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS n FROM file_catalog WHERE status = ?",
+                    (status,),
+                ).fetchone()
+        return int(row["n"])
+
+    def save_file_index_state(self, grant_id, state: Dict) -> Dict:
+        """整行替换一个目录的索引进度；进度是"这一轮扫描"的事实，不是缓存。"""
+        now = utc_now()
+        values = {
+            "status": str(state.get("status") or INDEX_IDLE),
+            "files_indexed": int(state.get("files_indexed") or 0),
+            "files_skipped": int(state.get("files_skipped") or 0),
+            "last_error": str(state.get("last_error") or ""),
+            "started_at": str(state.get("started_at") or ""),
+            "finished_at": str(state.get("finished_at") or ""),
+            "updated_at": now,
+        }
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO file_index_state(
+                    grant_id, status, files_indexed, files_skipped,
+                    last_error, started_at, finished_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(grant_id) DO UPDATE SET
+                    status = excluded.status,
+                    files_indexed = excluded.files_indexed,
+                    files_skipped = excluded.files_skipped,
+                    last_error = excluded.last_error,
+                    started_at = excluded.started_at,
+                    finished_at = excluded.finished_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(grant_id),
+                    values["status"],
+                    values["files_indexed"],
+                    values["files_skipped"],
+                    values["last_error"],
+                    values["started_at"],
+                    values["finished_at"],
+                    values["updated_at"],
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM file_index_state WHERE grant_id = ?",
+                (str(grant_id),),
+            ).fetchone()
+        return _file_index_state_from_row(row)
+
+    def get_file_index_state(self, grant_id) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM file_index_state WHERE grant_id = ?",
+                (str(grant_id),),
+            ).fetchone()
+        return _file_index_state_from_row(row)
+
+    def list_file_index_states(self) -> List[Dict]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT s.*, g.path, g.status AS grant_status
+                FROM file_index_state AS s
+                JOIN access_grants AS g ON g.grant_id = s.grant_id
+                ORDER BY s.updated_at DESC
+                """
+            ).fetchall()
+        return [_file_index_state_from_row(row) for row in rows]
+
+    def delete_file_index_state(self, grant_id) -> int:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM file_index_state WHERE grant_id = ?", (str(grant_id),)
+            )
+            return int(cursor.rowcount)
+
+    # -- 应用目录（桌面执行代理 S4）------------------------------------------
+
+    def upsert_app_catalog(self, entries: List[Dict]) -> int:
+        """写入一批应用元数据，返回落库条数。
+
+        冲突键是 ``target_key``：同一个 exe 被开始菜单和 App Paths 各指一次时，两次扫描
+        更新同一行，不会浮出两个候选。``app_id`` 由 ``target_key`` 派生，所以重新扫描不会
+        把用户已经登记的应用变成"另一个应用"——登记关系留在 access_grants 里。
+        状态与身份摘要由调用方复核后给出，这里不自己判断在不在、变没变。
+        """
+        now = utc_now()
+        written = 0
+        with self._connection() as connection:
+            for entry in entries:
+                target = str(entry.get("target") or "").strip()
+                if not target:
+                    continue
+                target_key = str(entry.get("target_key") or app_target_key(target))
+                connection.execute(
+                    """
+                    INSERT INTO app_catalog(
+                        app_id, name, name_key, aliases, target_kind, target,
+                        target_key, arguments, working_dir, source, source_path,
+                        publisher, signed, signature_state, file_version,
+                        size_bytes, mtime, volume_id, file_id, identity_digest,
+                        status, last_checked_at, last_error, discovered_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(target_key) DO UPDATE SET
+                        name = excluded.name,
+                        name_key = excluded.name_key,
+                        aliases = excluded.aliases,
+                        target_kind = excluded.target_kind,
+                        target = excluded.target,
+                        arguments = excluded.arguments,
+                        working_dir = excluded.working_dir,
+                        source = excluded.source,
+                        source_path = excluded.source_path,
+                        -- 只有真的算过身份的那次写入才允许覆盖身份列。发现扫描交的
+                        -- 行里这些全是空串，直接赋值会把登记时算好的发布者与摘要抹掉，
+                        -- 于是"重新扫一次"就等於"把已核验的应用变成没核验过"。
+                        publisher = CASE WHEN excluded.signature_state <> ''
+                            THEN excluded.publisher ELSE app_catalog.publisher END,
+                        signed = CASE WHEN excluded.signature_state <> ''
+                            THEN excluded.signed ELSE app_catalog.signed END,
+                        signature_state = CASE WHEN excluded.signature_state <> ''
+                            THEN excluded.signature_state ELSE app_catalog.signature_state END,
+                        identity_digest = CASE WHEN excluded.identity_digest <> ''
+                            THEN excluded.identity_digest ELSE app_catalog.identity_digest END,
+                        last_checked_at = CASE WHEN excluded.signature_state <> ''
+                            THEN excluded.last_checked_at ELSE app_catalog.last_checked_at END,
+                        file_version = excluded.file_version,
+                        size_bytes = excluded.size_bytes,
+                        mtime = excluded.mtime,
+                        volume_id = excluded.volume_id,
+                        file_id = excluded.file_id,
+                        -- drifted/blocked 是一次真实复核或主动禁用的结论，扫描只看得到
+                        -- "在不在"，没有资格把它改回 ready。missing 是更新的事实，照常覆盖。
+                        status = CASE WHEN app_catalog.status IN ('drifted', 'blocked')
+                            AND excluded.status = 'ready'
+                            THEN app_catalog.status ELSE excluded.status END,
+                        last_error = CASE WHEN app_catalog.status IN ('drifted', 'blocked')
+                            AND excluded.status = 'ready'
+                            THEN app_catalog.last_error ELSE excluded.last_error END,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(entry.get("app_id") or app_ref(target_key)),
+                        str(entry.get("name") or "")[:APP_CATALOG_NAME_MAX_CHARS],
+                        os.path.normcase(str(entry.get("name") or "").strip()),
+                        _access_json_list(entry.get("aliases") or []),
+                        str(entry.get("target_kind") or APP_TARGET_EXE),
+                        target,
+                        target_key,
+                        str(entry.get("arguments") or ""),
+                        str(entry.get("working_dir") or ""),
+                        str(entry.get("source") or ""),
+                        str(entry.get("source_path") or ""),
+                        str(entry.get("publisher") or ""),
+                        1 if entry.get("signed") else 0,
+                        str(entry.get("signature_state") or ""),
+                        str(entry.get("file_version") or ""),
+                        int(entry.get("size_bytes") or 0),
+                        str(entry.get("mtime") or ""),
+                        str(entry.get("volume_id") or ""),
+                        str(entry.get("file_id") or ""),
+                        str(entry.get("identity_digest") or ""),
+                        str(entry.get("status") or APP_READY),
+                        str(entry.get("last_checked_at") or now),
+                        str(entry.get("last_error") or ""),
+                        str(entry.get("discovered_at") or now),
+                        now,
+                    ),
+                )
+                written += 1
+        return written
+
+    def get_app_catalog(self, app_id) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM app_catalog WHERE app_id = ?", (str(app_id),)
+            ).fetchone()
+        return _app_catalog_from_row(row)
+
+    def find_app_catalog(self, target) -> Optional[Dict]:
+        """按目标路径（或 ``shell:`` 这类命名空间标识）查一行。"""
+        needle = app_target_key(target)
+        if not needle:
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM app_catalog WHERE target_key = ?", (needle,)
+            ).fetchone()
+        return _app_catalog_from_row(row)
+
+    def list_app_catalog(self, status=None, limit=500) -> List[Dict]:
+        clauses = []
+        values: List[Any] = []
+        if status:
+            clauses.append("status = ?")
+            values.append(str(status))
+        values.append(max(1, int(limit)))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM app_catalog
+                {}
+                ORDER BY name_key
+                LIMIT ?
+                """.format("WHERE " + " AND ".join(clauses) if clauses else ""),
+                tuple(values),
+            ).fetchall()
+        return [_app_catalog_from_row(row) for row in rows]
+
+    def search_app_catalog(self, term="", status=None, limit=50) -> List[Dict]:
+        """名字与别名的子串匹配；打分与截断交给上层，SQL 不猜哪个最像。"""
+        clauses = []
+        values: List[Any] = []
+        needle = os.path.normcase(str(term or "").strip())
+        if needle:
+            clauses.append("(name_key LIKE ? OR lower(aliases) LIKE ?)")
+            wild = "%{}%".format(needle)
+            values.extend([wild, wild])
+        if status:
+            clauses.append("status = ?")
+            values.append(str(status))
+        values.append(max(1, int(limit)))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM app_catalog
+                {}
+                ORDER BY name_key
+                LIMIT ?
+                """.format("WHERE " + " AND ".join(clauses) if clauses else ""),
+                tuple(values),
+            ).fetchall()
+        return [_app_catalog_from_row(row) for row in rows]
+
+    def set_app_catalog_status(self, app_id, status, error="") -> bool:
+        """只动状态与错误说明：文件消失了、身份摘要变了，都留得下这一行供对账。"""
+        if status not in APP_STATUSES:
+            raise ValueError("未知的应用状态：{}".format(status))
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE app_catalog
+                SET status = ?, last_error = ?, last_checked_at = ?, updated_at = ?
+                WHERE app_id = ?
+                """,
+                (str(status), str(error or ""), utc_now(), utc_now(), str(app_id)),
+            )
+            return int(cursor.rowcount) > 0
+
+    def count_app_catalog(self, status=None) -> int:
+        clauses = []
+        values: List[Any] = []
+        if status:
+            clauses.append("status = ?")
+            values.append(str(status))
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) FROM app_catalog
+                {}
+                """.format("WHERE " + " AND ".join(clauses) if clauses else ""),
+                tuple(values),
+            ).fetchone()
+        return int(row[0])
+
+    # -- 启动链（桌面执行代理 S5）--------------------------------------------
+
+    def upsert_launch_chain(self, entry: Dict) -> Dict:
+        """Create or replace one launch-chain configuration.
+
+        The caller supplies the sealed config digest. Keeping it in the row lets a
+        confirmation prove that the chain has not changed between proposal and
+        execution instead of trusting a fresh read.
+        """
+        now = utc_now()
+        chain_id = str(entry.get("chain_id") or new_id("chain"))
+        name = str(entry.get("name") or "").strip()
+        starter_app_id = str(entry.get("starter_app_id") or "").strip()
+        target_app_id = str(entry.get("target_app_id") or "").strip()
+        if not name or not starter_app_id or not target_app_id:
+            raise ValueError("launch chain requires a name and both app ids")
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO launch_chains(
+                    chain_id, name, name_key, starter_app_id, target_app_id,
+                    trigger_kind, trigger_config, detection_rules,
+                    readiness_rules, post_launch_adapter, config_digest,
+                    enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chain_id) DO UPDATE SET
+                    name = excluded.name,
+                    name_key = excluded.name_key,
+                    starter_app_id = excluded.starter_app_id,
+                    target_app_id = excluded.target_app_id,
+                    trigger_kind = excluded.trigger_kind,
+                    trigger_config = excluded.trigger_config,
+                    detection_rules = excluded.detection_rules,
+                    readiness_rules = excluded.readiness_rules,
+                    post_launch_adapter = excluded.post_launch_adapter,
+                    config_digest = excluded.config_digest,
+                    enabled = excluded.enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    chain_id,
+                    name,
+                    os.path.normcase(name),
+                    starter_app_id,
+                    target_app_id,
+                    str(entry.get("trigger_kind") or "auto"),
+                    json.dumps(
+                        entry.get("trigger_config") or {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        entry.get("detection_rules") or {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        entry.get("readiness_rules") or {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    str(entry.get("post_launch_adapter") or "none"),
+                    str(entry.get("config_digest") or ""),
+                    1 if entry.get("enabled", True) else 0,
+                    str(entry.get("created_at") or now),
+                    now,
+                ),
+            )
+        stored = self.get_launch_chain(chain_id)
+        if stored is None:
+            raise ValueError("launch chain write did not persist")
+        return stored
+
+    def get_launch_chain(self, chain_id) -> Optional[Dict]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM launch_chains WHERE chain_id = ?",
+                (str(chain_id),),
+            ).fetchone()
+        return _launch_chain_from_row(row)
+
+    def find_launch_chain(self, name) -> Optional[Dict]:
+        needle = os.path.normcase(str(name or "").strip())
+        if not needle:
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM launch_chains
+                WHERE name_key = ? OR chain_id = ?
+                ORDER BY enabled DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (needle, str(name or "").strip()),
+            ).fetchone()
+        return _launch_chain_from_row(row)
+
+    def list_launch_chains(
+        self,
+        enabled: Optional[bool] = None,
+        starter_app_id=None,
+        limit: int = 50,
+    ) -> List[Dict]:
+        clauses = []
+        values: List[Any] = []
+        if enabled is not None:
+            clauses.append("enabled = ?")
+            values.append(1 if enabled else 0)
+        if starter_app_id is not None:
+            clauses.append("starter_app_id = ?")
+            values.append(str(starter_app_id))
+        values.append(max(1, min(int(limit), 200)))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM launch_chains
+                {}
+                ORDER BY name_key, updated_at DESC
+                LIMIT ?
+                """.format("WHERE " + " AND ".join(clauses) if clauses else ""),
+                tuple(values),
+            ).fetchall()
+        return [_launch_chain_from_row(row) for row in rows]
+
+    def delete_launch_chain(self, chain_id) -> bool:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM launch_chains WHERE chain_id = ?",
+                (str(chain_id),),
+            )
+            return int(cursor.rowcount) > 0
+
+    def count_launch_chains(self, enabled: Optional[bool] = None) -> int:
+        with self._connection() as connection:
+            if enabled is None:
+                row = connection.execute(
+                    "SELECT COUNT(*) FROM launch_chains"
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) FROM launch_chains WHERE enabled = ?",
+                    (1 if enabled else 0,),
+                ).fetchone()
+        return int(row[0])
 
     # -- 文档库（M16 切片 1）------------------------------------------------
 

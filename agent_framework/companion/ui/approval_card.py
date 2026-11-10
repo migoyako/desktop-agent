@@ -21,6 +21,7 @@ RISK_LABELS = {
     "safe": "只读",
     "fs-read": "读取文件",
     "fs-write": "写入文件",
+    "fs-delete": "移入回收站",
     "shell": "命令执行",
     "network": "联网",
     "input-control": "控制输入",

@@ -581,8 +581,8 @@ class StoreMigrationTests(unittest.TestCase):
 
     def test_a_fresh_database_carries_the_document_library(self):
         store = CompanionStore(self.path)
-        self.assertEqual(SCHEMA_VERSION, 13)
-        self.assertEqual(self.user_version(store), 13)
+        self.assertEqual(SCHEMA_VERSION, 17)
+        self.assertEqual(self.user_version(store), SCHEMA_VERSION)
         self.assertTrue({"documents", "doc_chunks", "doc_fts"} <= self.tables(store))
         self.assertTrue(store.doc_fts_enabled)
 
@@ -596,7 +596,7 @@ class StoreMigrationTests(unittest.TestCase):
             )
             connection.execute("PRAGMA user_version = 10")
         reopened = CompanionStore(self.path)
-        self.assertEqual(self.user_version(reopened), 13)
+        self.assertEqual(self.user_version(reopened), SCHEMA_VERSION)
         self.assertTrue({"documents", "doc_chunks", "doc_fts"} <= self.tables(reopened))
         with reopened._connection() as connection:
             columns = {

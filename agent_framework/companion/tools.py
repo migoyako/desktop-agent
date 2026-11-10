@@ -22,11 +22,15 @@ def _run_with_timeout(handler, arguments, timeout):
     if not timeout or timeout <= 0:
         return handler(arguments)
     outcome = queue.Queue(maxsize=1)
+    state = {"done": False}
 
     def worker():
         try:
-            outcome.put((True, handler(arguments)))
+            value = handler(arguments)
+            state["done"] = True
+            outcome.put((True, value))
         except BaseException as error:
+            state["done"] = True
             outcome.put((False, error))
 
     thread = threading.Thread(
@@ -38,7 +42,13 @@ def _run_with_timeout(handler, arguments, timeout):
     try:
         ok, value = outcome.get(timeout=timeout)
     except queue.Empty:
-        raise ToolTimeout()
+        if state["done"]:
+            try:
+                ok, value = outcome.get_nowait()
+            except queue.Empty:
+                ok, value = False, RuntimeError("工具结果未送达队列。")
+        else:
+            raise ToolTimeout()
     if not ok:
         raise value
     return value

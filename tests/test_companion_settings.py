@@ -176,7 +176,7 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(store.load_settings(), None)
         store.save_settings({"model": "gpt-4o-mini"})
         self.assertEqual(store.load_settings()["model"], "gpt-4o-mini")
-        self.assertEqual(SCHEMA_VERSION, 13)
+        self.assertEqual(SCHEMA_VERSION, 17)
 
     def test_round_trip_and_corrupt_row(self):
         store = CompanionStore(self.root / "companion.db")

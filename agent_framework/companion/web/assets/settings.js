@@ -10,6 +10,12 @@
     settings: null,
     models: [],
     mcp: null,
+    desktop: null,
+    desktopTab: "directories",
+    desktopSearch: null,
+    desktopEditingChain: "",
+    desktopChainDraft: null,
+    desktopDetection: null,
     mcpOpen: {},
     mcpBusy: {},
     cat: "company",
@@ -32,6 +38,7 @@
   const CATEGORIES = [
     { id: "company", name: "陪伴", desc: "记忆、情绪与人设" },
     { id: "work", name: "工作", desc: "主动关心与任务卡" },
+    { id: "desktop", name: "桌面", desc: "目录、文件、应用与启动链" },
     { id: "model", name: "模型", desc: "推理参数与服务接入" },
     { id: "data", name: "数据与外观", desc: "管理、主题与浮窗" },
   ];
@@ -42,6 +49,7 @@
     persona: { cat: "company", name: "基础信息", desc: "称呼、边界与头像导入" },
     proactive: { cat: "work", name: "主动", desc: "免打扰、频率与未回复阈值" },
     tasks: { cat: "work", name: "任务", desc: "任务卡与执行记录" },
+    desktop: { cat: "desktop", name: "桌面能力", desc: "授权目录、文件、应用目录与启动链" },
     model: { cat: "model", name: "模型推理", desc: "模型、采样、上下文窗口与服务接入" },
     rag: { cat: "model", name: "RAG 文档库", desc: "词法检索已进上下文，上传与列表界面等画板" },
     mcp: { cat: "model", name: "MCP 服务", desc: "外部工具服务器与逐工具开关" },
@@ -308,7 +316,7 @@
       "persona",
       `<div class="persona-head">
         ${avatarMarkup()}
-        <div class="stat-grid">
+      <div class="stat-grid">
           <div class="stat"><div class="k">当前人设</div><div class="v">${escapeHtml(info.name || "数字分身")}</div></div>
           <div class="stat"><div class="k">版本</div><div class="v">${escapeHtml(info.version || "未加载")}</div></div>
         </div>
@@ -473,6 +481,582 @@
           : "当前未启用：界面保持纯色主题。"
       }</div>`
     );
+  }
+
+  function desktopView() {
+    return state.desktop || {
+      directories: [],
+      apps: [],
+      chains: [],
+      capabilities: [],
+      trigger_kinds: [],
+      recording: { active: false, candidates: [] },
+      uia: { available: false, reason: "" },
+      summary: {},
+      limits: { files: 20 },
+    };
+  }
+
+  function humanBytes(value) {
+    const size = Number(value || 0);
+    if (size < 1024) return size + " B";
+    if (size < 1024 * 1024) return (size / 1024).toFixed(1) + " KB";
+    return (size / 1024 / 1024).toFixed(1) + " MB";
+  }
+
+  function deskChip(text, kind) {
+    return `<span class="pill${kind ? " " + kind : ""}">${escapeHtml(text)}</span>`;
+  }
+
+  function desktopTabBar() {
+    const tabs = [
+      ["directories", "目录授权"],
+      ["files", "文件"],
+      ["apps", "应用目录"],
+      ["chains", "启动链"],
+      ["record", "录制"],
+    ];
+    return `<div class="desk-tabs">${tabs
+      .map(
+        ([id, label]) =>
+          `<button data-desk-tab="${id}" class="${state.desktopTab === id ? "on" : ""}" ${
+            state.desktopTab === id ? 'aria-current="true"' : ""
+          }>${label}</button>`
+      )
+      .join("")}</div>`;
+  }
+
+  function panelDesktopDirectories() {
+    const view = desktopView();
+    const capabilityOptions = (view.capabilities || [])
+      .map(
+        (item) =>
+          `<label class="cap-check"><input type="checkbox" value="${escapeHtml(item.value)}" ${
+            ["fs-read", "fs-search"].indexOf(item.value) >= 0 ? "checked" : ""
+          }> <span>${escapeHtml(item.label)}</span></label>`
+      )
+      .join("");
+    const rows = (view.directories || [])
+      .map((row) => {
+        const caps = (row.capabilities || [])
+          .map((cap) => {
+            const label = (view.capabilities || []).filter((item) => item.value === cap)[0];
+            return deskChip(label ? label.label : cap, "accent");
+          })
+          .join("");
+        const stateLabel =
+          row.index_status === "running" || row.indexing
+            ? "正在索引"
+            : row.index_status === "ready"
+            ? "索引就绪"
+            : row.index_status === "failed"
+            ? "索引失败"
+            : "等待索引";
+        return `<div class="desk-item">
+          <div class="desk-item-main">
+            <div class="name mono" title="${escapeHtml(row.path || "")}">${escapeHtml(row.path || "")}</div>
+            <div class="desk-meta">${caps}${
+              row.workspace_selected ? deskChip("当前工作目录", "accent") : ""
+            }${deskChip(stateLabel, row.index_status === "failed" ? "danger" : "")}</div>
+            <div class="hint">${Number(row.files_indexed || 0)} 个文件 · 跳过 ${Number(row.files_skipped || 0)} 项${
+              row.index_error ? " · " + escapeHtml(row.index_error) : ""
+            }</div>
+          </div>
+          <div class="desk-actions">
+            <button class="ghost" data-desk-act="reindex-directory" data-id="${escapeHtml(row.grant_id || "")}">重建索引</button>
+            <button class="ghost danger-text" data-desk-act="revoke-directory" data-id="${escapeHtml(row.grant_id || "")}">撤销授权</button>
+          </div>
+        </div>`;
+      })
+      .join("");
+    return `<div class="stat-grid">
+      <div class="stat"><div class="k">授权目录</div><div class="v">${Number((view.summary || {}).directories || 0)} 个</div></div>
+      <div class="stat"><div class="k">已索引文件</div><div class="v">${Number((view.summary || {}).catalog_files || 0).toLocaleString()} 条</div></div>
+    </div>
+    <div class="desk-form">
+      <div class="section-title">新增授权目录</div>
+      <div class="form-row"><label for="deskGrantPath">目录路径</label><input class="field mono" id="deskGrantPath" placeholder="输入已存在的绝对路径"></div>
+      <div class="cap-grid">${capabilityOptions}</div>
+      <label class="cap-check"><input type="checkbox" id="deskSensitive"> <span>允许敏感目录（仅在你明确需要时勾选）</span></label>
+      <div class="form-actions"><button class="primary" data-desk-act="grant-directory">授权并索引</button></div>
+      <div class="hint">这里的授权独立生效，不需要再在对话里选择工作目录；文件工具只在工作/执行模式可用，写入、删除和外发仍只获得你勾选的能力。</div>
+    </div>
+    <div class="section-title">已授权目录</div>
+    <div class="desk-list">${rows || '<div class="empty-note">还没有授权目录。</div>'}</div>`;
+  }
+
+  function panelDesktopFiles() {
+    const search = state.desktopSearch || {};
+    const rows = (search.candidates || [])
+      .map((row) => `<div class="desk-item compact">
+        <div class="desk-item-main">
+          <div class="name">${escapeHtml(row.name || row.rel_path || "文件")}</div>
+          <div class="desk-meta">${deskChip(humanBytes(row.size_bytes || row.size || 0))}${deskChip(
+            row.grant_id || ""
+          )}</div>
+          <div class="hint mono">${escapeHtml(row.rel_path || "")}</div>
+        </div>
+        <div class="desk-actions">
+          <button class="ghost" data-desk-act="open-file" data-ref="${escapeHtml(
+            row.file_ref || ""
+          )}">打开</button>
+          <button class="ghost" data-desk-act="move-file" data-ref="${escapeHtml(
+            row.file_ref || ""
+          )}">移动</button>
+          <button class="ghost danger-text" data-desk-act="delete-file" data-ref="${escapeHtml(
+            row.file_ref || ""
+          )}">移入回收站</button>
+        </div>
+      </div>`)
+      .join("");
+    return `<div class="desk-form">
+      <div class="form-row"><label for="deskFileQuery">搜索文件</label><input class="field" id="deskFileQuery" placeholder="文件名或路径关键词" value="${escapeHtml(
+        search.query || ""
+      )}"><button class="primary" data-desk-act="search-files">搜索</button></div>
+      <div class="hint">搜索只返回授权目录中的元数据；打开、移动和删除都继续走已有权限与确认链。</div>
+    </div>
+    <div class="section-title">搜索结果${
+      search.matched != null ? " · " + Number(search.matched || 0) : ""
+    }</div>
+    <div class="desk-list">${
+      rows || '<div class="empty-note">输入关键词后搜索授权目录。</div>'
+    }</div>
+    ${
+      (search.refused || []).length
+        ? `<div class="hint danger-text">${escapeHtml(
+            search.refused.join("；")
+          )}</div>`
+        : ""
+    }`;
+  }
+
+  function panelDesktopApps() {
+    const view = desktopView();
+    const statusLabel = {
+      ready: "就绪",
+      missing: "缺失",
+      drifted: "身份漂移",
+      blocked: "已阻止",
+    };
+    const rows = (view.apps || [])
+      .slice(0, 120)
+      .map((row) => {
+        const allowed = Boolean(row.allowed);
+        const statusKind =
+          row.status === "ready"
+            ? "accent"
+            : row.status === "drifted" || row.status === "missing"
+            ? "danger"
+            : "";
+        return `<div class="desk-item">
+          <div class="desk-item-main">
+            <div class="name">${escapeHtml(row.name || row.target || "应用")}</div>
+            <div class="desk-meta">${deskChip(statusLabel[row.status] || row.status || "", statusKind)}${
+              allowed ? deskChip("已允许启动", "accent") : ""
+            }${deskChip(row.source || "应用")}</div>
+            <div class="hint mono" title="${escapeHtml(row.target || "")}">${escapeHtml(
+              row.target || ""
+            )}</div>
+            <div class="hint">${escapeHtml(
+              row.publisher || "无签名身份"
+            )}${row.file_version ? " · " + escapeHtml(row.file_version) : ""}</div>
+          </div>
+          <div class="desk-actions">${
+            allowed
+              ? `<button class="ghost danger-text" data-desk-act="revoke-app" data-id="${escapeHtml(
+                  row.grant_id || ""
+                )}">撤销</button>`
+              : `<button class="ghost" data-desk-act="allow-app" data-id="${escapeHtml(
+                  row.app_id || ""
+                )}" ${row.status === "missing" ? "disabled" : ""}>${
+                  row.status === "drifted" ? "重新登记" : "允许启动"
+                }</button>`
+          }</div>
+        </div>`;
+      })
+      .join("");
+    return `<div class="stat-grid">
+      <div class="stat"><div class="k">应用目录</div><div class="v">${Number((view.summary || {}).apps || 0)} 条</div></div>
+      <div class="stat"><div class="k">允许启动</div><div class="v">${Number((view.summary || {}).apps_allowed || 0)} 个</div></div>
+    </div>
+    <div class="form-actions"><button class="primary" data-desk-act="scan-apps">扫描本机应用</button><span class="hint">发现不等于授权；扫描不会启动程序。</span></div>
+    <div class="desk-form">
+      <div class="section-title">手动登记</div>
+      <div class="form-row"><label for="deskAppName">名称</label><input class="field" id="deskAppName" placeholder="例如 Visual Studio Code"></div>
+      <div class="form-row"><label for="deskAppTarget">目标</label><input class="field mono" id="deskAppTarget" placeholder="程序绝对路径，或 shell:RecycleBinFolder"></div>
+      <div class="form-row"><label for="deskAppArgs">参数</label><input class="field mono" id="deskAppArgs" placeholder="可留空"></div>
+      <div class="form-row"><label for="deskAppCwd">工作目录</label><input class="field mono" id="deskAppCwd" placeholder="可留空"></div>
+      <div class="form-actions"><button class="primary" data-desk-act="register-app">登记并允许启动</button></div>
+    </div>
+    <div class="section-title">发现结果${
+      (view.apps || []).length > 120 ? " · 当前显示前 120 条" : ""
+    }</div>
+    <div class="desk-list">${rows || '<div class="empty-note">还没有扫描或登记应用。</div>'}</div>`;
+  }
+
+  function panelDesktopChains() {
+    const view = desktopView();
+    const readyApps = (view.apps || []).filter(
+      (row) => row.status === "ready" && row.allowed
+    );
+    const appOptions = (selected) =>
+      readyApps
+        .map(
+          (row) =>
+            `<option value="${escapeHtml(row.app_id || "")}" ${
+              row.app_id === selected ? "selected" : ""
+            }>${escapeHtml(row.name || row.target || row.app_id)}</option>`
+        )
+        .join("");
+    const editingId = state.desktopEditingChain;
+    const editing =
+      (view.chains || []).filter((row) => row.chain_id === editingId)[0] || null;
+    const draft =
+      state.desktopChainDraft &&
+      (!editingId || state.desktopChainDraft.chain_id === editingId)
+        ? state.desktopChainDraft
+        : null;
+    const base = draft || editing || {};
+    const detection = base.detection_rules || {};
+    const readiness = base.readiness_rules || {};
+    const triggerConfig = base.trigger_config || {};
+    const triggerKind = base.trigger_kind || "auto";
+    const triggerOptions = (view.trigger_kinds || []).length
+      ? view.trigger_kinds
+      : [
+          { value: "auto", label: "自动启动" },
+          { value: "argument", label: "固定参数" },
+          { value: "uri", label: "URI Scheme" },
+          { value: "api", label: "已登记 API 入口" },
+          { value: "uia", label: "UI Automation" },
+          { value: "manual", label: "人工接管" },
+        ];
+    const selectedTrigger = triggerOptions
+      .map(
+        (item) =>
+          `<option value="${escapeHtml(item.value)}" ${
+            item.value === triggerKind ? "selected" : ""
+          }>${escapeHtml(item.label)}</option>`
+      )
+      .join("");
+    const detectionResult = state.desktopDetection || null;
+    const detectionRows =
+      detectionResult && detectionResult.chain_id === editingId
+        ? (detectionResult.candidates || [])
+            .map(
+              (row) => `<div class="desk-item compact">
+                <div class="desk-item-main">
+                  <div class="name">${escapeHtml(row.name || "目标进程")}</div>
+                  <div class="desk-meta">${deskChip("PID " + row.pid)}${deskChip(
+                    row.exe_path || ""
+                  )}</div>
+                  <div class="hint mono">${escapeHtml(
+                    (row.windows || [])
+                      .map((window) => window.title || window.class_name || "")
+                      .filter(Boolean)
+                      .join(" · ") || "没有可见窗口"
+                  )}</div>
+                </div>
+                <div class="desk-actions">
+                  <button class="ghost" data-desk-act="use-detected-target" data-pid="${Number(
+                    row.pid || 0
+                  )}">用这个实例</button>
+                </div>
+              </div>`
+            )
+            .join("")
+        : "";
+    const rows = (view.chains || [])
+      .map(
+        (row) => `<div class="desk-item">
+          <div class="desk-item-main">
+            <div class="name">${escapeHtml(row.name || row.chain_id || "启动链")}</div>
+            <div class="desk-meta">${
+              row.enabled ? deskChip("已启用", "accent") : deskChip("已停用")
+            }${deskChip(row.trigger_kind || "auto")}${
+              row.runnable ? deskChip("可执行", "accent") : ""
+            }</div>
+            <div class="hint">${escapeHtml(
+              row.starter_name || row.starter_app_id || ""
+            )} → ${escapeHtml(
+              row.target_name || row.target_app_id || ""
+            )} · 超时 ${Number((row.readiness_rules || {}).timeout_seconds || 30)} 秒</div>
+          </div>
+          <div class="desk-actions">
+            <button class="ghost" data-desk-act="toggle-chain" data-id="${escapeHtml(
+              row.chain_id || ""
+            )}" data-enabled="${row.enabled ? "1" : "0"}">${
+              row.enabled ? "停用" : "启用"
+            }</button>
+            <button class="ghost" data-desk-act="run-chain" data-id="${escapeHtml(
+              row.chain_id || ""
+            )}" ${row.runnable ? "" : "disabled"}>生成启动提案</button>
+            <button class="ghost" data-desk-act="edit-chain" data-id="${escapeHtml(
+              row.chain_id || ""
+            )}">编辑</button>
+            <button class="ghost" data-desk-act="detect-chain" data-id="${escapeHtml(
+              row.chain_id || ""
+            )}">检测实例</button>
+            <button class="ghost danger-text" data-desk-act="delete-chain" data-id="${escapeHtml(
+              row.chain_id || ""
+            )}">删除</button>
+          </div>
+        </div>`
+      )
+      .join("");
+    return `<div class="stat-grid">
+      <div class="stat"><div class="k">启动链</div><div class="v">${Number((view.summary || {}).chains || 0)} 条</div></div>
+      <div class="stat"><div class="k">当前可执行</div><div class="v">${Number((view.summary || {}).chains_runnable || 0)} 条</div></div>
+    </div>
+    <div class="desk-list">${rows || '<div class="empty-note">还没有启动链。先在应用目录里允许起点与目标应用。</div>'}</div>
+    <div class="desk-form">
+      <div class="section-title">${editing ? "编辑启动链" : "新建启动链"}</div>
+      <div class="form-row"><label for="deskChainName">名称</label><input class="field" id="deskChainName" placeholder="例如 Codex++ → Codex" value="${escapeHtml(
+        base.name || ""
+      )}"></div>
+      <div class="form-row"><label for="deskChainStarter">起点应用</label><select class="field" id="deskChainStarter">${appOptions(
+        base.starter_app_id
+      )}</select></div>
+      <div class="form-row"><label for="deskChainTarget">目标应用</label><select class="field" id="deskChainTarget">${appOptions(
+        base.target_app_id
+      )}</select></div>
+      <div class="form-row"><label for="deskChainTrigger">触发方式</label><select class="field" id="deskChainTrigger">${selectedTrigger}</select></div>
+      <div data-trigger-field="argument" ${
+        triggerKind === "argument" ? "" : "hidden"
+      }>
+        <div class="form-row"><label for="deskChainArguments">固定参数</label><textarea class="field mono" id="deskChainArguments" rows="3" placeholder="每行一个参数">${escapeHtml(
+          (triggerConfig.arguments || []).join("\n")
+        )}</textarea></div>
+      </div>
+      <div data-trigger-field="uri" ${
+        triggerKind === "uri" ? "" : "hidden"
+      }>
+        <div class="form-row"><label for="deskChainUri">固定 URI</label><input class="field mono" id="deskChainUri" placeholder="codexplusplus://open/project" value="${escapeHtml(
+          triggerConfig.uri || ""
+        )}"></div>
+      </div>
+      <div data-trigger-field="api" ${
+        triggerKind === "api" ? "" : "hidden"
+      }>
+        <div class="form-row"><label for="deskChainApiApp">API 入口</label><select class="field" id="deskChainApiApp">${appOptions(
+          triggerConfig.api_app_id || ""
+        )}</select></div>
+        <div class="form-row"><label for="deskChainApiArguments">API 参数</label><textarea class="field mono" id="deskChainApiArguments" rows="3" placeholder="每行一个参数">${escapeHtml(
+          (triggerConfig.arguments || []).join("\n")
+        )}</textarea></div>
+      </div>
+      <div data-trigger-field="uia" ${
+        triggerKind === "uia" ? "" : "hidden"
+      }>
+        <div class="form-row"><label for="deskChainUiaWindowTitle">窗口标题</label><input class="field" id="deskChainUiaWindowTitle" placeholder="标题包含的文字" value="${escapeHtml(
+          triggerConfig.window_title_contains || ""
+        )}"></div>
+        <div class="form-row"><label for="deskChainUiaWindowClass">窗口类</label><input class="field mono" id="deskChainUiaWindowClass" placeholder="可留空" value="${escapeHtml(
+          triggerConfig.window_class || ""
+        )}"></div>
+        <div class="form-row"><label for="deskChainUiaAutomationId">Automation ID</label><input class="field mono" id="deskChainUiaAutomationId" placeholder="优先使用 Automation ID" value="${escapeHtml(
+          triggerConfig.automation_id || ""
+        )}"></div>
+        <div class="form-row"><label for="deskChainUiaControlName">控件名称</label><input class="field" id="deskChainUiaControlName" placeholder="Automation ID 为空时使用" value="${escapeHtml(
+          triggerConfig.control_name || ""
+        )}"></div>
+        <div class="form-row"><label for="deskChainUiaControlType">控件类型</label><input class="field" id="deskChainUiaControlType" placeholder="例如 Button" value="${escapeHtml(
+          triggerConfig.control_type || ""
+        )}"></div>
+        <div class="hint">${
+          (view.uia || {}).available
+            ? "UIA 适配器可用；只会点击起点应用进程内的唯一匹配窗口。"
+            : "UIA 当前不可用：" + escapeHtml((view.uia || {}).reason || "未知原因")
+        }</div>
+      </div>
+      <div class="form-row"><label for="deskChainTimeout">就绪超时</label><input class="field number" id="deskChainTimeout" type="number" min="1" max="120" step="1" value="${Number(
+        readiness.timeout_seconds || 30
+      )}"><span class="unit">秒</span></div>
+      <div class="form-row"><label for="deskChainWindowTitle">检测标题</label><input class="field" id="deskChainWindowTitle" placeholder="标题包含文字，可留空" value="${escapeHtml(
+        (detection.window_title_contains || []).join("\n")
+      )}"></div>
+      <div class="form-row"><label for="deskChainWindowClass">检测窗口类</label><input class="field mono" id="deskChainWindowClass" placeholder="精确窗口类，可留空" value="${escapeHtml(
+        (detection.window_class || []).join("\n")
+      )}"></div>
+      <div class="cap-grid">
+        <label class="cap-check"><input type="checkbox" id="deskChainDescendant" ${
+          detection.require_descendant ? "checked" : ""
+        }> <span>目标必须在起点进程树中</span></label>
+        <label class="cap-check"><input type="checkbox" id="deskChainWindow" ${
+          detection.require_window !== false ? "checked" : ""
+        }> <span>目标必须有可见窗口</span></label>
+        <label class="cap-check"><input type="checkbox" id="deskChainReuse" ${
+          detection.reuse_existing ? "checked" : ""
+        }> <span>允许复用已运行实例</span></label>
+      </div>
+      <div class="form-actions">
+        <button class="primary" data-desk-act="save-chain" data-id="${escapeHtml(
+          editingId || ""
+        )}">${editing ? "保存修改" : "保存启动链"}</button>
+        ${
+          editing
+            ? '<button class="ghost" data-desk-act="cancel-edit-chain">取消编辑</button>'
+            : ""
+        }
+      </div>
+      <div class="hint">保存只固化触发与检测配置；执行时仍会重新复核两个应用的身份与授权。</div>
+    </div>
+    ${
+      editingId
+        ? `<div class="section-title">检测到的目标实例</div>
+           <div class="desk-list">${
+             detectionRows ||
+             '<div class="empty-note">还没有检测结果；点击列表中的“检测实例”。</div>'
+           }</div>`
+        : ""
+    }`;
+  }
+
+  function panelDesktopRecord() {
+    const view = desktopView();
+    const recording = view.recording || {
+      active: false,
+      candidates: [],
+      candidate_count: 0,
+    };
+    const starterOptions = (view.apps || [])
+      .filter((row) => row.status === "ready" && row.allowed)
+      .map(
+        (row) =>
+          `<option value="${escapeHtml(row.app_id || "")}">${escapeHtml(
+            row.name || row.target || row.app_id
+          )}</option>`
+      )
+      .join("");
+    if (!recording.active) {
+      return `<div class="desk-form">
+        <div class="section-title">录制启动链</div>
+        <div class="form-row"><label for="deskRecordStarter">中转应用</label><select class="field" id="deskRecordStarter">${starterOptions}</select></div>
+        <div class="form-actions"><button class="primary" data-desk-act="start-recording">开始录制</button></div>
+        <div class="hint">开始后手动完成一次启动目标应用的操作，再刷新候选。录制不会启动程序，也不会自动授予权限。</div>
+      </div>`;
+    }
+    const starter = (view.apps || []).filter(
+      (row) => row.app_id === recording.starter_app_id
+    )[0];
+    const rows = (recording.candidates || [])
+      .map(
+        (row, index) => `<div class="desk-item">
+          <div class="desk-item-main">
+            <div class="name">${escapeHtml(row.name || "新进程")}</div>
+            <div class="desk-meta">${deskChip("PID " + row.pid)}${
+              row.app_name ? deskChip(row.app_name, "accent") : deskChip("不在应用目录")
+            }${row.app_allowed ? deskChip("已允许", "accent") : ""}</div>
+            <div class="hint mono">${escapeHtml(row.exe_path || "")}</div>
+            <div class="hint">${escapeHtml(
+              (row.windows || [])
+                .map((window) => window.title || window.class_name || "")
+                .filter(Boolean)
+                .join(" · ") || "没有新的可见窗口"
+            )}</div>
+          </div>
+          <div class="desk-actions">
+            <button class="ghost" data-desk-act="select-record-candidate" data-index="${index}" ${
+              row.selectable ? "" : "disabled"
+            }>${row.selectable ? "选为目标" : "先登记应用"}</button>
+          </div>
+        </div>`
+      )
+      .join("");
+    return `<div class="desk-form">
+      <div class="section-title">正在录制</div>
+      <div class="desk-meta">${deskChip(
+        starter ? starter.name || starter.target : recording.starter_app_id,
+        "accent"
+      )}${deskChip("剩余 " + Number(recording.expires_in_seconds || 0) + " 秒")}</div>
+      <div class="hint">${escapeHtml(recording.instructions || "")}</div>
+      <div class="form-actions">
+        <button class="primary" data-desk-act="refresh-recording">刷新候选</button>
+        <button class="ghost danger-text" data-desk-act="cancel-recording">取消录制</button>
+      </div>
+    </div>
+    <div class="section-title">新出现的进程与窗口 · ${Number(
+      recording.candidate_count || 0
+    )}</div>
+    <div class="desk-list">${rows || '<div class="empty-note">现在手动启动一次目标应用，然后刷新候选。</div>'}</div>`;
+  }
+
+  function panelDesktop() {
+    const body = {
+      directories: panelDesktopDirectories,
+      files: panelDesktopFiles,
+      apps: panelDesktopApps,
+      chains: panelDesktopChains,
+      record: panelDesktopRecord,
+    }[state.desktopTab] || panelDesktopDirectories;
+    return wrapPanel("desktop", desktopTabBar() + body());
+  }
+
+  async function loadDesktop() {
+    const view = await guard(api("/api/desktop"));
+    if (!view) return;
+    state.desktop = view;
+    if (state.panel === "desktop") render();
+  }
+
+  async function desktopCommand(payload, success) {
+    const result = await guard(post("/api/desktop", payload));
+    if (!result) return null;
+    if (result.desktop) state.desktop = result.desktop;
+    if (result.search) state.desktopSearch = result.search;
+    if (result.recording) {
+      state.desktop = state.desktop || {};
+      state.desktop.recording = result.recording;
+    }
+    if (result.detection) state.desktopDetection = result.detection;
+    if (success) toast(success);
+    render();
+    return result;
+  }
+
+  async function moveDesktopFile(fileRef) {
+    const writable = (desktopView().directories || []).filter(
+      (row) => (row.capabilities || []).indexOf("fs-write") >= 0
+    );
+    if (!writable.length) {
+      toast("没有授予 fs-write 的目标目录。");
+      return;
+    }
+    const host = document.createElement("div");
+    host.innerHTML = `<div class="sheet">
+      <div class="form-row"><label for="deskMoveGrant">目标目录</label><select class="field" id="deskMoveGrant">${writable
+        .map(
+          (row) =>
+            `<option value="${escapeHtml(row.grant_id || "")}">${escapeHtml(
+              row.path || ""
+            )}</option>`
+        )
+        .join("")}</select></div>
+      <div class="form-row"><label for="deskMovePath">相对路径</label><input class="field mono" id="deskMovePath" placeholder="archive/report.md"></div>
+      <div class="hint">这里只生成移动提案，仍需回到对话确认；目标已存在或跨卷会在提案阶段拒绝。</div>
+    </div>`;
+    const body = host.firstChild;
+    const ok = await CompanionDialog.form(
+      "选择目标授权目录并填写目录内相对路径。",
+      body,
+      { title: "移动文件", okText: "生成提案" }
+    );
+    if (!ok) return;
+    const result = await desktopCommand(
+      {
+        action: "move_file",
+        file_ref: fileRef,
+        target_grant_id: body.querySelector("#deskMoveGrant").value,
+        target_rel_path: body.querySelector("#deskMovePath").value,
+      }
+    );
+    if (result) {
+      toast(
+        result.auto_executed
+          ? (result.execution || {}).summary || "文件已移动"
+          : "移动提案已生成，回到对话确认"
+      );
+    }
   }
 
   function settingsView() {
@@ -1258,6 +1842,7 @@
     const current = String(permissions.current || values.tool_permission || "balanced");
     const tiers = (permissions.tiers || []).map((tier) => ({ value: tier.value, label: tier.label }));
     const diag = view.diagnostics || {};
+    const execution = diag.last_execution || {};
     return wrapPanel(
       "advanced",
       `<details class="group" open>
@@ -1278,6 +1863,15 @@
           }</div>
           <div class="k">备份</div><div class="v">${Number(diag.backups) || 0} 份${
             diag.latest_backup ? " · 最近 " + escapeHtml(diag.latest_backup) : ""
+          }</div>
+          <div class="k">最近文件执行</div><div class="v">${
+            execution.status
+              ? escapeHtml(
+                  execution.status +
+                    (execution.tool_name ? " · " + execution.tool_name : "") +
+                    (execution.error ? " · " + execution.error : "")
+                )
+              : "本次启动后还没有执行记录"
           }</div>
         </div>
         <div class="hint">路径可以直接选中复制。程序目前没有写日志文件，所以这里给的是已经存在的事实：库、锁与备份。完整自检请在终端运行 <code>python doctor.py</code>。</div>
@@ -1480,12 +2074,398 @@
     await refresh();
   }
 
+  function lines(value) {
+    return String(value || "")
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  function captureChainForm(chainId) {
+    const view = desktopView();
+    const current = (view.chains || []).filter(
+      (row) => row.chain_id === chainId
+    )[0];
+    const base = state.desktopChainDraft || current || {};
+    const triggerKind = ($("#deskChainTrigger") || {}).value || "auto";
+    let triggerConfig = {};
+    if (triggerKind === "argument") {
+      triggerConfig = {
+        arguments: lines(($("#deskChainArguments") || {}).value),
+      };
+    } else if (triggerKind === "uri") {
+      triggerConfig = { uri: ($("#deskChainUri") || {}).value || "" };
+    } else if (triggerKind === "api") {
+      triggerConfig = {
+        api_app_id: ($("#deskChainApiApp") || {}).value || "",
+        arguments: lines(($("#deskChainApiArguments") || {}).value),
+      };
+    } else if (triggerKind === "uia") {
+      triggerConfig = {
+        window_title_contains:
+          ($("#deskChainUiaWindowTitle") || {}).value || "",
+        window_class: ($("#deskChainUiaWindowClass") || {}).value || "",
+        automation_id:
+          ($("#deskChainUiaAutomationId") || {}).value || "",
+        control_name: ($("#deskChainUiaControlName") || {}).value || "",
+        control_type:
+          ($("#deskChainUiaControlType") || {}).value || "",
+      };
+    }
+    return {
+      ...base,
+      chain_id: chainId || "",
+      name: ($("#deskChainName") || {}).value || "",
+      starter_app_id: ($("#deskChainStarter") || {}).value || "",
+      target_app_id: ($("#deskChainTarget") || {}).value || "",
+      trigger_kind: triggerKind,
+      trigger_config: triggerConfig,
+      detection_rules: {
+        executable_path: (base.detection_rules || {}).executable_path || "",
+        process_name: (base.detection_rules || {}).process_name || "",
+        reuse_existing: Boolean(
+          $("#deskChainReuse") && $("#deskChainReuse").checked
+        ),
+        require_descendant: Boolean(
+          $("#deskChainDescendant") && $("#deskChainDescendant").checked
+        ),
+        require_window: Boolean(
+          $("#deskChainWindow") && $("#deskChainWindow").checked
+        ),
+        window_title_contains: lines(
+          ($("#deskChainWindowTitle") || {}).value
+        ),
+        window_class: lines(($("#deskChainWindowClass") || {}).value),
+      },
+      readiness_rules: {
+        timeout_seconds: Number(
+          ($("#deskChainTimeout") || {}).value || 30
+        ),
+        poll_interval_seconds: 0.25,
+      },
+    };
+  }
+
+  function applyTriggerVisibility() {
+    const select = $("#deskChainTrigger");
+    if (!select) return;
+    el.content.querySelectorAll("[data-trigger-field]").forEach((node) => {
+      node.hidden = node.dataset.triggerField !== select.value;
+    });
+  }
+
+  async function handleDesktopAction(event) {
+    const tab = event.target.closest("[data-desk-tab]");
+    if (tab) {
+      state.desktopTab = tab.dataset.deskTab;
+      render();
+      return true;
+    }
+    const button = event.target.closest("[data-desk-act]");
+    if (!button) return false;
+    const action = button.dataset.deskAct;
+    if (action === "grant-directory") {
+      const path = ($("#deskGrantPath") || {}).value || "";
+      const capabilities = Array.from(
+        el.content.querySelectorAll(".cap-grid input[type=checkbox]:checked")
+      ).map((node) => node.value);
+      if (!path.trim()) {
+        toast("先输入要授权的目录绝对路径。");
+        return true;
+      }
+      await desktopCommand(
+        {
+          action: "grant_directory",
+          path: path.trim(),
+          capabilities: capabilities,
+          allow_sensitive: Boolean(
+            $("#deskSensitive") && $("#deskSensitive").checked
+          ),
+        },
+        "目录已授权，索引会在后台开始"
+      );
+      return true;
+    }
+    if (action === "revoke-directory") {
+      const ok = await CompanionDialog.confirm(
+        "撤销后，模型和文件工具会立即失去这个目录的权限；目录里的文件不会被删除。",
+        { title: "撤销目录授权？", okText: "确认撤销", danger: true }
+      );
+      if (ok) {
+        await desktopCommand(
+          { action: "revoke_directory", grant_id: button.dataset.id },
+          "目录授权已撤销"
+        );
+      }
+      return true;
+    }
+    if (action === "reindex-directory") {
+      await desktopCommand(
+        { action: "reindex_directory", grant_id: button.dataset.id },
+        "已安排重建索引"
+      );
+      return true;
+    }
+    if (action === "search-files") {
+      await desktopCommand({
+        action: "search_files",
+        query: ($("#deskFileQuery") || {}).value || "",
+        limit: 12,
+      });
+      return true;
+    }
+    if (action === "open-file") {
+      await desktopCommand(
+        { action: "open_file", file_ref: button.dataset.ref },
+        "已交给系统默认程序打开"
+      );
+      return true;
+    }
+    if (action === "delete-file") {
+      const ok = await CompanionDialog.confirm(
+        "这将生成一张“移入系统回收站”的确认卡；设置页不会直接删除文件。",
+        { title: "生成删除提案？", okText: "生成提案", danger: true }
+      );
+      if (ok) {
+        await desktopCommand(
+          { action: "delete_file", file_ref: button.dataset.ref },
+          "删除提案已生成，回到对话确认"
+        );
+      }
+      return true;
+    }
+    if (action === "move-file") {
+      await moveDesktopFile(button.dataset.ref);
+      return true;
+    }
+    if (action === "scan-apps") {
+      toast("正在扫描开始菜单与 App Paths…");
+      await desktopCommand({ action: "scan_apps" }, "应用扫描完成");
+      return true;
+    }
+    if (action === "allow-app") {
+      await desktopCommand(
+        { action: "allow_app", app_id: button.dataset.id },
+        "已登记并允许启动"
+      );
+      return true;
+    }
+    if (action === "revoke-app") {
+      const ok = await CompanionDialog.confirm(
+        "撤销只删除启动授权，不会关闭已经启动的进程，也不会删除应用目录里的记录。",
+        { title: "撤销启动授权？", okText: "确认撤销", danger: true }
+      );
+      if (ok) {
+        await desktopCommand(
+          { action: "revoke_app", grant_id: button.dataset.id },
+          "启动授权已撤销"
+        );
+      }
+      return true;
+    }
+    if (action === "register-app") {
+      await desktopCommand(
+        {
+          action: "register_app",
+          name: ($("#deskAppName") || {}).value || "",
+          target: ($("#deskAppTarget") || {}).value || "",
+          arguments: ($("#deskAppArgs") || {}).value || "",
+          working_dir: ($("#deskAppCwd") || {}).value || "",
+        },
+        "应用已登记并允许启动"
+      );
+      return true;
+    }
+    if (action === "save-chain") {
+      const draft = captureChainForm(button.dataset.id || "");
+      if (!draft.name || !draft.starter_app_id || !draft.target_app_id) {
+        toast("名称、起点和目标应用都要填写。");
+        return true;
+      }
+      if (draft.starter_app_id === draft.target_app_id) {
+        toast("起点和目标必须是两个不同应用。");
+        return true;
+      }
+      const result = await desktopCommand(
+        { action: "save_chain", ...draft },
+        draft.chain_id ? "启动链修改已保存" : "启动链已保存"
+      );
+      if (result) {
+        state.desktopEditingChain = "";
+        state.desktopChainDraft = null;
+        state.desktopDetection = null;
+        render();
+      }
+      return true;
+    }
+    if (action === "edit-chain") {
+      const row = (desktopView().chains || []).filter(
+        (item) => item.chain_id === button.dataset.id
+      )[0];
+      if (!row) return true;
+      state.desktopEditingChain = row.chain_id;
+      state.desktopChainDraft = { ...row };
+      state.desktopDetection = null;
+      render();
+      return true;
+    }
+    if (action === "cancel-edit-chain") {
+      state.desktopEditingChain = "";
+      state.desktopChainDraft = null;
+      state.desktopDetection = null;
+      render();
+      return true;
+    }
+    if (action === "detect-chain") {
+      const chainId = button.dataset.id;
+      const row = (desktopView().chains || []).filter(
+        (item) => item.chain_id === chainId
+      )[0];
+      state.desktopEditingChain = chainId;
+      state.desktopChainDraft = row ? { ...row } : null;
+      await desktopCommand({
+        action: "detect_chain_targets",
+        chain_id: chainId,
+      });
+      return true;
+    }
+    if (action === "use-detected-target") {
+      const detection = state.desktopDetection || {};
+      const candidate = (detection.candidates || []).filter(
+        (row) => String(row.pid) === String(button.dataset.pid)
+      )[0];
+      if (!candidate) return true;
+      const window = (candidate.windows || [])[0] || {};
+      const base = state.desktopChainDraft || captureChainForm(
+        state.desktopEditingChain
+      );
+      state.desktopChainDraft = {
+        ...base,
+        detection_rules: {
+          ...(base.detection_rules || {}),
+          executable_path: candidate.exe_path || "",
+          process_name: candidate.name || "",
+          require_window: Boolean(window.title),
+          window_title_contains: window.title ? [window.title] : [],
+          window_class: window.class_name ? [window.class_name] : [],
+        },
+      };
+      state.desktopDetection = null;
+      render();
+      toast("已把该实例写入检测规则，保存后生效。");
+      return true;
+    }
+    if (action === "start-recording") {
+      const starter = ($("#deskRecordStarter") || {}).value || "";
+      if (!starter) {
+        toast("先选择已允许启动的中转应用。");
+        return true;
+      }
+      await desktopCommand(
+        { action: "start_recording", starter_app_id: starter },
+        "录制已开始，现在手动启动一次目标应用"
+      );
+      return true;
+    }
+    if (action === "refresh-recording") {
+      await desktopCommand({
+        action: "refresh_recording",
+        recording_id: ((desktopView().recording || {}).recording_id || ""),
+      });
+      return true;
+    }
+    if (action === "cancel-recording") {
+      await desktopCommand(
+        {
+          action: "cancel_recording",
+          recording_id: ((desktopView().recording || {}).recording_id || ""),
+        },
+        "录制已取消"
+      );
+      return true;
+    }
+    if (action === "select-record-candidate") {
+      const recording = desktopView().recording || {};
+      const candidate = (recording.candidates || [])[
+        Number(button.dataset.index || 0)
+      ];
+      if (!candidate || !candidate.app_id) {
+        toast("这个进程还不在应用目录里，先在“应用目录”登记并允许启动。");
+        return true;
+      }
+      const starter = (desktopView().apps || []).filter(
+        (row) => row.app_id === recording.starter_app_id
+      )[0] || {};
+      const window = (candidate.windows || [])[0] || {};
+      state.desktopEditingChain = "";
+      state.desktopChainDraft = {
+        chain_id: "",
+        name: `${starter.name || "中转应用"} → ${candidate.app_name || candidate.name}`,
+        starter_app_id: recording.starter_app_id || "",
+        target_app_id: candidate.app_id,
+        trigger_kind: "auto",
+        trigger_config: {},
+        detection_rules: {
+          executable_path: candidate.exe_path || "",
+          process_name: candidate.process_name || "",
+          reuse_existing: false,
+          require_descendant: false,
+          require_window: Boolean(window.title),
+          window_title_contains: window.title ? [window.title] : [],
+          window_class: window.class_name ? [window.class_name] : [],
+        },
+        readiness_rules: {
+          timeout_seconds: 30,
+          poll_interval_seconds: 0.25,
+        },
+      };
+      state.desktopDetection = null;
+      state.desktopTab = "chains";
+      render();
+      toast("目标实例已带入启动链表单，请检查并保存。");
+      return true;
+    }
+    if (action === "toggle-chain") {
+      await desktopCommand(
+        {
+          action: "toggle_chain",
+          chain_id: button.dataset.id,
+          enabled: button.dataset.enabled !== "1",
+        },
+        button.dataset.enabled === "1" ? "启动链已停用" : "启动链已启用"
+      );
+      return true;
+    }
+    if (action === "delete-chain") {
+      const ok = await CompanionDialog.confirm(
+        "删除启动链配置不会退出任何已经启动的进程。",
+        { title: "删除启动链？", okText: "确认删除", danger: true }
+      );
+      if (ok) {
+        await desktopCommand(
+          { action: "delete_chain", chain_id: button.dataset.id },
+          "启动链已删除"
+        );
+      }
+      return true;
+    }
+    if (action === "run-chain") {
+      await desktopCommand(
+        { action: "run_chain", chain_id: button.dataset.id },
+        "启动链提案已生成，回到对话确认"
+      );
+      return true;
+    }
+    return false;
+  }
+
   const PANELS = {
-    memory: panelMemory,
+  memory: panelMemory,
     affect: panelAffect,
     persona: panelPersona,
     proactive: panelProactive,
     tasks: panelTasks,
+    desktop: panelDesktop,
     model: panelModel,
     rag: panelRag,
     mcp: panelMcp,
@@ -1508,11 +2488,13 @@
       renderList();
     }
     bindPanel();
+    applyTriggerVisibility();
   }
 
   function bindPanel() {
     const panel = el.content;
     panel.onclick = async (event) => {
+      if (await handleDesktopAction(event)) return;
       const back = event.target.closest("[data-back]");
       if (back) {
         state.panel = null;
@@ -1728,6 +2710,10 @@
     };
     panel.onchange = (event) => {
       const node = event.target;
+      if (node.id === "deskChainTrigger") {
+        applyTriggerVisibility();
+        return;
+      }
       if (node.id === "st-model") {
         applyModelWindow(node.value);
         return;
@@ -1816,6 +2802,7 @@
         // The asset folder is user-managed, so re-read it when the panel opens.
         if (state.panel === "background" || state.panel === "persona") await refresh();
         else if (state.panel === "mcp") await loadMcp();
+        else if (state.panel === "desktop") await loadDesktop();
         else if (["model", "rag", "memory", "advanced"].indexOf(state.panel) >= 0)
           await loadSettings();
         else render();

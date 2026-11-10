@@ -44,11 +44,20 @@ class StreamEvent:
 class LLMClient:
     """Small interface shared by remote and offline clients."""
 
-    def chat(self, messages, tools=None) -> LLMResponse:
+    supports_forced_tool_choice = False
+
+    def chat(self, messages, tools=None, tool_choice=None) -> LLMResponse:
         raise NotImplementedError
 
-    def stream_chat(self, messages, tools=None):
-        response = self.chat(messages, tools)
+    def stream_chat(self, messages, tools=None, tool_choice=None):
+        if tool_choice is None:
+            response = self.chat(messages, tools)
+        else:
+            response = self.chat(
+                messages,
+                tools,
+                tool_choice=tool_choice,
+            )
         if response.content:
             yield StreamEvent(kind="delta", text=response.content)
         yield StreamEvent(kind="done", response=response)
@@ -57,7 +66,7 @@ class LLMClient:
 class OfflineLLMClient(LLMClient):
     """Deterministic client so the framework can run without API credentials."""
 
-    def chat(self, messages, tools=None) -> LLMResponse:
+    def chat(self, messages, tools=None, tool_choice=None) -> LLMResponse:
         user_text = ""
         for message in reversed(messages):
             if message.role == "tool":
@@ -150,7 +159,9 @@ class RemoteLLMClient(LLMClient):
             request["top_p"] = round(top_p, 4)
         return request
 
-    def chat(self, messages, tools=None) -> LLMResponse:
+    supports_forced_tool_choice = True
+
+    def chat(self, messages, tools=None, tool_choice=None) -> LLMResponse:
         request: Dict[str, Any] = {
             "model": self.config.model,
             "messages": [message.to_api_dict() for message in messages],
@@ -159,7 +170,7 @@ class RemoteLLMClient(LLMClient):
         self._apply_sampling(request)
         if tools:
             request["tools"] = tools
-            request["tool_choice"] = "auto"
+            request["tool_choice"] = tool_choice or "auto"
 
         response = self.client.chat.completions.create(**request)
         message = response.choices[0].message
@@ -181,7 +192,7 @@ class RemoteLLMClient(LLMClient):
             tool_calls=parsed_calls,
         )
 
-    def stream_chat(self, messages, tools=None):
+    def stream_chat(self, messages, tools=None, tool_choice=None):
         request: Dict[str, Any] = {
             "model": self.config.model,
             "messages": [message.to_api_dict() for message in messages],
@@ -191,7 +202,7 @@ class RemoteLLMClient(LLMClient):
         self._apply_sampling(request)
         if tools:
             request["tools"] = tools
-            request["tool_choice"] = "auto"
+            request["tool_choice"] = tool_choice or "auto"
 
         stream = None
         content_parts: List[str] = []

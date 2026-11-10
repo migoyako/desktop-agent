@@ -1026,7 +1026,10 @@ class SettingsZoneContractTests(unittest.TestCase):
         self.assertIn("允许这次调用", card)
         self.assertIn('["服务器", remoteServer(preview)]', card)
         self.assertIn("argumentLines(preview.arguments)", card)
-        self.assertIn("回执已写入审计日志，导出时不含凭据。", card)
+        self.assertIn(
+            'remote ? "导出时不含凭据。" : "结果以执行器回执为准。"',
+            card,
+        )
         self.assertIn("外部调用不提供撤销，点击只会说明原因。", card)
         self.assertIn('data-undo="${escapeHtml(undoId)}" aria-disabled="true"', card)
         self.assertIn("view.warning", card)
@@ -1099,6 +1102,42 @@ class SettingsZoneContractTests(unittest.TestCase):
         self.assertIn("overflow-wrap: anywhere", rule_block(css, ".diag-path"))
         self.assertIn("overflow-wrap: anywhere", rule_block(css, ".panel .hint"))
         self.assertIn("font-size: var(--fs-body)", rule_block(css, ".group > summary"))
+
+
+class DesktopCapabilityContractTests(unittest.TestCase):
+    def test_settings_exposes_all_desktop_capability_tabs(self):
+        script = asset("settings.js")
+        self.assertIn('{ id: "desktop", name: "桌面", desc:', script)
+        self.assertIn('desktop: { cat: "desktop", name: "桌面能力"', script)
+        for tab in ("directories", "files", "apps", "chains"):
+            self.assertIn('["{}",'.format(tab), script)
+        for action in (
+            "grant-directory",
+            "search-files",
+            "delete-file",
+            "move-file",
+            "register-app",
+            "save-chain",
+            "run-chain",
+        ):
+            self.assertIn('"{}"'.format(action), script)
+
+    def test_desktop_cards_use_the_shared_approval_language(self):
+        script = asset("app.js")
+        self.assertIn('"app-launch": "启动应用"', script)
+        self.assertIn('"launch-chain": "启动链"', script)
+        self.assertIn("data.desktop_cards", script)
+        self.assertIn("允许这次删除", script)
+        self.assertIn("允许启动链", script)
+
+    def test_desktop_layout_wraps_instead_of_forcing_fixed_heights(self):
+        css = asset("settings.css")
+        item = rule_block(css, ".desk-item")
+        self.assertIn("display: flex", item)
+        self.assertIn("gap: var(--sp-lg)", item)
+        self.assertIn("flex-wrap: wrap", rule_block(css, ".desk-actions"))
+        self.assertIn("flex-wrap: wrap", rule_block(css, ".desk-tabs"))
+        self.assertIn("min-height: var(--ctl-segment)", rule_block(css, ".desk-tabs button"))
 
 
 if __name__ == "__main__":

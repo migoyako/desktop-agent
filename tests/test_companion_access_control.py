@@ -80,8 +80,8 @@ class GrantFixture(unittest.TestCase):
 
 
 class SchemaTest(GrantFixture):
-    def test_fresh_database_is_v13_with_both_tables(self):
-        self.assertEqual(SCHEMA_VERSION, 13)
+    def test_fresh_database_has_grants_and_leases(self):
+        self.assertEqual(SCHEMA_VERSION, 17)
         tables = {
             row[0]
             for row in self.raw(
@@ -99,6 +99,7 @@ class SchemaTest(GrantFixture):
             {
                 "idx_access_grants_path",
                 "idx_access_grants_status",
+                "idx_access_grants_workspace_selected",
                 "idx_grant_leases_task",
                 "idx_grant_leases_active",
             }
@@ -293,7 +294,7 @@ class GrantingTest(GrantFixture):
         flagged = [
             row
             for row in self.rows("access_grants")
-            if row["legacy_workspace"]
+            if row["legacy_workspace"] and row["status"] == GRANT_ACTIVE
         ]
         self.assertEqual(len(flagged), 1)
         self.assertEqual(flagged[0]["path"], str(other))
@@ -301,6 +302,56 @@ class GrantingTest(GrantFixture):
         self.store.clear_workspace()
         self.assertIsNone(self.store.get_workspace())
         self.store.clear_workspace()  # idempotent
+
+    def test_selecting_workspace_does_not_downgrade_an_explicit_grant(self):
+        grant = self.access.grant_directory(
+            self.projects,
+            ["fs-read", "fs-search", "fs-write", "fs-delete"],
+        )
+        selected = self.store.set_workspace(str(self.projects))
+        self.assertEqual(selected["grant_id"], grant.grant_id)
+        self.assertTrue(selected["workspace_selected"])
+        self.assertFalse(selected["legacy_workspace"])
+        self.assertEqual(
+            set(selected["capabilities"]),
+            {"fs-read", "fs-search", "fs-write", "fs-delete"},
+        )
+        self.assertEqual(self.store.get_workspace(), str(self.projects))
+        self.assertIsNotNone(
+            self.access.grant_for_capability(self.projects, "fs-delete")[0]
+        )
+
+    def test_clearing_workspace_keeps_the_explicit_grant(self):
+        grant = self.access.grant_directory(
+            self.projects, ["fs-read", "fs-search", "fs-write", "fs-delete"]
+        )
+        self.store.set_workspace(str(self.projects))
+        self.store.clear_workspace()
+        self.assertIsNone(self.store.get_workspace())
+        current = self.access.get_grant(grant.grant_id)
+        self.assertEqual(current.status, GRANT_ACTIVE)
+        self.assertFalse(current.workspace_selected)
+        self.assertFalse(current.legacy_workspace)
+        self.assertEqual(
+            set(current.capabilities),
+            {"fs-read", "fs-search", "fs-write", "fs-delete"},
+        )
+
+    def test_regranting_the_selected_workspace_enables_generic_actions(self):
+        selected = self.store.set_workspace(str(self.projects))
+        self.assertTrue(selected["legacy_workspace"])
+        explicit = self.access.grant_directory(
+            self.projects,
+            ["fs-read", "fs-search", "fs-write", "fs-delete"],
+        )
+        self.assertEqual(explicit.grant_id, selected["grant_id"])
+        self.assertTrue(explicit.workspace_selected)
+        self.assertFalse(explicit.legacy_workspace)
+        self.assertEqual(
+            self.access.grants_for_capability("fs-delete", exclude_legacy=True),
+            [explicit],
+        )
+        self.assertEqual(self.store.get_workspace(), str(self.projects))
 
 
 class IdentityTest(GrantFixture):
@@ -601,11 +652,14 @@ class PendingProposalTest(GrantFixture):
             offline=True,
         )
         runtime.select_workspace(str(self.projects))
+        runtime.apply_settings({"tool_permission": "strict"})
+        runtime.set_mode(AgentMode.WORK)
         result = runtime.handle_message(
             "搜索 Python Agent 并保存为笔记", AgentMode.WORK
         )
         proposal = result["proposal"]
         self.assertIsNotNone(proposal)
+        runtime.apply_settings({"tool_permission": "balanced"})
 
         self.store.clear_workspace()
         rejected = runtime.confirm_proposal(proposal.action_id, AgentMode.WORK)

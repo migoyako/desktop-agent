@@ -13,7 +13,7 @@ from agent_framework.companion.models import (
     confirmation_digest,
     new_id,
 )
-from agent_framework.companion.store import CompanionStore
+from agent_framework.companion.store import CompanionStore, SCHEMA_VERSION
 
 
 class CompanionStoreTest(unittest.TestCase):
@@ -217,7 +217,7 @@ class CompanionStoreTest(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-        self.assertEqual(version, 13)
+        self.assertEqual(version, SCHEMA_VERSION)
         self.assertTrue({"title", "pinned_at", "unread"} <= columns)
         self.assertIn("session_drafts", tables)
         store.ensure_session("chat_a", AgentMode.CHAT)

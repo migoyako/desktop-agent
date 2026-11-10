@@ -773,6 +773,135 @@ body {
   flex-wrap: wrap;
 }
 
+/* Desktop capability settings: the same card language as approvals, but
+   arranged for repeated scanning and status comparison. */
+.desk-tabs {
+  display: flex;
+  gap: var(--sp-xs);
+  flex-wrap: wrap;
+  padding: var(--sp-xs);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--page);
+}
+
+.desk-tabs button {
+  min-height: var(--ctl-segment);
+  padding: 0 var(--sp-lg);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: var(--fs-ui);
+}
+
+.desk-tabs button.on {
+  border-color: var(--accent);
+  background: var(--selected);
+  color: var(--accent-soft);
+}
+
+.desk-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-md);
+  padding: var(--sp-lg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--page);
+}
+
+.desk-form .section-title {
+  margin: 0;
+}
+
+.cap-grid {
+  display: flex;
+  gap: var(--sp-md);
+  flex-wrap: wrap;
+}
+
+.cap-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-xs);
+  min-height: var(--ctl-ghost);
+  color: var(--muted);
+  font-size: var(--fs-ui);
+}
+
+.cap-check input {
+  accent-color: var(--accent);
+}
+
+.desk-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-sm);
+}
+
+.desk-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-lg);
+  padding: var(--sp-md) var(--sp-lg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--page);
+}
+
+.desk-item.compact {
+  padding: var(--sp-sm) var(--sp-md);
+}
+
+.desk-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-xs);
+}
+
+.desk-item .name {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-ui);
+}
+
+.desk-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-xs);
+  flex-wrap: wrap;
+}
+
+.desk-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-xs);
+  flex-wrap: wrap;
+}
+
+.desk-actions button {
+  min-height: var(--ctl-ghost);
+  padding: 0 var(--sp-md);
+}
+
+@media (max-width: 720px) {
+  .desk-item {
+    flex-direction: column;
+  }
+
+  .desk-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
+
 .foot {
   min-height: calc(var(--ctl-ghost) + var(--sp-md));
   flex: none;

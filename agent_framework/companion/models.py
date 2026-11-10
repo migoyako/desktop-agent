@@ -54,10 +54,13 @@ class RiskLevel(str, Enum):
     SAFE = "safe"
     FS_READ = "fs-read"
     FS_WRITE = "fs-write"
+    FS_DELETE = "fs-delete"
     SHELL = "shell"
     NETWORK = "network"
     INPUT_CONTROL = "input-control"
     EXTERNAL = "external"
+    APP_LAUNCH = "app-launch"
+    LAUNCH_CHAIN = "launch-chain"
 
 
 class ProposalStatus(str, Enum):
@@ -73,10 +76,23 @@ class ProposalStatus(str, Enum):
 
 # Which code runs a confirmed proposal. "note" is the original filesystem path:
 # workspace snapshot, backup, undo. "mcp" only sends tools/call, so its receipt is
-# never undoable and it must not touch the workspace guard at all.
+# never undoable and it must not touch the workspace guard at all. "file" is the
+# general authorised-directory executor and narrows the note contract per operation
+# (write / copy / move / recycle-bin delete) instead of reusing the note whitelist.
+# "app" launches a registered application only; the command line comes from the
+# catalog row, never from the model, so it cannot be used to run arbitrary code.
 EXECUTOR_NOTE = "note"
+EXECUTOR_FILE = "file"
 EXECUTOR_MCP = "mcp"
-PROPOSAL_EXECUTORS = (EXECUTOR_NOTE, EXECUTOR_MCP)
+EXECUTOR_APP = "app"
+EXECUTOR_CHAIN = "chain"
+PROPOSAL_EXECUTORS = (
+    EXECUTOR_NOTE,
+    EXECUTOR_FILE,
+    EXECUTOR_MCP,
+    EXECUTOR_APP,
+    EXECUTOR_CHAIN,
+)
 
 
 @dataclass

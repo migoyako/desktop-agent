@@ -286,6 +286,8 @@ class StreamingRuntimeTest(unittest.TestCase):
 
     def test_search_proposal_branch_streams_answer(self):
         runtime = self.runtime(OfflineLLMClient(), offline=True)
+        runtime.apply_settings({"tool_permission": "strict"})
+        runtime.set_mode(AgentMode.WORK)
         events = list(
             runtime.stream_message(
                 "搜索 Python Agent 并保存为笔记",
@@ -383,12 +385,15 @@ class DesktopStatusTest(unittest.TestCase):
         self.assertEqual(status["source"], "idle")
 
     def test_pending_proposal_then_receipt_states(self):
+        self.runtime.apply_settings({"tool_permission": "strict"})
+        self.runtime.set_mode(AgentMode.WORK)
         result = self.runtime.handle_message(
             "搜索 Python Agent 并保存为笔记",
             AgentMode.WORK,
         )
         proposal = result["proposal"]
         self.assertIsNotNone(proposal)
+        self.runtime.apply_settings({"tool_permission": "balanced"})
 
         status = self.runtime.desktop_status()
         self.assertEqual(status["state"], "awaiting_confirmation")
@@ -408,6 +413,7 @@ class DesktopStatusTest(unittest.TestCase):
         self.assertEqual(status["label"], "已撤销")
 
     def test_unknown_receipt_is_reported(self):
+        self.runtime.apply_settings({"tool_permission": "strict"})
         result = self.runtime.handle_message(
             "搜索 Python Agent 并保存为笔记",
             AgentMode.WORK,

@@ -32,6 +32,7 @@ class CompanionPolicyTest(unittest.TestCase):
         for risk in (
             RiskLevel.FS_READ,
             RiskLevel.FS_WRITE,
+            RiskLevel.FS_DELETE,
             RiskLevel.NETWORK,
             RiskLevel.SHELL,
             RiskLevel.INPUT_CONTROL,
@@ -39,14 +40,14 @@ class CompanionPolicyTest(unittest.TestCase):
         ):
             self.assertEqual(decide_tool_policy(AgentMode.CHAT, risk), DENY)
 
-    def test_work_requires_write_confirmation(self):
+    def test_work_executes_authorized_writes_without_a_second_prompt(self):
         self.assertEqual(
             decide_tool_policy(AgentMode.WORK, RiskLevel.NETWORK),
             ALLOW,
         )
         self.assertEqual(
             decide_tool_policy(AgentMode.WORK, RiskLevel.FS_WRITE),
-            ASK,
+            ALLOW,
         )
         self.assertEqual(
             decide_tool_policy(AgentMode.WORK, RiskLevel.SHELL),
@@ -82,9 +83,9 @@ class PermissionTierTest(unittest.TestCase):
                     decide_tool_policy(mode, RiskLevel.INPUT_CONTROL, PERMISSION_STRICT),
                     DENY,
                 )
-                # 写入仍然要确认 —— 它本来就要弹卡片，保守档不该抢走这一步。
+                # 默认写入已直接执行；保守档不再保留确认，而是直接禁用。
                 self.assertEqual(
-                    decide_tool_policy(mode, RiskLevel.FS_WRITE, PERMISSION_STRICT), ASK
+                    decide_tool_policy(mode, RiskLevel.FS_WRITE, PERMISSION_STRICT), DENY
                 )
 
     def test_strict_leaves_read_and_network_alone(self):
@@ -103,6 +104,22 @@ class PermissionTierTest(unittest.TestCase):
             decide_tool_policy(AgentMode.WORK, RiskLevel.FS_WRITE, PERMISSION_RELAXED),
             ALLOW,
         )
+        # 「信任」放行的是能就地回滚的本机写入。回收站删除看着可撤销，实际是把文件
+        # 搬进一个用户不常打开的目录，所以它永远留在确认这一步。
+        for mode in (AgentMode.WORK, AgentMode.EXECUTE):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    decide_tool_policy(mode, RiskLevel.FS_DELETE, PERMISSION_RELAXED),
+                    ASK,
+                )
+                self.assertEqual(
+                    decide_tool_policy(mode, RiskLevel.FS_DELETE, PERMISSION_STRICT),
+                    DENY,
+                )
+                self.assertEqual(
+                    decide_tool_policy(mode, RiskLevel.FS_DELETE),
+                    ASK,
+                )
         self.assertEqual(
             decide_tool_policy(AgentMode.EXECUTE, RiskLevel.SHELL, PERMISSION_RELAXED), ASK
         )
@@ -137,11 +154,17 @@ class PermissionTierTest(unittest.TestCase):
                         self.assertEqual(decide_tool_policy(mode, risk, tier), DENY)
 
     def test_confirmation_follows_the_tier(self):
-        self.assertTrue(
+        self.assertFalse(
             requires_confirmation(AgentMode.WORK, RiskLevel.FS_WRITE, PERMISSION_STRICT)
         )
         self.assertFalse(
             requires_confirmation(AgentMode.WORK, RiskLevel.FS_WRITE, PERMISSION_RELAXED)
+        )
+        self.assertFalse(
+            requires_confirmation(AgentMode.WORK, RiskLevel.FS_WRITE, PERMISSION_BALANCED)
+        )
+        self.assertTrue(
+            requires_confirmation(AgentMode.WORK, RiskLevel.FS_DELETE, PERMISSION_BALANCED)
         )
         self.assertFalse(
             requires_confirmation(AgentMode.EXECUTE, RiskLevel.SHELL, PERMISSION_STRICT)

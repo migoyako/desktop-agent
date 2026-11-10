@@ -572,6 +572,51 @@ class WebAdapterTests(unittest.TestCase):
             and len(data["messages"]) >= 2
         )
 
+    def test_bridge_turn_returns_the_answer_synchronously(self):
+        status, payload = self.request(
+            "/api/bridge/turn", {"text": "你好", "mode": "chat"}
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("completed", payload["status"])
+        self.assertIn("离线演示模式", payload["answer"])
+        self.assertEqual("main", payload["session_id"])
+        self.assertTrue(payload["run_id"])
+        rows = self.runtime.store.list_messages("main", limit=10)
+        self.assertEqual(["user", "assistant"], [row["role"] for row in rows])
+        self.assertEqual(payload["answer"], rows[-1]["content"])
+
+    def test_bridge_turn_broadcasts_the_turn_to_ui_subscribers(self):
+        channel = self.adapter.subscribe()
+        try:
+            status, _ = self.request(
+                "/api/bridge/turn", {"text": "你好", "mode": "chat"}
+            )
+            self.assertEqual(200, status)
+            kinds = []
+            while True:
+                message = json.loads(channel.get(timeout=20))
+                if message["type"] == "turn":
+                    kinds.append(message["event"]["kind"])
+                if message["type"] == "refresh":
+                    break
+        finally:
+            self.adapter.unsubscribe(channel)
+        self.assertIn("delta", kinds)
+        self.assertEqual("done", kinds[-1])
+
+    def test_bridge_turn_rejects_empty_text(self):
+        status, payload = self.request("/api/bridge/turn", {"text": "   "})
+        self.assertEqual(200, status)
+        self.assertEqual("invalid", payload["status"])
+        self.assertEqual("消息不能为空。", payload["answer"])
+        self.assertEqual([], self.runtime.store.list_messages("main", limit=10))
+
+    def test_bridge_turn_requires_token(self):
+        status, _ = self.request(
+            "/api/bridge/turn", {"text": "你好"}, token="wrong-token"
+        )
+        self.assertEqual(403, status)
+
     def test_bootstrap_exposes_trailing_message_actions(self):
         bootstrap = self.run_turn()
         actions = bootstrap["message_actions"]

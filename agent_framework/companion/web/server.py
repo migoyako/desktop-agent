@@ -21,11 +21,23 @@ from .. import settings as app_settings
 from ..app.projection import build_context_view
 from ..assets import MAX_AVATAR_BYTES, AssetImportError
 from ..documents import DocumentError, MAX_DOC_BYTES, MAX_LIBRARY_BYTES
-from ..models import EXECUTOR_MCP, AgentMode, ProposalStatus, RiskLevel
+from ..models import (
+    EXECUTOR_APP,
+    EXECUTOR_CHAIN,
+    EXECUTOR_FILE,
+    EXECUTOR_MCP,
+    AgentMode,
+    ProposalStatus,
+    RiskLevel,
+)
+from ..path_safety import app_target_key
 from ..policy import (
+    ALLOW,
+    DENY,
     PERMISSION_HINTS,
     PERMISSION_LABELS,
     PERMISSION_TIERS,
+    decide_tool_policy,
     mode_label,
     resolve_permission_tier,
 )
@@ -332,6 +344,362 @@ class WebAdapter:
             "connected": False,
         }
 
+    def desktop_payload(self):
+        """One read model for the desktop-capability settings page.
+
+        The page deliberately receives service-layer facts, not UI-only copies:
+        grants, index state, app readiness and launch chains all come from the
+        tables that the executors check before acting.
+        """
+        runtime = self.runtime
+        directory_grants = self._safe(
+            lambda: runtime.directory_grants(status="active"), []
+        )
+        index_rows = self._safe(
+            lambda: runtime.file_index_status().get("directories", []), []
+        )
+        index_by_grant = {
+            str(row.get("grant_id") or ""): row for row in index_rows
+        }
+        directories = []
+        for grant in directory_grants:
+            value = plain(grant)
+            state = index_by_grant.get(str(value.get("grant_id") or ""), {})
+            value.update(
+                {
+                    "capabilities": list(value.get("capabilities") or []),
+                    "index_status": str(state.get("status") or "idle"),
+                    "files_indexed": int(state.get("files_indexed") or 0),
+                    "files_skipped": int(state.get("files_skipped") or 0),
+                    "indexing": bool(state.get("indexing")),
+                    "index_error": str(state.get("last_error") or ""),
+                    "indexed_at": str(state.get("indexed_at") or ""),
+                }
+            )
+            directories.append(value)
+
+        app_grants = self._safe(
+            lambda: runtime.access.list_grants(
+                status="active", resource_kind="app"
+            ),
+            [],
+        )
+        grants_by_target = {
+            app_target_key(str(grant.path or "")): grant for grant in app_grants
+        }
+        apps = []
+        for row in self._safe(lambda: runtime.store.list_app_catalog(limit=500), []):
+            grant = grants_by_target.get(
+                app_target_key(str(row.get("target") or ""))
+            )
+            apps.append(
+                {
+                    "app_id": str(row.get("app_id") or ""),
+                    "name": str(row.get("name") or ""),
+                    "target": str(row.get("target") or ""),
+                    "target_kind": str(row.get("target_kind") or ""),
+                    "source": str(row.get("source") or ""),
+                    "publisher": str(row.get("publisher") or ""),
+                    "signature_state": str(row.get("signature_state") or ""),
+                    "file_version": str(row.get("file_version") or ""),
+                    "status": str(row.get("status") or ""),
+                    "last_error": str(row.get("last_error") or ""),
+                    "identity_ready": bool(row.get("identity_digest"))
+                    or str(row.get("target_kind") or "") != "exe",
+                    "grant_id": str(grant.grant_id) if grant is not None else "",
+                    "allowed": grant is not None,
+                }
+            )
+
+        chain_rows = self._safe(
+            lambda: runtime.chains.list_chains(), []
+        )
+        runnable_chain_ids = {
+            str(row.get("chain_id") or "")
+            for row in self._safe(
+                lambda: runtime.chains.runnable_chains(), []
+            )
+        }
+        app_names = {
+            str(row.get("app_id") or ""): str(row.get("name") or "")
+            for row in apps
+        }
+        chains = []
+        for row in chain_rows:
+            value = dict(row)
+            value["starter_name"] = app_names.get(
+                str(row.get("starter_app_id") or ""), ""
+            )
+            value["target_name"] = app_names.get(
+                str(row.get("target_app_id") or ""), ""
+            )
+            value["runnable"] = str(row.get("chain_id") or "") in runnable_chain_ids
+            chains.append(value)
+
+        uia = getattr(runtime, "uia", None)
+        uia_available, uia_reason = self._safe(
+            lambda: uia.available(),
+            (False, "UIA 适配器未初始化。"),
+        )
+        recording = self._safe(
+            lambda: runtime.chains.recording_status(),
+            {"active": False, "candidates": [], "candidate_count": 0},
+        )
+
+        return {
+            "directories": directories,
+            "apps": apps,
+            "chains": chains,
+            "uia": {
+                "available": bool(uia_available),
+                "reason": str(uia_reason or ""),
+                "version": str(
+                    self._safe(lambda: uia.version(), "") or ""
+                ),
+            },
+            "recording": recording,
+            "trigger_kinds": [
+                {"value": "auto", "label": "自动启动"},
+                {"value": "argument", "label": "固定参数"},
+                {"value": "uri", "label": "URI Scheme"},
+                {"value": "api", "label": "已登记 API 入口"},
+                {"value": "uia", "label": "UI Automation"},
+                {"value": "manual", "label": "人工接管"},
+            ],
+            "summary": {
+                "directories": len(directories),
+                "catalog_files": self._safe(
+                    lambda: runtime.store.count_file_catalog(), 0
+                ),
+                "apps": len(apps),
+                "apps_allowed": len(
+                    [row for row in apps if row.get("allowed")]
+                ),
+                "chains": len(chains),
+                "chains_runnable": len(
+                    [row for row in chains if row.get("runnable")]
+                ),
+            },
+            "capabilities": [
+                {"value": "fs-read", "label": "读取"},
+                {"value": "fs-search", "label": "搜索"},
+                {"value": "fs-write", "label": "写入"},
+                {"value": "fs-delete", "label": "移入回收站"},
+                {"value": "fs-export", "label": "外部发送"},
+            ],
+            "limits": {
+                "files": 20,
+                "apps": 500,
+            },
+        }
+
+    def desktop_action(self, body):
+        """Commands used by the desktop-capability page.
+
+        File deletion and movement stop at proposal creation. The page never gets
+        a shortcut around the confirmation card or the execution ledger.
+        """
+        runtime = self.runtime
+        action = str(body.get("action") or "").strip()
+        result = {"action": action}
+        if action == "grant_directory":
+            grant = runtime.grant_directory(
+                str(body.get("path") or ""),
+                body.get("capabilities") or ["fs-read", "fs-search"],
+                allow_sensitive=bool(body.get("allow_sensitive")),
+            )
+            result["grant"] = plain(grant)
+        elif action == "revoke_directory":
+            grant = runtime.revoke_directory(str(body.get("grant_id") or ""))
+            result["grant"] = plain(grant)
+        elif action == "reindex_directory":
+            grant_id = str(body.get("grant_id") or "")
+            result["scheduled"] = runtime.file_index.schedule_index(grant_id)
+        elif action == "search_files":
+            query = str(body.get("query") or "")
+            search = runtime.file_index.search(
+                query,
+                limit=max(1, min(int(body.get("limit") or 12), 20)),
+                ext=str(body.get("ext") or ""),
+            )
+            search["query"] = query
+            result["search"] = search
+        elif action == "open_file":
+            result["opened"] = runtime.apps.open_ref(
+                str(body.get("file_ref") or "")
+            )
+        elif action == "delete_file":
+            proposal = runtime.files.create_delete_proposal(
+                session_id=runtime.session_id,
+                file_ref=str(body.get("file_ref") or ""),
+                mode=runtime.current_mode(),
+            )
+            runtime.store.create_proposal(proposal)
+            result["proposal"] = plain(proposal)
+        elif action == "move_file":
+            decision = decide_tool_policy(
+                runtime.current_mode(),
+                RiskLevel.FS_WRITE,
+                runtime.tool_permission,
+            )
+            if decision == DENY:
+                raise ValueError(
+                    "当前权限档位禁用文件写入，移动没有执行。"
+                )
+            proposal = runtime.files.create_move_proposal(
+                session_id=runtime.session_id,
+                file_ref=str(body.get("file_ref") or ""),
+                target_grant_id=str(body.get("target_grant_id") or ""),
+                target_rel_path=str(body.get("target_rel_path") or ""),
+                mode=runtime.current_mode(),
+            )
+            runtime.store.create_proposal(proposal)
+            if decision == ALLOW:
+                outcome = runtime.confirm_proposal(proposal.action_id)
+                receipt = (outcome or {}).get("receipt")
+                result["auto_executed"] = True
+                result["execution"] = {
+                    "status": getattr(receipt, "status", ""),
+                    "summary": getattr(receipt, "summary", ""),
+                    "receipt_id": getattr(receipt, "receipt_id", ""),
+                }
+            result["proposal"] = plain(proposal)
+        elif action == "scan_apps":
+            result["scan"] = runtime.app_catalog.scan()
+        elif action == "allow_app":
+            app_id = str(body.get("app_id") or "")
+            row = runtime.app_catalog.get(app_id)
+            if row is None:
+                raise ValueError("应用目录里找不到这一条。")
+            captured = runtime.app_catalog.capture_identity(app_id)
+            if not captured.get("captured") and str(
+                row.get("target_kind") or ""
+            ) == "exe":
+                raise ValueError(
+                    captured.get("reason") or "应用身份无法登记。"
+                )
+            current = captured.get("row") or row
+            grant = runtime.access.grant_app(str(current.get("target") or ""))
+            result["grant"] = plain(grant)
+        elif action == "revoke_app":
+            grant = runtime.access.revoke_grant(
+                str(body.get("grant_id") or "")
+            )
+            result["grant"] = plain(grant)
+        elif action == "register_app":
+            row = runtime.app_catalog.register_manual(
+                str(body.get("name") or ""),
+                str(body.get("target") or ""),
+                str(body.get("arguments") or ""),
+                str(body.get("working_dir") or ""),
+            )
+            captured = runtime.app_catalog.capture_identity(row["app_id"])
+            if not captured.get("captured") and str(
+                row.get("target_kind") or ""
+            ) == "exe":
+                raise ValueError(
+                    captured.get("reason") or "应用身份无法登记。"
+                )
+            current = captured.get("row") or row
+            grant = runtime.access.grant_app(str(current.get("target") or ""))
+            result["app"] = current
+            result["grant"] = plain(grant)
+        elif action == "save_chain":
+            detection = body.get("detection_rules")
+            if not isinstance(detection, dict):
+                detection = {
+                    "require_window": bool(body.get("require_window")),
+                    "require_descendant": bool(
+                        body.get("require_descendant")
+                    ),
+                }
+            readiness = body.get("readiness_rules")
+            if not isinstance(readiness, dict):
+                readiness = {
+                    "timeout_seconds": body.get("timeout_seconds") or 30,
+                    "poll_interval_seconds": body.get(
+                        "poll_interval_seconds"
+                    )
+                    or 0.25,
+                }
+            trigger_kind = str(body.get("trigger_kind") or "auto")
+            trigger_config = body.get("trigger_config")
+            if not isinstance(trigger_config, dict):
+                trigger_config = {}
+                if trigger_kind == "argument":
+                    trigger_config["arguments"] = body.get("arguments") or []
+                elif trigger_kind == "uri":
+                    trigger_config["uri"] = str(body.get("uri") or "")
+                elif trigger_kind == "api":
+                    trigger_config["api_app_id"] = str(
+                        body.get("api_app_id") or ""
+                    )
+                    trigger_config["arguments"] = (
+                        body.get("arguments") or []
+                    )
+                elif trigger_kind == "uia":
+                    trigger_config = {
+                        key: str(body.get(key) or "")
+                        for key in (
+                            "window_title_contains",
+                            "window_class",
+                            "automation_id",
+                            "control_name",
+                            "control_type",
+                        )
+                    }
+            chain = runtime.chains.save_chain(
+                str(body.get("name") or ""),
+                str(body.get("starter_app_id") or ""),
+                str(body.get("target_app_id") or ""),
+                chain_id=str(body.get("chain_id") or "") or None,
+                trigger_kind=trigger_kind,
+                trigger_config=trigger_config,
+                detection_rules=detection,
+                readiness_rules=readiness,
+            )
+            result["chain"] = chain
+        elif action == "start_recording":
+            result["recording"] = runtime.chains.start_recording(
+                str(body.get("starter_app_id") or "")
+            )
+        elif action == "refresh_recording":
+            result["recording"] = runtime.chains.recording_status(
+                str(body.get("recording_id") or "") or None
+            )
+        elif action == "cancel_recording":
+            result["cancelled"] = runtime.chains.cancel_recording(
+                str(body.get("recording_id") or "") or None
+            )
+            result["recording"] = runtime.chains.recording_status()
+        elif action == "detect_chain_targets":
+            result["detection"] = runtime.chains.detect_chain_targets(
+                str(body.get("chain_id") or "")
+            )
+        elif action == "toggle_chain":
+            chain = runtime.chains.set_enabled(
+                str(body.get("chain_id") or ""),
+                bool(body.get("enabled")),
+            )
+            result["chain"] = chain
+        elif action == "delete_chain":
+            result["removed"] = runtime.chains.delete_chain(
+                str(body.get("chain_id") or "")
+            )
+        elif action == "run_chain":
+            proposal = runtime.chains.create_proposal(
+                session_id=runtime.session_id,
+                term=str(body.get("chain_id") or ""),
+                mode=runtime.current_mode(),
+            )
+            runtime.store.create_proposal(proposal)
+            result["proposal"] = plain(proposal)
+        else:
+            raise ValueError("未知的桌面能力动作。")
+        self.broadcast({"type": "refresh"})
+        result["desktop"] = self.desktop_payload()
+        return result
+
     def mcp_payload(self):
         """远程工具服务器面板（A9）：地址、开关与掩码后的凭据（Q2）。
 
@@ -386,6 +754,18 @@ class WebAdapter:
         解释为什么撤不回（K3）。
         """
 
+        return self._settled_action_cards({EXECUTOR_MCP}, limit)
+
+    def desktop_cards(self, limit: int = 6):
+        """Settled file/app/chain cards that stay in the transcript after approval."""
+        return self._settled_action_cards(
+            {EXECUTOR_FILE, EXECUTOR_APP, EXECUTOR_CHAIN},
+            limit,
+        )
+
+    def _settled_action_cards(self, executors, limit):
+        wanted = {str(item) for item in executors}
+
         def read():
             rows = self.runtime.store.list_proposals(
                 self.runtime.session_id,
@@ -395,14 +775,18 @@ class WebAdapter:
                     ProposalStatus.FAILED.value,
                     ProposalStatus.UNKNOWN.value,
                 ),
-                limit=20,
+                limit=30,
             )
             cards = []
             for proposal in rows or []:
-                if str(proposal.executor or "") != EXECUTOR_MCP:
+                if str(proposal.executor or "") not in wanted:
                     continue
-                card = plain(self.service.approval_view(proposal.action_id).as_dict())
-                receipt = self.runtime.store.get_receipt_for_action(proposal.action_id)
+                card = plain(
+                    self.service.approval_view(proposal.action_id).as_dict()
+                )
+                receipt = self.runtime.store.get_receipt_for_action(
+                    proposal.action_id
+                )
                 card["settled"] = True
                 card["receipt"] = (
                     None
@@ -411,10 +795,11 @@ class WebAdapter:
                         "receipt_id": receipt.receipt_id,
                         "status": str(receipt.status),
                         "summary": redact_text(str(receipt.summary or "")),
-                        # 被档位拦下的那张卡要说清原因，原因只有回执自己知道。
                         "error": redact_text(str(receipt.error or "")),
                         "undoable": bool(receipt.undoable),
-                        "at": str(receipt.finished_at or receipt.created_at or ""),
+                        "at": str(
+                            receipt.finished_at or receipt.created_at or ""
+                        ),
                     }
                 )
                 cards.append(card)
@@ -491,6 +876,10 @@ class WebAdapter:
             "lock_file": str(owner.get("lock_file") or ""),
             "backups": len(backups),
             "latest_backup": str(backups[0].get("name") or "") if backups else "",
+            "last_execution": plain(
+                getattr(self.runtime, "last_execution_diagnostic", {})
+            )
+            or {},
         }
 
     def fetch_models(self, body):
@@ -627,6 +1016,7 @@ class WebAdapter:
             "message_actions": plain(projection.message_actions),
             "approvals": self._approval_rows(projection.approvals),
             "remote_cards": self.remote_cards(),
+            "desktop_cards": self.desktop_cards(),
             # S04f 的「档位：保守」说的是当前档位：被档位拦下的那条提案没有出网，
             # 芯片要告诉用户现在这一档是什么，而不是复刻拒绝时的历史值。
             "permission_label": PERMISSION_LABELS[
@@ -643,6 +1033,9 @@ class WebAdapter:
             # 来源通道只有一个形状：本机文档命中在前、网络命中在后。
             "sources": plain(projection.sources),
             "status": self._safe(lambda: self.runtime.desktop_status(), {}),
+            "work_status": plain(
+                self._safe(lambda: self.runtime.work_status(), {})
+            ),
             "affect": self._affect_view(),
             "proactive": self._safe(lambda: self.runtime.proactive_status(), {}),
             # The overlay bubble is one delivery path; the main window keeps
@@ -949,15 +1342,54 @@ class WebAdapter:
     def run_turn(self, text, mode=None):
         return self._start_run(self.service.begin_turn(text, mode))
 
+    def bridge_turn(self, body, timeout=100.0):
+        """Synchronous turn for the OpenClaw/WeChat bridge.
+
+        Goes through the same run lifecycle as the UI so the desktop sees the
+        conversation, then waits for the terminal event instead of making the
+        bridge subscribe to SSE.
+        """
+        text = str(body.get("text") or "").strip()
+        if not text:
+            return {"status": "invalid", "answer": "消息不能为空。"}
+        run = self.run_turn(text, body.get("mode"))
+        run.wait(timeout)
+        if not run.finished:
+            return {
+                "status": "running",
+                "run_id": run.run_id,
+                "answer": "这条回复还在生成，请到桌面数字分身查看结果。",
+            }
+        result = run.result or {}
+        answer = str(result.get("answer") or "").strip()
+        if not answer:
+            answer = run.error or "处理消息时遇到问题。"
+        proposal = result.get("proposal")
+        plan = str(getattr(proposal, "user_visible_plan", "") or "").strip()
+        if plan:
+            answer = "{}\n\n{}\n（这条动作需要确认，请在桌面数字分身中确认或取消。）".format(
+                answer, plan
+            )
+        return {
+            "status": run.status.value,
+            "run_id": run.run_id,
+            "session_id": run.session_id,
+            "answer": answer,
+            "error": run.error,
+        }
+
     def regenerate(self, message_id):
         return self._start_run(self.service.regenerate(message_id))
 
     def _start_run(self, run):
         def worker():
+            finished = False
             try:
                 for event in self.service.stream_turn(run):
                     self.broadcast({"type": "turn", "event": event.as_dict()})
+                finished = True
             except Exception as error:  # surfaced in the chat as a failed run
+                finished = True
                 self.broadcast(
                     {
                         "type": "turn",
@@ -971,6 +1403,11 @@ class WebAdapter:
                     }
                 )
             finally:
+                if not finished:
+                    self.service.abandon_run(
+                        run.run_id,
+                        reason="adapter worker exited before a terminal event",
+                    )
                 self.broadcast({"type": "refresh"})
 
         threading.Thread(target=worker, name="companion-turn", daemon=True).start()
@@ -1048,6 +1485,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, adapter.settings_payload())
         if path == "/api/docs":
             return self._json(200, adapter.documents_payload())
+        if path == "/api/desktop":
+            return self._json(200, plain(adapter.desktop_payload()) or {})
         if path == "/api/mcp":
             return self._json(200, plain(adapter.mcp_payload()) or {})
         if path == "/api/console/memory":
@@ -1077,6 +1516,8 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/turn":
                 run = adapter.run_turn(body.get("text"), body.get("mode"))
                 return self._json(202, {"run_id": run.run_id})
+            if path == "/api/bridge/turn":
+                return self._json(200, adapter.bridge_turn(body))
             if path == "/api/messages/regenerate":
                 run = adapter.regenerate(body.get("message_id"))
                 return self._json(202, {"run_id": run.run_id})
@@ -1129,13 +1570,34 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._document_import(body)
             if path == "/api/docs/delete":
                 return self._document_delete(body)
+            if path == "/api/desktop":
+                return self._json(200, plain(adapter.desktop_action(body)) or {})
             if path == "/api/mcp":
                 return self._mcp_action(body)
             if path == "/api/approvals/confirm":
-                result = service.confirm_action(body.get("action_id"), body.get("mode"))
+                adapter.service.recover_stale_runs(max_age_seconds=300.0)
+                action_id = body.get("action_id")
+                proposal = adapter.runtime.store.get_proposal(action_id)
+                progress = None
+                if (
+                    proposal is not None
+                    and str(proposal.executor or "") == EXECUTOR_CHAIN
+                ):
+                    def progress(message):
+                        adapter.broadcast(
+                            {"type": "desktop_progress", **message}
+                        )
+
+                    adapter.runtime.chains.set_progress_callback(progress)
+                try:
+                    result = service.confirm_action(action_id, body.get("mode"))
+                finally:
+                    if progress is not None:
+                        adapter.runtime.chains.set_progress_callback(None)
                 adapter.broadcast({"type": "refresh"})
                 return self._json(200, plain(result) or {})
             if path == "/api/approvals/cancel":
+                adapter.service.recover_stale_runs(max_age_seconds=300.0)
                 result = service.cancel_action(body.get("action_id"))
                 adapter.broadcast({"type": "refresh"})
                 return self._json(200, plain(result) or {})
@@ -1162,6 +1624,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _session_action(self, action, body):
         service = self.adapter.service
+        # A finished in-memory run must never leave the UI permanently busy.
+        # A genuinely live run still returns SessionBusy and stays protected.
+        service.recover_stale_runs(max_age_seconds=300.0)
         session_id = str(body.get("session_id") or "")
         changed = False
         if action == "switch":
@@ -1407,6 +1872,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _task_action(self, body):
         runtime = self.adapter.runtime
+        self.adapter.service.recover_stale_runs(max_age_seconds=300.0)
         action = str(body.get("action") or "")
         task_id = str(body.get("task_id") or "")
         if action == "approve":

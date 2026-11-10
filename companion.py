@@ -202,6 +202,11 @@ def run_app(args, data_dir):
         except Exception as error:
             print("工作目录授权失败：{}".format(error), file=sys.stderr)
             return 2
+    # 后台补扫已授权但还没索引的目录：启动不等扫描完成，对话也不等（S2）。
+    try:
+        runtime.resume_file_index()
+    except Exception as error:
+        print("文件索引启动失败：{}".format(error), file=sys.stderr)
 
     if args.ui == "cli":
         return run_cli(runtime)

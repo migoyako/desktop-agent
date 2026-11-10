@@ -13,11 +13,12 @@ import threading
 import time
 import unittest
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 
 from agent_framework.companion.app import create_application_service
 from agent_framework.companion.documents import source_items
-from agent_framework.companion.models import AgentMode
+from agent_framework.companion.models import AgentMode, WORK_NORMAL
 from agent_framework.companion.runtime import CompanionRuntime
 from agent_framework.companion.search import SearchService
 from agent_framework.companion.store import CompanionStore
@@ -100,6 +101,7 @@ class KeyedTranscriptBrowserTests(unittest.TestCase):
             "http://{}/?t={}".format(self.adapter.address, self.adapter.token),
             wait_until="load",
         )
+        page.wait_for_selector('body[data-ready="true"]')
         return page
 
     def wait_for(self, page, expression, description, timeout=20):
@@ -148,6 +150,45 @@ class KeyedTranscriptBrowserTests(unittest.TestCase):
         self.assertTrue(kept, "历史消息节点被重建了")
 
     # -- tests ----------------------------------------------------------
+
+    def test_task_approve_button_submits_once_without_a_second_dialog(self):
+        task = self.adapter.runtime.create_work_task(
+            "把今天的总结写入项目文件", force=True
+        )
+        stored_task = self.store.get_work_task(task["task"].task_id)
+        stored_task.card = replace(stored_task.card, executor="测试转发器")
+        self.store.update_work_task(stored_task)
+        self.adapter.runtime.work.executor = (
+            lambda card, receipt: {
+                "status": "completed",
+                "summary": "测试转发完成",
+            }
+        )
+        page = self.open_page()
+        if not page.locator("#inspector").is_visible():
+            page.click("#toggleInspector")
+        page.get_by_role("tab", name="任务", exact=True).click()
+        page.wait_for_selector('[data-task-act="approve"]')
+        page.click('[data-task-act="approve"]')
+        self.wait_for(
+            page,
+            "document.querySelectorAll('[role=\"dialog\"]').length === 0",
+            "批准后没有二次弹窗",
+        )
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            current = self.store.get_work_task(task["task"].task_id)
+            receipt = self.store.get_work_receipt_for_task(task["task"].task_id)
+            if (
+                current is not None
+                and current.state == WORK_NORMAL
+                and receipt is not None
+                and receipt.status == "completed"
+            ):
+                break
+            time.sleep(0.2)
+        else:
+            self.fail("任务卡批准按钮没有完成转发回执")
 
     def test_history_nodes_survive_appends(self):
         self.seed(24)

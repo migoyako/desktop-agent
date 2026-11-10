@@ -11,7 +11,7 @@ import hashlib
 import os
 from pathlib import Path, PureWindowsPath
 import stat
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 class PathSafetyError(RuntimeError):
@@ -28,6 +28,9 @@ BLOCKED_NAMES = {
     ".env",
     "node_modules",
 }
+
+# 不是路径、只能交给 shell 解析的目标前缀。
+SHELL_TARGET_PREFIXES = ("shell:", "shell::", "::")
 
 # Directories that hold credentials. Unlike BLOCKED_NAMES these are judged against
 # the authorized path itself: a grant whose own path sits inside a credential
@@ -95,6 +98,42 @@ def identity_digest(snapshot: Dict) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 
+def app_ref(target_key) -> str:
+    """Stable row id for one launch target, derived from its normalized key.
+
+    Recomputing the catalog must not hand the user a different ``app_id`` for the
+    same program, or every rescan would orphan the allow-list grant they registered.
+    """
+    return "app-" + hashlib.sha256(
+        str(target_key or "").encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def is_shell_target(target) -> bool:
+    """``shell:回收站`` / ``:: {GUID}`` 这类 shell 命名空间标识，不是文件系统路径。
+
+    大小写不敏感：注册表和快捷方式都给过 ``SHELL:::{...}`` 这种写法，而它和
+    ``shell:::{...}`` 指的是同一个入口，必须落成同一个键。
+    """
+    text = str(target or "").strip().lower()
+    return text.startswith(SHELL_TARGET_PREFIXES)
+
+
+def app_target_key(target) -> str:
+    """One launch target's row key.
+
+    ``shell:回收站`` 这类命名空间标识不是路径，按路径归一化会把它们变成一个假的绝对
+    路径；反过来真实 exe 又必须走 ``path_key``，不然大小写与分隔符一换就找不到同一条
+    授权。发现和启动两头都用这个函数，键才对得上。
+    """
+    text = str(target or "").strip()
+    if not text:
+        return ""
+    if is_shell_target(text):
+        return os.path.normcase(text)
+    return path_key(text)
+
+
 def resource_identity_valid(snapshot: Dict) -> bool:
     if not snapshot or not snapshot.get("root"):
         return False
@@ -115,6 +154,33 @@ def resource_identity_valid(snapshot: Dict) -> bool:
 def path_key(root) -> str:
     """Case-insensitive Windows key used to find one directory's grant row."""
     return os.path.normcase(os.path.abspath(str(root)))
+
+
+def relative_path_key(value) -> str:
+    """Key for a path relative to a granted directory: one separator, one case.
+
+    The index stores this and only this, so a scan that finds ``Notes/a.md`` and a
+    search that asks for ``notes\\A.MD`` land on the same row. Absolute paths never
+    get here — those keep going through ``path_key``.
+    """
+    normalized = os.path.normcase(str(value or "").replace("\\", "/").strip("/"))
+    # ``Path("a.md").parent`` 是 "."，它指的就是授权目录自己。顶层文件必须和
+    # parent_key="" 的查询落在同一个键上，否则"列出顶层"永远列不到东西。
+    return "" if normalized == "." else normalized
+
+
+def relative_parts(rel_path) -> List[str]:
+    """Split a stored relative path into its segments, rejecting anything absolute."""
+    normalized = str(rel_path or "").replace("\\", "/").strip("/")
+    if not normalized:
+        return []
+    pure = PureWindowsPath(normalized)
+    if pure.is_absolute() or pure.drive:
+        raise PathSafetyError("文件路径必须相对于授权目录。")
+    parts = [part for part in normalized.split("/") if part]
+    if any(part in ("", ".", "..") for part in parts):
+        raise PathSafetyError("文件路径包含越界或不允许的名称。")
+    return parts
 
 
 class WorkspaceGuard:

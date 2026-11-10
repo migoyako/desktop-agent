@@ -198,6 +198,22 @@ class ApplicationServiceTest(unittest.TestCase):
 
         self.service.abandon_run(run.run_id)
 
+    def test_stale_run_does_not_permanently_block_session_actions(self):
+        run = self.service.begin_turn("旧回合")
+        run.started_at = "2000-01-01T00:00:00+00:00"
+        self.assertEqual(1, self.service.recover_stale_runs(max_age_seconds=60))
+        self.assertIsNone(self.service.active_run())
+        created = self.service.create_session()
+        self.assertTrue(created)
+        self.assertTrue(self.service.switch_session(created))
+
+    def test_stale_run_can_be_released_before_approval_and_task_actions(self):
+        run = self.service.begin_turn("卡住的旧回合")
+        run.started_at = "2000-01-01T00:00:00+00:00"
+        self.service.recover_stale_runs(max_age_seconds=60)
+        self.assertIsNone(self.service.active_run())
+        self.assertTrue(self.service.create_session())
+
     def test_mutations_are_rejected_while_a_run_is_active(self):
         self.persist_default_done("忙碌")
         run = self.service.begin_turn("开始")

@@ -114,6 +114,8 @@ class CompanionQtEndToEndTest(unittest.TestCase):
             offline=True,
         )
         self.runtime.select_workspace(str(self.workspace))
+        self.runtime.apply_settings({"tool_permission": "strict"})
+        self.runtime.set_mode(AgentMode.WORK)
         self.app = QApplication.instance() or QApplication([])
         self.window = CompanionWindow(create_application_service(self.runtime))
         self.window.show()
@@ -149,6 +151,7 @@ class CompanionQtEndToEndTest(unittest.TestCase):
             "提案没有出现在窗口中",
         )
         proposal = self.window.current_proposal
+        self.runtime.apply_settings({"tool_permission": "balanced"})
         card = self.window.confirm_frame
         self.assertTrue(card.isVisible())
         self.assertEqual(card.status_pill.text(), "等待确认")

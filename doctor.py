@@ -6,6 +6,7 @@ import importlib.util
 import os
 import platform
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 
@@ -39,6 +40,33 @@ def check(name, passed, detail):
     return passed
 
 
+def _process_integrity():
+    """Return (name, sid) of this process's mandatory integrity level (Windows only)."""
+    if os.name != "nt":
+        return None, None
+    whoami = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "whoami.exe"
+    try:
+        output = subprocess.run(
+            [str(whoami), "/groups"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        ).stdout
+    except Exception:
+        return None, None
+    for sid, name in (
+        ("S-1-16-4096", "Low"),
+        ("S-1-16-8192", "Medium"),
+        ("S-1-16-12288", "High"),
+        ("S-1-16-16384", "System"),
+        ("S-1-16-20480", "Protected"),
+    ):
+        if sid in output:
+            return name, sid
+    return None, None
+
+
 def main():
     _keep_stdout_writable()
     checks = []
@@ -50,6 +78,26 @@ def main():
             "{} at {}".format(version, sys.executable),
         )
     )
+
+    integrity_name, integrity_sid = _process_integrity()
+    if integrity_name == "Low":
+        checks.append(
+            check(
+                "Process integrity",
+                False,
+                "Low ({}): python.exe carries a Low integrity label, so writes to "
+                "normal folders are denied. Run setup.ps1 to move the venv outside "
+                "the repository and relabel it.".format(integrity_sid),
+            )
+        )
+    elif integrity_name:
+        checks.append(
+            check(
+                "Process integrity",
+                True,
+                "{} ({})".format(integrity_name, integrity_sid),
+            )
+        )
 
     try:
         import PySide6
@@ -429,6 +477,144 @@ def main():
                 checks.append(check("Access grants", True, detail))
     except Exception as error:
         checks.append(check("Access grants", False, str(error)))
+
+    try:
+        from agent_framework.companion.access_control import state_report
+
+        database = ROOT / "data" / "companion.db"
+        if not database.exists():
+            print("[WARN] {:<20} {}".format(
+                "File write access",
+                "database not created yet",
+            ))
+        else:
+            access = state_report(database)
+            if not access["available"]:
+                print("[WARN] {:<20} {}".format(
+                    "File write access",
+                    access["reason"],
+                ))
+            else:
+                # 通用写入与删除只认用户单独授予的目录；旧版工作区那条提升不算。
+                writable = [
+                    item for item in access["grants"]
+                    if item["status"] == "active"
+                    and not item["legacy_workspace"]
+                    and "fs-write" in item["capabilities"]
+                ]
+                deletable = [
+                    item for item in access["grants"]
+                    if item["status"] == "active"
+                    and not item["legacy_workspace"]
+                    and "fs-delete" in item["capabilities"]
+                ]
+                detail = "fs-write={} fs-delete={}".format(
+                    len(writable), len(deletable)
+                )
+                if not writable:
+                    print("[WARN] {:<20} {}".format(
+                        "File write access",
+                        "没有显式授予 fs-write 的目录，write_file 与 move_file "
+                        "不会出现在工具清单里",
+                    ))
+                for item in writable:
+                    if item["drifted"]:
+                        print("[WARN] {:<20} {}: {}".format(
+                            "Writable grant drifted",
+                            item["path"],
+                            item.get("reason", "identity_changed"),
+                        ))
+                checks.append(check("File write access", True, detail))
+    except Exception as error:
+        checks.append(check("File write access", False, str(error)))
+
+    try:
+        from agent_framework.companion.app_launch import launch_state_report
+
+        database = ROOT / "data" / "companion.db"
+        if not database.exists():
+            print("[WARN] {:<20} {}".format("App launch", "database not created yet"))
+        else:
+            apps = launch_state_report(database)
+            if not apps["available"]:
+                print("[WARN] {:<20} {}".format("App launch", apps["reason"]))
+            else:
+                detail = (
+                    "catalog={} grants={} launchable={} missing={} drifted={}".format(
+                        apps["total"],
+                        apps["grant_count"],
+                        apps["launchable_count"],
+                        apps["missing"],
+                        apps["drifted"],
+                    )
+                )
+                if not apps["launchable_count"]:
+                    print("[WARN] {:<20} {}".format(
+                        "App launch",
+                        "「允许启动」清单是空的，open_app 不会出现在工具清单里",
+                    ))
+                for item in apps["drifted_rows"]:
+                    print("[WARN] {:<20} {}: {}".format(
+                        "App identity",
+                        item["name"] or item["target"],
+                        item["reason"] or "与登记时不一致，需要重新登记",
+                    ))
+                if apps["without_baseline"]:
+                    print("[WARN] {:<20} {}".format(
+                        "App identity",
+                        "{} 条已登记启动但没有身份基线，需要重新登记".format(
+                            apps["without_baseline"]
+                        ),
+                    ))
+                checks.append(check("App launch", True, detail))
+    except Exception as error:
+        checks.append(check("App launch", False, str(error)))
+
+    try:
+        from agent_framework.companion.file_index import index_state_report
+
+        database = ROOT / "data" / "companion.db"
+        if not database.exists():
+            print("[WARN] {:<20} {}".format(
+                "File index",
+                "database not created yet",
+            ))
+        else:
+            index = index_state_report(database)
+            if not index["available"]:
+                print("[WARN] {:<20} {}".format("File index", index["reason"]))
+            else:
+                detail = "grants={} indexed_rows={} never={} stale={} failed={} missing={}".format(
+                    index["searchable_count"],
+                    index["catalog_rows"],
+                    index["never_indexed"],
+                    index["stale"],
+                    index["failed"],
+                    index["missing_directories"],
+                )
+                if not index["searchable_count"]:
+                    print("[WARN] {:<20} {}".format(
+                        "File index",
+                        "没有含 fs-search 的有效授权，find_files 只能拿到空结果",
+                    ))
+                for item in index["directories"]:
+                    if item["grant_status"] != "active" or not item["searchable"]:
+                        continue
+                    if not item["directory_present"]:
+                        print("[WARN] {:<20} {}".format(
+                            "Index directory",
+                            "目录已打不开：{}".format(item["path"]),
+                        ))
+                    elif item["status"] in ("idle", "failed", "stale"):
+                        print("[WARN] {:<20} {}：status={} {}".format(
+                            "Index progress",
+                            item["path"],
+                            item["status"],
+                            item["last_error"],
+                        ).rstrip())
+                checks.append(check("File index", True, detail))
+    except Exception as error:
+        checks.append(check("File index", False, str(error)))
 
     try:
         from agent_framework.companion.assets import character_assets_check

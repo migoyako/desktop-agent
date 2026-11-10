@@ -18,45 +18,76 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
-$VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
+# The repository tree carries an inheritable Low mandatory label. Windows starts
+# an image at the lower of the caller token and the executable file's own level,
+# so a venv built or copied inside the repo runs Low and cannot write to normal
+# folders. Keep the venv outside the repo and expose it inside as a junction so
+# every existing script keeps using .venv.
+$RuntimeRoot = Join-Path $env:PUBLIC "CompanionRuntime"
+$VenvRoot = Join-Path $RuntimeRoot "venv"
+$VenvLink = Join-Path $Root ".venv"
+$VenvPython = Join-Path $VenvRoot "Scripts\python.exe"
+
+$LinkItem = Get-Item -LiteralPath $VenvLink -Force -ErrorAction SilentlyContinue
+$LinkIsJunction = $LinkItem -and $LinkItem.LinkType -eq "Junction"
+if ($LinkItem -and -not $LinkIsJunction -and (Test-Path $VenvRoot)) {
+    throw "Both .venv (a real folder) and $VenvRoot exist. Remove .venv, then run setup.ps1 again."
+}
 
 if (-not (Test-Path $VenvPython)) {
-    $Candidates = @()
+    if ($LinkItem -and -not $LinkIsJunction -and -not (Test-Path $VenvRoot)) {
+        New-Item -ItemType Directory -Path $RuntimeRoot -Force | Out-Null
+        Write-Host "Moving the virtual environment out of the repository..."
+        Move-Item -LiteralPath $VenvLink -Destination $VenvRoot
+    } elseif (-not (Test-Path $VenvRoot)) {
+        $Candidates = @()
 
-    $PythonRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
-    if (Test-Path $PythonRoot) {
-        $Candidates += Get-ChildItem $PythonRoot -Directory -Filter "Python3*" |
-            Sort-Object Name -Descending |
-            ForEach-Object { Join-Path $_.FullName "python.exe" }
-    }
-
-    $Candidates += @(
-        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
-        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe")
-    )
-
-    $BasePython = $null
-    foreach ($Candidate in $Candidates | Select-Object -Unique) {
-        if (-not (Test-Path $Candidate)) {
-            continue
+        $PythonRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
+        if (Test-Path $PythonRoot) {
+            $Candidates += Get-ChildItem $PythonRoot -Directory -Filter "Python3*" |
+                Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName "python.exe" }
         }
-        & $Candidate -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
-        if ($LASTEXITCODE -eq 0) {
-            $BasePython = $Candidate
-            break
+
+        $Candidates += @(
+            (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
+            (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe")
+        )
+
+        $BasePython = $null
+        foreach ($Candidate in $Candidates | Select-Object -Unique) {
+            if (-not (Test-Path $Candidate)) {
+                continue
+            }
+            & $Candidate -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+            if ($LASTEXITCODE -eq 0) {
+                $BasePython = $Candidate
+                break
+            }
         }
-    }
 
-    if (-not $BasePython) {
-        throw "Python 3.11 or newer was not found. Install Python 3.12, then run setup.ps1 again."
-    }
+        if (-not $BasePython) {
+            throw "Python 3.11 or newer was not found. Install Python 3.12, then run setup.ps1 again."
+        }
 
-    Write-Host "Creating virtual environment with $BasePython"
-    & $BasePython -m venv .venv
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to create .venv"
+        New-Item -ItemType Directory -Path $RuntimeRoot -Force | Out-Null
+        Write-Host "Creating virtual environment with $BasePython"
+        & $BasePython -m venv $VenvRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create the virtual environment at $VenvRoot"
+        }
+    } else {
+        throw "The virtual environment at $VenvRoot is incomplete. Delete it, then run setup.ps1 again."
     }
 }
+
+if (-not (Test-Path $VenvLink)) {
+    New-Item -ItemType Junction -Path $VenvLink -Target $VenvRoot | Out-Null
+}
+
+# A venv migrated out of the repo keeps the Low labels it inherited there;
+# reset the whole tree so launched interpreters run at Medium integrity.
+& "$env:SystemRoot\System32\icacls.exe" $VenvRoot /setintegritylevel "(OI)(CI)M" /T /C /Q 2>$null | Out-Null
 
 Write-Host "Updating packaging tools..."
 & $VenvPython -m pip install --upgrade pip setuptools wheel `

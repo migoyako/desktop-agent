@@ -141,10 +141,13 @@
     safe: "安全",
     "fs-read": "读取文件",
     "fs-write": "写入文件",
+    "fs-delete": "移入回收站",
     shell: "执行命令",
     network: "联网",
     "input-control": "控制系统",
     external: "外部调用",
+    "app-launch": "启动应用",
+    "launch-chain": "启动链",
   };
 
   // ---------- transport ----------
@@ -327,8 +330,8 @@
     el.wsCard.innerHTML = workspace
       ? `<span aria-hidden="true">◫</span><span class="path" title="${escapeHtml(workspace)}">${escapeHtml(workspace)}</span>` +
         `<span class="acts"><button data-act="clear-ws" title="取消工作区" aria-label="取消工作区">×</button></span>`
-      : `<span aria-hidden="true">◫</span><span class="path">未授权工作区</span>` +
-        `<span class="acts"><button data-act="pick-ws" title="选择目录" aria-label="选择工作区目录">＋</button></span>`;
+      : `<span aria-hidden="true">◫</span><span class="path">未选择工作目录</span>` +
+        `<span class="acts"><button data-act="pick-ws" title="选择工作目录（笔记）" aria-label="选择工作目录">＋</button></span>`;
 
     const filter = state.filter.trim().toLowerCase();
     const sessions = (data.sessions || []).filter(
@@ -571,7 +574,10 @@
     const settled = (data.remote_cards || []).filter(
       (view) => !seen[view.action_id]
     );
-    return pending.concat(settled);
+    const desktop = (data.desktop_cards || []).filter(
+      (view) => !seen[view.action_id]
+    );
+    return pending.concat(settled, desktop);
   }
 
   function renderChat() {
@@ -616,16 +622,27 @@
     });
   }
 
+  function previewChange(view) {
+    const preview = (view && view.preview) || {};
+    return String(preview.operation || preview.change || "");
+  }
+
   function approvalHtml(view) {
     const preview = view.preview || {};
     const status = view.status;
     const awaiting = status === "awaiting_confirmation" && !view.expired;
     const remote = view.risk === "external";
+    const launch = view.risk === "app-launch" || view.risk === "launch-chain";
+    const deleting = view.risk === "fs-delete" || previewChange(view) === "delete";
+    const moving = previewChange(view) === "move";
     const settled = Boolean(view.settled);
     const receipt = view.receipt || null;
     const done = settled && status === "completed";
     const denied = settled && status === "not_executed";
-    const undoId = done && receipt && receipt.receipt_id ? receipt.receipt_id : "";
+    const undoId =
+      done && receipt && receipt.receipt_id && view.reversible
+        ? receipt.receipt_id
+        : "";
     const chips = [];
     if (done) {
       chips.push('<span class="pill accent">已执行</span>', '<span class="pill">已完成</span>');
@@ -637,7 +654,17 @@
     } else {
       chips.push(
         `<span class="pill accent">${
-          awaiting ? (remote ? "待确认外部调用" : "待确认写入") : "已执行"
+          awaiting
+            ? remote
+              ? "待确认外部调用"
+              : deleting
+              ? "待确认移入回收站"
+              : view.risk === "launch-chain"
+              ? "待确认启动链"
+              : view.risk === "app-launch"
+              ? "待确认启动"
+              : "待确认写入"
+            : "已执行"
         }</span>`,
         `<span class="pill ${view.expired ? "danger" : ""}">${
           view.expired ? "已过期" : STATUS_LABELS[status] || status
@@ -681,28 +708,53 @@
           .join("")}</div>`
       : "";
     const changeLabel =
-      preview.change === "create"
-        ? "新建文件"
-        : preview.change === "update"
-        ? "更新文件"
-        : preview.change === "unavailable"
-        ? "改动预览不可用"
-        : preview.change || "";
+      {
+        create: "新建文件",
+        update: "更新文件",
+        write: "写入文件",
+        copy: "复制文件",
+        move: "移动或重命名",
+        delete: "移入回收站",
+        launch: "启动应用",
+        unavailable: "改动预览不可用",
+      }[preview.operation || preview.change] ||
+      preview.change ||
+      "";
     const foot = done
-      ? '<div class="hint">回执已写入审计日志，导出时不含凭据。</div>'
+      ? `<div class="hint">回执已写入审计日志。${
+          remote ? "导出时不含凭据。" : "结果以执行器回执为准。"
+        }</div>`
       : denied
-      ? `<div class="hint">${escapeHtml((receipt && receipt.error) || "这条外部调用没有出网。")}</div>`
+      ? `<div class="hint">${escapeHtml(
+          (receipt && receipt.error) ||
+            preview.error ||
+            (remote
+              ? "这条外部调用没有出网。"
+              : "动作在产生副作用之前被拒绝。")
+        )}</div>`
       : view.warning
       ? `<div class="hint">${escapeHtml(view.warning)}</div>`
       : "";
     const actions = awaiting
       ? `<button class="primary" data-approve="${escapeHtml(view.action_id)}">${
-          remote ? "允许这次调用" : "允许这次写入"
+          remote
+            ? "允许这次调用"
+            : deleting
+            ? "允许这次删除"
+            : view.risk === "launch-chain"
+            ? "允许启动链"
+            : view.risk === "app-launch"
+            ? "允许这次启动"
+            : "允许这次写入"
         }</button>
          <button class="ghost" data-cancel-approval="${escapeHtml(view.action_id)}">取消</button>`
       : undoId
       ? `<button class="ghost" data-undo="${escapeHtml(undoId)}" aria-disabled="true">撤销</button>
-         <span class="hint">外部调用不提供撤销，点击只会说明原因。</span>`
+         <span class="hint">${
+           remote
+             ? "外部调用不提供撤销，点击只会说明原因。"
+             : "这次修改可通过本机备份撤销。"
+         }</span>`
       : `<span class="hint">${
           view.expired ? "提案已过期，请重新生成。" : settled ? "" : "这条动作已经处理。"
         }</span>`;
@@ -713,19 +765,38 @@
       <div class="meta">${rows
         .map(
           ([label, value]) =>
-            `<div class="row"><label>${label}</label><b title="${escapeHtml(value)}">${escapeHtml(value || "—")}</b></div>`
+            `<div class="row${
+              ["目标", "回执", "命令行", "拒绝原因"].indexOf(label) >= 0
+                ? " full"
+                : ""
+            }"><label>${label}</label><b title="${escapeHtml(value)}">${escapeHtml(value || "—")}</b></div>`
         )
         .join("")}</div>
       ${remote ? "" : `<div class="plan">${escapeHtml(view.plan || "")}</div>`}
       ${
         remote
           ? args
+          : launch
+          ? ""
+          : moving
+          ? '<div class="hint">只改目录项，不读取正文，没有内容 Diff。</div>'
+          : deleting
+          ? `<div class="diff-line"><span>${changeLabel}</span><span class="del">-${Number(
+              preview.removed || 0
+            ).toLocaleString()} 字节</span><span>1 个文件</span></div>`
           : `<div class="diff-line"><span>${changeLabel}</span><span class="add">+${
               preview.added || 0
             }</span><span class="del">-${preview.removed || 0}</span><span>行</span></div>
       ${diffLines ? `<div class="diff">${diffLines}</div>` : ""}`
       }
       ${foot}
+      ${
+        launch
+          ? `<div class="desktop-progress" data-progress-for="${escapeHtml(
+              view.action_id
+            )}" hidden></div>`
+          : ""
+      }
       <div class="actions">${actions}</div>
     </div>`;
   }
@@ -740,9 +811,9 @@
         const receipt = task.receipt
           ? `<div class="line">回执：${escapeHtml(RECEIPT_LABELS[task.receipt.status] || task.receipt.status)}${task.receipt.summary ? " · " + escapeHtml(task.receipt.summary) : ""}</div>`
           : "";
-        const actions = actionable
-          ? `<div class="actions">
-              ${canApprove ? `<button class="primary" data-task-act="approve" data-task-id="${escapeHtml(task.task_id)}">批准计划</button>` : ""}
+          const actions = actionable
+            ? `<div class="actions">
+                ${canApprove ? `<button class="primary" data-task-act="approve" data-task-id="${escapeHtml(task.task_id)}"${task.executor === "未配置转发器" ? ' aria-disabled="true" title="当前没有可用的任务执行器"' : ""}>${task.executor === "未配置转发器" ? "暂无执行器" : "批准计划"}</button>` : ""}
               <button class="ghost" data-task-act="revise" data-task-id="${escapeHtml(task.task_id)}">修改</button>
               <button class="ghost danger-text" data-task-act="reject" data-task-id="${escapeHtml(task.task_id)}">拒绝</button>
             </div>`
@@ -1197,6 +1268,8 @@
       }
       if (payload.type === "turn") {
         handleEvent(payload.event);
+      } else if (payload.type === "desktop_progress") {
+        showDesktopProgress(payload);
       } else if (payload.type === "refresh") {
         scheduleRefresh();
       } else if (payload.type === "ui") {
@@ -1215,6 +1288,31 @@
     source.onerror = () => {
       // EventSource reconnects on its own; keep the UI usable meanwhile.
     };
+  }
+
+  function showDesktopProgress(payload) {
+    const labels = {
+      checking: "正在检查权限与身份",
+      launching: "正在启动中转应用",
+      triggering: "正在执行触发",
+      waiting: "正在等待目标应用",
+      completed: "启动链已完成",
+      failed: "启动链执行失败",
+      unknown: "目标状态需要复核",
+    };
+    const node = Array.from(
+      document.querySelectorAll("[data-progress-for]")
+    ).find(
+      (item) =>
+        item.dataset.progressFor === String(payload.action_id || "")
+    );
+    if (!node) return;
+    node.hidden = false;
+    node.dataset.stage = payload.stage || "";
+    node.textContent =
+      (labels[payload.stage] || "执行中") +
+      " · " +
+      (payload.detail || "");
   }
 
   // ---------- actions ----------
@@ -1401,9 +1499,9 @@
 
   async function chooseWorkspace() {
     const path = await CompanionDialog.prompt(
-      "输入要授权的工作目录绝对路径",
+      "输入工作目录绝对路径。文件读写、删除使用设置页中的目录授权，不依赖这里的选择。",
       state.data.workspace || "",
-      { title: "授权工作目录", okText: "授权" }
+      { title: "选择工作目录", okText: "选择" }
     );
     if (!path) return;
     await guard(post("/api/workspace", { path: path }));
@@ -1436,6 +1534,16 @@
   }
 
   async function confirmApproval(actionId) {
+    const node = Array.from(
+      document.querySelectorAll("[data-progress-for]")
+    ).find(
+      (item) => item.dataset.progressFor === String(actionId || "")
+    );
+    if (node) {
+      node.hidden = false;
+      node.dataset.stage = "checking";
+      node.textContent = "正在检查权限与身份 · 准备启动链";
+    }
     await guard(post("/api/approvals/confirm", { action_id: actionId }));
     await refresh();
   }
@@ -1450,20 +1558,20 @@
   }
 
   async function taskAction(action, taskId) {
+    let result = null;
     if (action === "approve") {
-      const approved = await CompanionDialog.confirm("批准这份计划并开始执行？", {
-        title: "批准计划",
-        okText: "批准",
-      });
-      if (!approved) return;
-      await guard(post("/api/console/tasks", { action: "approve", task_id: taskId }));
+      // The task card itself is the confirmation surface. Asking again in a
+      // modal makes the primary action look unresponsive and duplicates consent.
+      result = await guard(
+        post("/api/console/tasks", { action: "approve", task_id: taskId })
+      );
     } else if (action === "revise") {
       const instruction = await CompanionDialog.prompt("要修改什么？", "", {
         title: "修改计划",
         okText: "提交",
       });
       if (!instruction) return;
-      await guard(
+      result = await guard(
         post("/api/console/tasks", { action: "revise", task_id: taskId, instruction: instruction })
       );
     } else if (action === "reject") {
@@ -1472,8 +1580,20 @@
         okText: "拒绝",
       });
       if (reason === null) return;
-      await guard(post("/api/console/tasks", { action: "reject", task_id: taskId, reason: reason }));
+      result = await guard(
+        post("/api/console/tasks", {
+          action: "reject",
+          task_id: taskId,
+          reason: reason,
+        })
+      );
     }
+      if (result) {
+        const receipt = result.receipt || {};
+        toast(action === "approve"
+          ? receipt.summary || "计划已批准"
+          : "任务卡已更新");
+      }
     await refresh();
   }
 
@@ -1719,9 +1839,6 @@
         markProactiveRead();
         return;
       }
-      const button = event.target.closest("[data-task-act]");
-      if (!button) return;
-      taskAction(button.dataset.taskAct, button.dataset.taskId);
     };
     el.pills.onclick = (event) => {
       const pill = event.target.closest("[data-pill]");
@@ -1733,6 +1850,22 @@
         openInspector("上下文");
       }
     };
+    document.addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-task-act]");
+      if (!button || button.disabled) return;
+      event.preventDefault();
+      const label = button.textContent;
+      button.disabled = true;
+      button.textContent = "处理中…";
+      try {
+        await taskAction(button.dataset.taskAct, button.dataset.taskId);
+      } finally {
+        if (button.isConnected) {
+          button.disabled = false;
+          button.textContent = label;
+        }
+      }
+    });
     for (const button of document.querySelectorAll("[data-cmd]")) {
       button.onclick = () => {
         if (state.host) state.host[button.dataset.cmd]();
@@ -1878,6 +2011,7 @@
     bind();
     connectHost();
     connectEvents();
+    document.body.dataset.ready = "true";
     el.input.focus();
   }
 

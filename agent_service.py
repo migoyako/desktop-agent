@@ -1,4 +1,4 @@
-"""Run the current Python Agent as a local OpenAI-compatible service."""
+"""Run the local OpenAI-compatible bridge to the running desktop companion."""
 
 import argparse
 import json
@@ -82,14 +82,17 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Current Python Agent HTTP bridge")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--offline", action="store_true")
+    parser.add_argument(
+        "--data-dir",
+        help="分身数据目录，默认是项目下的 data（须与 companion.py 一致）",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
     global SERVICE
-    SERVICE = AgentService(offline=args.offline)
+    SERVICE = AgentService(data_dir=args.data_dir)
     server = ThreadingHTTPServer((args.host, args.port), AgentRequestHandler)
     print(
         "Current Python Agent listening on http://{}:{}/v1".format(

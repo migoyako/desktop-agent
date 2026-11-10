@@ -57,6 +57,10 @@ EXPORT_TABLES = (
     "mcp_servers",
     "access_grants",
     "grant_leases",
+    "file_catalog",
+    "file_index_state",
+    "app_catalog",
+    "launch_chains",
 )
 
 EXPECTED_INDEXES = (
@@ -84,6 +88,17 @@ EXPECTED_INDEXES = (
     "idx_access_grants_status",
     "idx_grant_leases_task",
     "idx_grant_leases_active",
+    "idx_file_catalog_path",
+    "idx_file_catalog_name",
+    "idx_file_catalog_parent",
+    "idx_file_catalog_grant",
+    "idx_app_catalog_target",
+    "idx_app_catalog_name",
+    "idx_app_catalog_status",
+    "idx_access_grants_app_path",
+    "idx_launch_chains_enabled",
+    "idx_launch_chains_starter",
+    "idx_launch_chains_target",
 )
 
 # Child rows before parents so foreign keys stay valid during a session purge.
@@ -116,6 +131,10 @@ PURGE_ALL_TABLES = (
     "doc_chunks",
     "documents",
     "mcp_servers",
+    "launch_chains",
+    "app_catalog",
+    "file_catalog",
+    "file_index_state",
     "grant_leases",
     "access_grants",
     "memory_relations",

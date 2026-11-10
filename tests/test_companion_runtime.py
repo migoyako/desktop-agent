@@ -1,5 +1,6 @@
 """End-to-end workflow tests using a deterministic search backend."""
 
+import contextlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,6 @@ from agent_framework.companion.runtime import CompanionRuntime
 from agent_framework.companion.search import SearchService, WebSearchService
 from agent_framework.companion.store import CompanionStore
 from agent_framework.llm import OfflineLLMClient
-
 
 class StubSearch:
     def search(self, query, limit=5):
@@ -44,6 +44,15 @@ class RuntimeWorkflowTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    @contextlib.contextmanager
+    def deferred_write(self):
+        self.runtime.apply_settings({"tool_permission": "strict"})
+        self.runtime.set_mode(AgentMode.WORK)
+        try:
+            yield
+        finally:
+            self.runtime.apply_settings({"tool_permission": "balanced"})
 
     def test_switch_session_moves_history_and_services(self):
         self.store.add_message("main", "user", "主会话的问题", AgentMode.CHAT)
@@ -111,10 +120,12 @@ class RuntimeWorkflowTest(unittest.TestCase):
         self.assertEqual(list(self.workspace.rglob("*.md")), [])
 
     def test_search_note_requires_confirmation_then_records_experience(self):
-        result = self.runtime.handle_message(
-            "搜索 Python Agent 并保存为笔记",
-            AgentMode.WORK,
-        )
+        with self.deferred_write():
+            result = self.runtime.handle_message(
+                "搜索 Python Agent 并保存为笔记",
+                AgentMode.WORK,
+            )
+        self.runtime.apply_settings({"tool_permission": "balanced"})
         proposal = result["proposal"]
         self.assertIsNotNone(proposal)
         self.assertEqual(self.runtime.pending_proposals()[0].action_id, proposal.action_id)
@@ -130,18 +141,22 @@ class RuntimeWorkflowTest(unittest.TestCase):
         )
 
     def test_cancel_never_writes(self):
-        result = self.runtime.handle_message(
-            "搜索 Python 并保存为笔记",
-            AgentMode.WORK,
-        )
+        with self.deferred_write():
+            result = self.runtime.handle_message(
+                "搜索 Python 并保存为笔记",
+                AgentMode.WORK,
+            )
+        self.runtime.apply_settings({"tool_permission": "balanced"})
         self.runtime.cancel_proposal(result["proposal"].action_id)
         self.assertEqual(list(self.workspace.rglob("*.md")), [])
 
     def test_tampered_content_is_rejected(self):
-        result = self.runtime.handle_message(
-            "搜索 Python 并保存为笔记",
-            AgentMode.WORK,
-        )
+        with self.deferred_write():
+            result = self.runtime.handle_message(
+                "搜索 Python 并保存为笔记",
+                AgentMode.WORK,
+            )
+        self.runtime.apply_settings({"tool_permission": "balanced"})
         proposal = result["proposal"]
         proposal.normalized_arguments = dict(proposal.normalized_arguments)
         proposal.normalized_arguments["content"] = "tampered"

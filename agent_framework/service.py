@@ -1,18 +1,26 @@
-"""OpenAI-compatible bridge around the local ChatAgent."""
+"""OpenAI-compatible bridge forwarding OpenClaw messages to the running companion."""
 
 import json
-import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import re
+from pathlib import Path
 from typing import Dict, Iterable, Optional
 
-from .agent import ChatAgent
-from .config import AgentConfig
-from .llm import create_llm_client
+from .companion.activation import read_endpoint
 
 
 MODEL_ID = "python-agent"
+
+# The companion endpoint waits 100s for a run; this client must outlive that
+# answer but stay under OpenClaw's 120s provider timeout.
+COMPANION_REQUEST_TIMEOUT = 110.0
+
+COMPANION_NOT_RUNNING_ANSWER = (
+    "数字分身没有在运行，请先启动桌面数字分身（python companion.py），再给我发消息。"
+)
 
 OPENCLAW_TIMESTAMP_PREFIX = re.compile(
     r"^\[[A-Z][a-z]{2} \d{4}-\d{2}-\d{2} \d{2}:\d{2} GMT[+-]\d{1,2}\]\s*"
@@ -69,26 +77,56 @@ def extract_latest_user_message(messages: Iterable[Dict]) -> str:
 
 
 class AgentService:
-    """Keeps one ChatAgent per local session id."""
+    """Forwards every message to the companion instance that owns the data dir.
 
-    def __init__(self, offline: bool = False):
-        self.offline = offline
-        self._agents: Dict[str, ChatAgent] = {}
-        self._lock = threading.Lock()
+    The companion runtime is the single execution kernel (D6): persona, memory,
+    permissions and receipts stay shared with the desktop, and the turn is
+    visible in the desktop UI. Messages land in the companion's current session.
+    """
 
-    def _build_agent(self) -> ChatAgent:
-        config = AgentConfig.from_env()
-        client = create_llm_client(config, offline=self.offline or config.offline)
-        return ChatAgent(llm_client=client, config=config)
-
-    def get_agent(self, session_id: str) -> ChatAgent:
-        with self._lock:
-            if session_id not in self._agents:
-                self._agents[session_id] = self._build_agent()
-            return self._agents[session_id]
+    def __init__(self, data_dir=None):
+        root = Path(__file__).resolve().parents[1]
+        self.data_dir = Path(data_dir) if data_dir else root / "data"
 
     def chat(self, session_id: str, prompt: str) -> str:
-        return self.get_agent(session_id).ask(normalize_agent_prompt(prompt))
+        text = normalize_agent_prompt(prompt)
+        if not text:
+            return "请输入内容。"
+        endpoint = read_endpoint(self.data_dir)
+        if endpoint is None:
+            return COMPANION_NOT_RUNNING_ANSWER
+        return self._forward(endpoint, text)
+
+    def _forward(self, endpoint: Dict, text: str) -> str:
+        request = urllib.request.Request(
+            "http://127.0.0.1:{}/api/bridge/turn".format(endpoint["port"]),
+            data=json.dumps({"text": text}, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Companion-Token": endpoint["token"],
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=COMPANION_REQUEST_TIMEOUT
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as error:
+            try:
+                detail = json.loads(error.read().decode("utf-8") or "{}")
+            except ValueError:
+                detail = {}
+            finally:
+                error.close()
+            message = str(detail.get("error") or "").strip()
+            return message or "数字分身拒绝了这条消息（HTTP {}）。".format(error.code)
+        except (OSError, ValueError):
+            # Stale endpoint file: the instance exited without cleaning up or
+            # the port is gone. Same user-facing remedy as "not running".
+            return COMPANION_NOT_RUNNING_ANSWER
+        answer = str(payload.get("answer") or "").strip()
+        return answer or COMPANION_NOT_RUNNING_ANSWER
 
     def completion_payload(
         self,

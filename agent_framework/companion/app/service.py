@@ -67,6 +67,7 @@ class CompanionApplicationService:
         return self.runtime.session_summaries()
 
     def pending_proposals(self):
+        self.recover_stale_runs(max_age_seconds=300.0)
         return self.runtime.pending_proposals()
 
     def latest_receipts(self, limit=20):
@@ -74,6 +75,7 @@ class CompanionApplicationService:
 
     def ui_projection(self, message_limit=60) -> UiProjection:
         """Everything the chat adapter may render, without runtime objects."""
+        self.recover_stale_runs(max_age_seconds=300.0)
         session_id = self.runtime.session_id
         rows = self.runtime.history(limit=message_limit)
         messages = tuple(
@@ -135,6 +137,7 @@ class CompanionApplicationService:
             raise InvalidTurnError("消息不能为空。")
         selected_mode = AgentMode(command.mode or mode or self.runtime.current_mode())
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             session_id = self.runtime.session_id
             active_id = self._session_runs.get(session_id)
             if active_id:
@@ -423,28 +426,69 @@ class CompanionApplicationService:
             self._release_run(run)
             return True
 
+    def recover_stale_runs(
+        self,
+        max_age_seconds=300.0,
+    ) -> int:
+        """Release adapters' in-memory runs that outlived their execution.
+
+        The persisted ledger is recovered on startup, but the web adapter's
+        RunContext also gates session switching and approvals. Without this
+        second cleanup a stale run would keep the whole UI read-only until the
+        process exits.
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        stale = []
+        with self._lock:
+            for run in self._runs.values():
+                if run.finished:
+                    continue
+                try:
+                    started = datetime.fromisoformat(str(run.started_at))
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    age = (now - started.astimezone(timezone.utc)).total_seconds()
+                except ValueError:
+                    age = float("inf")
+                if age >= max(0.0, float(max_age_seconds)):
+                    stale.append((run, "stale"))
+        selected = [(run, reason) for run, reason in stale]
+        for run, reason in selected:
+            self.abandon_run(
+                run.run_id,
+                reason="stale run released: {}".format(reason),
+            )
+        return len(selected)
+
     def set_mode(self, mode):
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("切换模式")
             self.runtime.set_mode(AgentMode(mode))
 
     def select_workspace(self, path):
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("切换工作目录")
             return self.runtime.select_workspace(path)
 
     def clear_workspace(self):
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("取消工作目录")
             return self.runtime.clear_workspace()
 
     def switch_session(self, session_id) -> bool:
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("切换会话")
             return self.runtime.switch_session(session_id)
 
     def create_session(self, mode=None) -> str:
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("新建会话")
             session_id = new_id("chat")
             selected_mode = AgentMode(mode or self.runtime.current_mode())
@@ -453,21 +497,25 @@ class CompanionApplicationService:
 
     def rename_session(self, session_id, title) -> bool:
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("重命名会话")
             return self.runtime.rename_session(session_id, title)
 
     def set_session_pinned(self, session_id, pinned=True) -> bool:
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("置顶会话")
             return self.runtime.set_session_pinned(session_id, pinned)
 
     def set_session_unread(self, session_id, unread=True) -> bool:
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("标记会话")
             return self.runtime.set_session_unread(session_id, unread)
 
     def delete_session(self, session_id) -> bool:
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("删除会话")
             return self.runtime.delete_session(session_id)
 
@@ -502,6 +550,7 @@ class CompanionApplicationService:
 
     def confirm_action(self, action_id, mode=None):
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("确认动作")
             view = self.approval_view(action_id)
             if view.status != ProposalStatus.AWAITING_CONFIRMATION.value:
@@ -512,6 +561,7 @@ class CompanionApplicationService:
 
     def cancel_action(self, action_id):
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("取消动作")
             view = self.approval_view(action_id)
             if view.status != ProposalStatus.AWAITING_CONFIRMATION.value:
@@ -520,6 +570,7 @@ class CompanionApplicationService:
 
     def undo_receipt(self, receipt_id):
         with self._lock:
+            self.recover_stale_runs(max_age_seconds=300.0)
             self._assert_idle("撤销写入")
             return self.runtime.undo_receipt(receipt_id)
 
@@ -645,6 +696,7 @@ class CompanionApplicationService:
         return int(rows[-1]["id"]) if rows else 0
 
     def _assert_idle(self, action):
+        self.recover_stale_runs(max_age_seconds=300.0)
         active = self.active_run()
         if active is not None:
             raise SessionBusyError(

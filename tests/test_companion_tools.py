@@ -5,6 +5,11 @@ import time
 import unittest
 from pathlib import Path
 
+from agent_framework.companion.access_control import (
+    CAPABILITY_FS_READ,
+    CAPABILITY_FS_SEARCH,
+    CAPABILITY_FS_WRITE,
+)
 from agent_framework.companion.models import AgentMode, RiskLevel, SearchResult
 from agent_framework.companion.runtime import (
     MAX_TOOL_CALLS,
@@ -115,6 +120,9 @@ class CompanionToolTest(unittest.TestCase):
             runtime.tool_names(AgentMode.WORK),
             [
                 "current_time",
+                "find_files",
+                "open_path",
+                "read_file",
                 "read_tool_result",
                 "search_web",
                 "set_reminder",
@@ -125,12 +133,32 @@ class CompanionToolTest(unittest.TestCase):
             runtime.tool_names(AgentMode.EXECUTE),
             [
                 "current_time",
+                "find_files",
+                "open_path",
+                "read_file",
                 "read_tool_result",
                 "search_web",
                 "set_reminder",
                 "write_note",
             ],
         )
+
+    def test_open_app_needs_a_launchable_grant_to_appear(self):
+        # 「登记即授权」的清单为空时把 open_app 留在模型面前，等于给它一个只能失败的
+        # 入口：它会编一个应用名出来。与 write_file 同一套规矩。
+        runtime = self.runtime(ScriptedLLM([]))
+        for mode in (AgentMode.WORK, AgentMode.EXECUTE):
+            with self.subTest(mode=mode):
+                self.assertNotIn("open_app", runtime.tool_names(mode))
+        target = Path(self.workspace) / "demo.exe"
+        target.write_bytes(b"MZ\x90\x00")
+        row = runtime.app_catalog.register_manual("演示", str(target))
+        runtime.access.grant_app(str(target))
+        self.assertIn("open_app", runtime.tool_names(AgentMode.WORK))
+        registry = runtime._build_tool_registry(AgentMode.WORK, None)
+        offered = {tool.name: tool.description for tool in registry.available(AgentMode.WORK)}
+        # 清单要出现在描述里：没有它模型只能猜一个 app_id。
+        self.assertIn("演示", offered["open_app"])
 
     def test_model_creates_reminder_through_tool(self):
         llm = ScriptedLLM(
@@ -278,7 +306,7 @@ class CompanionToolTest(unittest.TestCase):
         self.assertIn("network unavailable", tool_events[-1]["error"])
         self.assertTrue(tool_events[-1]["code"])
 
-    def test_model_write_tool_creates_proposal_without_writing(self):
+    def test_model_write_tool_executes_by_default(self):
         content = "# 会议摘要\n\n- 讨论了工具循环"
         llm = ScriptedLLM(
             [
@@ -296,22 +324,18 @@ class CompanionToolTest(unittest.TestCase):
             ]
         )
         runtime = self.runtime(llm)
+        runtime.apply_settings({"tool_permission": "balanced"})
+        runtime.set_mode(AgentMode.WORK)
 
         result = runtime.handle_message("把这段讨论整理成笔记", AgentMode.WORK)
 
-        proposal = result["proposal"]
-        self.assertIsNotNone(proposal)
-        self.assertEqual(proposal.intent, "保存笔记")
-        self.assertIn("内容预览", proposal.user_visible_plan)
-        self.assertIn("讨论了工具循环", proposal.user_visible_plan)
-        self.assertEqual(list(self.workspace.rglob("*.md")), [])
-        self.assertEqual(
-            [item.action_id for item in runtime.pending_proposals()],
-            [proposal.action_id],
-        )
-
-        confirmed = runtime.confirm_proposal(proposal.action_id, AgentMode.WORK)
-        self.assertEqual(confirmed["receipt"].status, "completed")
+        self.assertIsNone(result["proposal"])
+        self.assertEqual([], runtime.pending_proposals())
+        self.assertIn("笔记已写入", result["answer"])
+        receipts = runtime.latest_receipts(3)
+        self.assertEqual(1, len(receipts))
+        self.assertEqual("completed", receipts[0].status)
+        self.assertIn("回执：rcp_", result["answer"])
         files = list(self.workspace.rglob("*.md"))
         self.assertEqual(len(files), 1)
         self.assertEqual(files[0].read_text(encoding="utf-8"), content)
@@ -433,7 +457,7 @@ class CompanionToolTest(unittest.TestCase):
                 LLMResponse(
                     tool_calls=[
                         ToolCall(
-                            name="read_file",
+                            name="open_the_fridge",
                             arguments={"path": "x"},
                         )
                     ]
@@ -475,6 +499,8 @@ class CompanionToolTest(unittest.TestCase):
     def test_explicit_search_uses_regex_fast_path(self):
         llm = ScriptedLLM([])
         runtime = self.runtime(llm)
+        runtime.apply_settings({"tool_permission": "strict"})
+        runtime.set_mode(AgentMode.WORK)
 
         result = runtime.handle_message(
             "搜索 Python 并保存为笔记",
@@ -586,7 +612,7 @@ class PermissionTierRegistryTest(unittest.TestCase):
     def test_strict_removes_the_dangerous_tools_from_the_list(self):
         registry = self.build("strict")
         names = [tool.name for tool in registry.available(AgentMode.EXECUTE)]
-        self.assertIn("write_note", names)
+        self.assertNotIn("write_note", names)
         self.assertNotIn("run_command", names)
         self.assertNotIn("type_into_app", names)
         result = registry.execute("run_command", {}, AgentMode.EXECUTE)
@@ -606,9 +632,11 @@ class PermissionTierRegistryTest(unittest.TestCase):
                 self.assertFalse(asked.ok)
                 self.assertEqual("confirmation_missing", asked.code)
 
-    def test_balanced_keeps_every_confirmation_where_it_was(self):
+    def test_balanced_runs_writes_and_still_asks_for_dangerous_tools(self):
         registry = self.build("balanced")
-        for name in ("write_note", "run_command", "type_into_app"):
+        done = registry.execute("write_note", {}, AgentMode.EXECUTE)
+        self.assertTrue(done.ok)
+        for name in ("run_command", "type_into_app"):
             with self.subTest(name=name):
                 result = registry.execute(name, {}, AgentMode.EXECUTE)
                 self.assertFalse(result.ok)
@@ -635,7 +663,7 @@ class PermissionTierRegistryTest(unittest.TestCase):
 
 
 class PermissionTierTurnTest(unittest.TestCase):
-    """「信任」档的承诺必须在真正的写入回合里成立，而不只在决策表里。"""
+    """An authorized write runs directly in balanced and relaxed tiers."""
 
     CONTENT = "# 会议摘要\n\n- 讨论了权限档位"
 
@@ -657,7 +685,8 @@ class PermissionTierTurnTest(unittest.TestCase):
                             arguments={"query": "会议摘要", "content": self.CONTENT},
                         )
                     ]
-                )
+                ),
+                LLMResponse(content="写入被保守档禁用。"),
             ]
         )
         runtime = CompanionRuntime(
@@ -674,21 +703,28 @@ class PermissionTierTurnTest(unittest.TestCase):
     def assistant_messages(self, runtime):
         return [row for row in runtime.history() if row.get("role") == "assistant"]
 
-    def test_relaxed_writes_without_a_confirmation_card(self):
-        runtime, result = self.run_write("relaxed")
+    def test_balanced_and_relaxed_write_without_a_confirmation_card(self):
+        for tier in ("balanced", "relaxed"):
+            with self.subTest(tier=tier):
+                self.setUp()
+                runtime, result = self.run_write(tier)
 
-        self.assertIsNone(result["proposal"])
-        self.assertEqual([], runtime.pending_proposals())
-        files = list(self.workspace.rglob("*.md"))
-        self.assertEqual(1, len(files))
-        self.assertEqual(self.CONTENT, files[0].read_text(encoding="utf-8"))
-        receipts = runtime.latest_receipts(3)
-        self.assertEqual(1, len(receipts))
-        self.assertEqual("completed", receipts[0].status)
-        self.assertIn("回执", result["answer"])
-        # 回执文案由本轮自己落库一次，确认路径不再重复写一条。
-        self.assertEqual(1, len(self.assistant_messages(runtime)))
-        self.assertEqual(result["answer"], self.assistant_messages(runtime)[0]["content"])
+                self.assertIsNone(result["proposal"])
+                self.assertEqual([], runtime.pending_proposals())
+                files = list(self.workspace.rglob("*.md"))
+                self.assertEqual(1, len(files))
+                self.assertEqual(
+                    self.CONTENT, files[0].read_text(encoding="utf-8")
+                )
+                receipts = runtime.latest_receipts(3)
+                self.assertEqual(1, len(receipts))
+                self.assertEqual("completed", receipts[0].status)
+                self.assertIn("回执", result["answer"])
+                self.assertEqual(1, len(self.assistant_messages(runtime)))
+                self.assertEqual(
+                    result["answer"],
+                    self.assistant_messages(runtime)[0]["content"],
+                )
 
     def test_the_auto_write_is_undone_through_the_same_receipt(self):
         runtime, _ = self.run_write("relaxed")
@@ -698,22 +734,99 @@ class PermissionTierTurnTest(unittest.TestCase):
 
         self.assertEqual([], list(self.workspace.rglob("*.md")))
 
-    def test_balanced_and_strict_still_pause_for_the_card(self):
-        for tier in ("balanced", "strict"):
-            with self.subTest(tier=tier):
-                self.temp = tempfile.TemporaryDirectory()
-                self.addCleanup(self.temp.cleanup)
-                self.root = Path(self.temp.name)
-                self.workspace = self.root / "workspace"
-                self.workspace.mkdir()
-                self.data = self.root / "data"
+    def test_strict_disables_write_without_creating_a_card(self):
+        self.setUp()
+        runtime, result = self.run_write("strict")
+        self.assertIsNone(result["proposal"])
+        self.assertEqual([], runtime.pending_proposals())
+        self.assertEqual([], list(self.workspace.rglob("*.md")))
 
-                runtime, result = self.run_write(tier)
+    def test_explicit_file_write_request_forces_write_file_tool(self):
+        runtime = CompanionRuntime(
+            CompanionStore(self.data / "companion.db"),
+            ScriptedLLM([]),
+            SearchService(StubSearch()),
+            self.data,
+            offline=True,
+        )
+        runtime.access.grant_directory(
+            self.workspace,
+            [
+                CAPABILITY_FS_READ,
+                CAPABILITY_FS_SEARCH,
+                CAPABILITY_FS_WRITE,
+            ],
+        )
+        choice = runtime._forced_write_tool_choice(
+            "在123.txt恭维我两句话",
+            AgentMode.WORK,
+        )
+        self.assertEqual(
+            choice,
+            {
+                "type": "function",
+                "function": {"name": "write_file"},
+            },
+        )
+        runtime.apply_settings({"tool_permission": "strict"})
+        self.assertIsNone(
+            runtime._forced_write_tool_choice(
+                "在123.txt恭维我两句话",
+                AgentMode.WORK,
+            )
+        )
 
-                self.assertIsNotNone(result["proposal"])
-                self.assertEqual(1, len(runtime.pending_proposals()))
-                self.assertEqual([], list(self.workspace.rglob("*.md")))
-                self.assertEqual(1, len(self.assistant_messages(runtime)))
+    def test_explicit_filename_wins_over_a_historical_parallel_write(self):
+        runtime = CompanionRuntime(
+            CompanionStore(self.data / "companion.db"),
+            ScriptedLLM(
+                [
+                    LLMResponse(
+                        tool_calls=[
+                            ToolCall(
+                                name="write_file",
+                                arguments={
+                                    "relative_path": "123.txt",
+                                    "content": "wrong target",
+                                },
+                            ),
+                            ToolCall(
+                                name="write_file",
+                                arguments={
+                                    "relative_path": "new-result.txt",
+                                    "content": "right target",
+                                },
+                            ),
+                        ]
+                    )
+                ]
+            ),
+            SearchService(StubSearch()),
+            self.data,
+            offline=False,
+        )
+        runtime.access.grant_directory(
+            self.workspace,
+            [
+                CAPABILITY_FS_READ,
+                CAPABILITY_FS_SEARCH,
+                CAPABILITY_FS_WRITE,
+            ],
+        )
+        runtime.apply_settings({"tool_permission": "balanced"})
+        runtime.set_mode(AgentMode.WORK)
+
+        result = runtime.handle_message(
+            "在 new-result.txt 中写入：right target",
+            AgentMode.WORK,
+        )
+
+        self.assertFalse((self.workspace / "123.txt").exists())
+        self.assertEqual(
+            "right target",
+            (self.workspace / "new-result.txt").read_text(encoding="utf-8"),
+        )
+        self.assertIn("回执：rcp_", result["answer"])
 
 
 if __name__ == "__main__":

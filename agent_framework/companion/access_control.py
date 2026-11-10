@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .models import new_id, utc_now
 from .path_safety import (
     PathSafetyError,
+    app_target_key,
     check_grantable_directory,
     path_key,
     resource_identity,
@@ -31,9 +32,12 @@ CAPABILITY_FS_SEARCH = "fs-search"
 CAPABILITY_FS_DELETE = "fs-delete"
 CAPABILITY_FS_EXPORT = "fs-export"
 
-# Directory-scoped capabilities only. Application launching, UI control, launch
-# chains and chat sending get their own resource kinds when those slices land;
-# inventing them now would create grant states no executor can ever reach.
+# 用户点"允许启动"那一刻登记的一条：登记即授权，不需要每件事再发一张租约。
+CAPABILITY_APP_LAUNCH = "app-launch"
+
+# Directory-scoped capabilities only. UI control, launch chains and chat sending
+# get their own resource kinds when those slices land; inventing them now would
+# create grant states no executor can ever reach.
 DIRECTORY_CAPABILITIES = (
     CAPABILITY_FS_READ,
     CAPABILITY_FS_WRITE,
@@ -41,8 +45,16 @@ DIRECTORY_CAPABILITIES = (
     CAPABILITY_FS_DELETE,
     CAPABILITY_FS_EXPORT,
 )
+APP_CAPABILITIES = (CAPABILITY_APP_LAUNCH,)
 
 RESOURCE_DIRECTORY = "directory"
+RESOURCE_APP = "app"
+RESOURCE_KINDS = (RESOURCE_DIRECTORY, RESOURCE_APP)
+
+CAPABILITIES_BY_KIND = {
+    RESOURCE_DIRECTORY: DIRECTORY_CAPABILITIES,
+    RESOURCE_APP: APP_CAPABILITIES,
+}
 
 GRANT_ACTIVE = "active"
 GRANT_REVOKED = "revoked"
@@ -54,6 +66,9 @@ LEASE_REVOKED = "revoked"
 LEASE_EXPIRED = "expired"
 
 MAX_DIRECTORY_GRANTS = 16
+# 应用授权比目录细碎（一个工具链七八条很常见），上限给得宽，但仍然有：一条能被模型
+# 一句话叫起来的清单不该无限长。
+MAX_APP_GRANTS = 64
 DEFAULT_LEASE_TTL_SECONDS = 300
 MAX_LEASE_TTL_SECONDS = 900
 MAX_LEASE_OPERATIONS = 50
@@ -108,6 +123,7 @@ class AccessGrant:
     source: str = "grant"
     sensitivity_override: bool = False
     legacy_workspace: bool = False
+    workspace_selected: bool = False
     created_at: str = ""
     updated_at: str = ""
     last_used_at: str = ""
@@ -174,6 +190,7 @@ def grant_from_row(row) -> Optional[AccessGrant]:
         source=str(row["source"] or "grant"),
         sensitivity_override=bool(row["sensitivity_override"]),
         legacy_workspace=bool(row["legacy_workspace"]),
+        workspace_selected=bool(row["workspace_selected"]),
         created_at=str(row["created_at"] or ""),
         updated_at=str(row["updated_at"] or ""),
         last_used_at=str(row["last_used_at"] or ""),
@@ -201,7 +218,18 @@ def lease_from_row(row) -> Optional[GrantLease]:
     )
 
 
-def normalize_capabilities(values) -> Tuple[str, ...]:
+def normalize_capabilities(values, resource_kind=RESOURCE_DIRECTORY) -> Tuple[str, ...]:
+    """Validate a capability list against the set that belongs to one resource kind.
+
+    ``fs-read`` on an application grant would otherwise sit in the table looking
+    like an authorization that no executor can ever honour; each kind only accepts
+    what its own executor actually checks.
+    """
+    allowed = CAPABILITIES_BY_KIND.get(resource_kind)
+    if allowed is None:
+        raise AccessControlError(
+            "不认识的资源类型：{}。".format(resource_kind), "unknown_resource_kind"
+        )
     if isinstance(values, str):
         try:
             values = json.loads(values)
@@ -215,10 +243,10 @@ def normalize_capabilities(values) -> Tuple[str, ...]:
     for item in items:
         if not item:
             continue
-        if item not in DIRECTORY_CAPABILITIES:
+        if item not in allowed:
             raise AccessControlError(
-                "不认识的能力：{}。目录授权只接受 {}。".format(
-                    item, "、".join(DIRECTORY_CAPABILITIES)
+                "不认识的能力：{}。{} 授权只接受 {}。".format(
+                    item, resource_kind, "、".join(allowed)
                 ),
                 "unknown_capability",
             )
@@ -253,7 +281,9 @@ class AccessControlService:
         caps = normalize_capabilities(capabilities)
         guard = check_grantable_directory(path, allow_sensitive=allow_sensitive)
         existing = self.store.find_directory_grant(guard.root)
-        if existing is None and self.store.count_access_grants(GRANT_ACTIVE) >= MAX_DIRECTORY_GRANTS:
+        if existing is None and self.store.count_access_grants(
+            GRANT_ACTIVE, RESOURCE_DIRECTORY
+        ) >= MAX_DIRECTORY_GRANTS:
             raise AccessControlError(
                 "已授权的目录已达 {} 个上限，请先撤销不再需要的目录。".format(
                     MAX_DIRECTORY_GRANTS
@@ -267,6 +297,64 @@ class AccessControlService:
             sensitivity_override=bool(allow_sensitive),
         )
         return grant_from_row(row)
+
+    def grant_app(self, target, source="grant") -> AccessGrant:
+        """Allow launching one application — this call IS the authorization.
+
+        Identity belongs to ``app_catalog`` (the launcher captures and rechecks it),
+        not here: this row only ever answers "did the user say yes to this target".
+        Re-granting re-activates and replaces the set, so a revoked app comes back
+        only through an explicit user action.
+        """
+        key = app_target_key(target)
+        if not key:
+            raise AccessControlError("应用授权需要一个目标路径或 shell 解析名。", "app_target_required")
+        caps = normalize_capabilities((CAPABILITY_APP_LAUNCH,), RESOURCE_APP)
+        existing = self.store.find_app_grant(target)
+        if existing is None and self.store.count_access_grants(
+            GRANT_ACTIVE, RESOURCE_APP
+        ) >= MAX_APP_GRANTS:
+            raise AccessControlError(
+                "已登记启动的应用已达 {} 个上限，请先移除不再需要的条目。".format(MAX_APP_GRANTS),
+                "grant_limit",
+            )
+        row = self.store.upsert_app_grant(str(target), caps, source=source)
+        return grant_from_row(row)
+
+    def find_app_grant(self, target) -> Optional[AccessGrant]:
+        if not str(target or "").strip():
+            return None
+        return grant_from_row(self.store.find_app_grant(target))
+
+    def app_launch_grant(self, target) -> Tuple[Optional[AccessGrant], str]:
+        """这条目标现在能不能启动，不能的话原因是什么。
+
+        只回答授权这一层：文件在不在、身份变没变是复核的事，别把两种"不行"混成一句
+        话，用户看到的原因才对症。
+        """
+        grant = self.find_app_grant(target)
+        if grant is None:
+            return None, "这个应用还没有登记允许启动。"
+        if grant.status != GRANT_ACTIVE:
+            return None, "这条启动授权已撤销，需要重新登记。"
+        if not grant.has_capability(CAPABILITY_APP_LAUNCH):
+            return None, "这条授权不包含允许启动。"
+        return grant, ""
+
+    def launchable_grants(self) -> List[AccessGrant]:
+        """当前真的能启动的那些应用。
+
+        模型可见的 `open_app` 清单由它生成：出现一个启动不了的名字，模型就会去试一个
+        不存在的 `app_id`，然后拿到一条它解释不了的失败。
+        """
+        return [
+            grant
+            for grant in self.list_grants(
+                status=GRANT_ACTIVE, resource_kind=RESOURCE_APP
+            )
+            if grant.status == GRANT_ACTIVE
+            and grant.has_capability(CAPABILITY_APP_LAUNCH)
+        ]
 
     def revoke_grant(self, grant_id) -> AccessGrant:
         grant = self.get_grant(grant_id)
@@ -288,8 +376,18 @@ class AccessControlService:
             return None
         return grant_from_row(self.store.find_directory_grant(path))
 
-    def list_grants(self, status=GRANT_ACTIVE) -> List[AccessGrant]:
-        return [grant_from_row(row) for row in self.store.list_access_grants(status=status)]
+    def list_grants(self, status=GRANT_ACTIVE, resource_kind=RESOURCE_DIRECTORY) -> List[AccessGrant]:
+        """默认只列目录授权。
+
+        调用这一层的代码几乎都在"列已授权的目录"（设置页、索引器、doctor），把它们和
+        应用授权混在一起会让上限、计数和界面一起说胡话；要另一类就明说。
+        """
+        return [
+            grant_from_row(row)
+            for row in self.store.list_access_grants(
+                status=status, resource_kind=resource_kind
+            )
+        ]
 
     def grant_for_capability(self, path, capability) -> Tuple[Optional[AccessGrant], str]:
         """Return the usable grant for ``path`` or the reason there is none."""
@@ -307,6 +405,22 @@ class AccessControlService:
         if not usable:
             return None, reason
         return grant, ""
+
+    def grants_for_capability(
+        self, capability, exclude_legacy=False
+    ) -> List[AccessGrant]:
+        """含某个能力的活跃授权清单；``exclude_legacy`` 挡掉旧版工作区的自动提升。
+
+        那条提升只为了"笔记还能写"，它不是用户为通用写入与删除挑的目录。
+        """
+        chosen = []
+        for grant in self.list_grants(status=GRANT_ACTIVE):
+            if not grant.has_capability(capability):
+                continue
+            if exclude_legacy and grant.legacy_workspace:
+                continue
+            chosen.append(grant)
+        return chosen
 
     def check_identity(self, grant: AccessGrant) -> Tuple[bool, str]:
         """Verify the directory is still the one the user authorized.
@@ -346,8 +460,6 @@ class AccessControlService:
         """Open a short lease bound to one task, one capability and one grant."""
         if not str(task_id or "").strip():
             raise AccessControlError("租约必须绑定到一个任务。", "no_task")
-        caps = normalize_capabilities([capability])
-        capability = caps[0]
         ttl = int(ttl_seconds)
         if ttl <= 0 or ttl > MAX_LEASE_TTL_SECONDS:
             raise AccessControlError(
@@ -369,6 +481,15 @@ class AccessControlService:
         grant = self.get_grant(grant_id)
         if grant is None:
             raise AccessControlError("找不到这条授权。", "grant_missing")
+        if grant.resource_kind != RESOURCE_DIRECTORY:
+            # 租约说的是"这一次任务在这批文件上能动几下"，那是目录的语义；应用授权是
+            # 登记即授权。让它发租约只会把 exe 路径当目录去比卷标识，两边都说胡话。
+            raise AccessControlError(
+                "这条授权不是目录授权，不能用文件租约。", "lease_resource_kind"
+            )
+        # 能力能不能用，取决于这条授权是哪一类资源，所以校验放在查到授权之后。
+        caps = normalize_capabilities([capability], grant.resource_kind)
+        capability = caps[0]
         if grant.status != GRANT_ACTIVE:
             raise AccessControlError("这条授权已撤销，不能发放租约。", "grant_revoked")
         if not grant.has_capability(capability):
@@ -487,7 +608,8 @@ def read_state(connection, now=None) -> Dict:
         rows = connection.execute(
             """
             SELECT grant_id, path, path_key, capabilities, status, source,
-                   sensitivity_override, legacy_workspace, volume_id, file_id,
+                   sensitivity_override, legacy_workspace, workspace_selected,
+                   volume_id, file_id,
                    created_at, updated_at, last_used_at, revoked_at
             FROM access_grants
             ORDER BY status, updated_at DESC
@@ -509,6 +631,7 @@ def read_state(connection, now=None) -> Dict:
             "source": value["source"],
             "sensitivity_override": bool(value["sensitivity_override"]),
             "legacy_workspace": bool(value["legacy_workspace"]),
+            "workspace_selected": bool(value["workspace_selected"]),
             "identity_bound": bool(value["volume_id"] or value["file_id"]),
             "drifted": False,
             "last_used_at": value["last_used_at"],

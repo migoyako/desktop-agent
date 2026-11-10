@@ -879,6 +879,10 @@ body.compact .who .state {
   min-width: 0;
 }
 
+.approval .meta .row.full {
+  grid-column: 1 / -1;
+}
+
 .approval .meta label {
   flex: none;
   width: 4em;
@@ -946,6 +950,23 @@ body.compact .who .state {
 .approval .hint {
   color: var(--muted);
   font-size: var(--fs-meta);
+}
+
+.approval .desktop-progress {
+  padding: var(--sp-sm) var(--sp-md);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--selected);
+  color: var(--accent-soft);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  overflow-wrap: anywhere;
+}
+
+.approval .desktop-progress[data-stage="failed"],
+.approval .desktop-progress[data-stage="unknown"] {
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 /* S04f 的另两态已经处理完，边框回到中性；被档位拒绝的那张用强调边框。 */

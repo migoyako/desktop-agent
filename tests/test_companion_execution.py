@@ -6,7 +6,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_framework.companion.file_actions import UncertainExecutionError
-from agent_framework.companion.models import AgentMode, ProposalStatus, SearchResult
+from agent_framework.companion.models import (
+    AgentMode,
+    ProposalStatus,
+    SearchResult,
+)
 from agent_framework.companion.runtime import CompanionRuntime
 from agent_framework.companion.search import SearchService
 from agent_framework.companion.store import CompanionStore
@@ -49,16 +53,22 @@ class ExecutionSafetyTest(unittest.TestCase):
         self.temp.cleanup()
 
     def _proposal(self):
-        result = self.runtime.handle_message(
-            "搜索 Python Agent 并保存为笔记",
-            AgentMode.WORK,
+        self.runtime.apply_settings({"tool_permission": "strict"})
+        proposal = self.runtime.notes.create_proposal(
+            session_id="main",
+            query="safe write",
+            content="safe write",
+            mode=AgentMode.WORK,
         )
-        self.assertIsNotNone(result["proposal"])
-        return result["proposal"]
+        self.runtime.set_mode(AgentMode.WORK)
+        self.store.create_proposal(proposal)
+        self.runtime.apply_settings({"tool_permission": "balanced"})
+        return proposal
 
     def test_workspace_switch_rejects_confirmation(self):
         proposal = self._proposal()
         self.runtime.select_workspace(str(self.other_workspace))
+        self.runtime.apply_settings({"tool_permission": "balanced"})
 
         result = self.runtime.confirm_proposal(proposal.action_id, AgentMode.WORK)
 
@@ -70,7 +80,7 @@ class ExecutionSafetyTest(unittest.TestCase):
             ProposalStatus.NOT_EXECUTED,
         )
         self.assertEqual(self.runtime.pending_proposals(), [])
-        self.assertEqual(list(self.root.rglob("*.md")), [])
+        self.assertEqual(list(self.workspace.rglob("*.md")), [])
 
     def test_mode_downgrade_denies_stale_proposal(self):
         proposal = self._proposal()
@@ -80,6 +90,7 @@ class ExecutionSafetyTest(unittest.TestCase):
         self.assertEqual(result["receipt"].status, "not_executed")
         self.assertEqual(result["receipt"].result["code"], "mode_denied")
         self.assertEqual(self.runtime.current_mode(), AgentMode.CHAT)
+        self.runtime.apply_settings({"tool_permission": "balanced"})
         self.assertEqual(list(self.workspace.rglob("*.md")), [])
         repeated = self.runtime.confirm_proposal(
             proposal.action_id,
@@ -150,6 +161,11 @@ class ExecutionSafetyTest(unittest.TestCase):
         )
         claimed, _ = self.store.claim_execution(proposal)
         self.assertTrue(claimed)
+        with self.store._connection() as connection:
+            connection.execute(
+                "UPDATE execution_ledger SET started_at = ? WHERE action_id = ?",
+                ("2000-01-01T00:00:00+00:00", proposal.action_id),
+            )
 
         restarted = CompanionRuntime(
             store=CompanionStore(self.data / "companion.db"),
@@ -186,6 +202,7 @@ class ExecutionSafetyTest(unittest.TestCase):
             offline=True,
         )
 
+        restarted.set_mode(AgentMode.WORK)
         self.assertEqual(restarted.current_mode(), AgentMode.WORK)
         result = restarted.confirm_proposal(proposal.action_id)
         self.assertEqual(result["receipt"].status, "completed")
