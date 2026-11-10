@@ -33,9 +33,13 @@ data/assets/*/*
 # Local design and diagnostic scratch output. Tracked board generators remain
 # available, but their generated HTML, screenshots, and logs do not.
 .tmp-s4/
+.tmp-pixso/*.html
 .tmp-pixso/*.log
 .tmp-pixso/*-measure.html
 .tmp-pixso/shots/
+
+# Root-level runtime logs
+/debug.log
 
 # Reference projects
 /research/
